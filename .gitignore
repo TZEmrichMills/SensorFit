@@ -1,0 +1,28 @@
+# Virtual environments
+sensorfit_env/
+.venv/
+venv/
+
+# Python build artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test / scratch output
+*.xlsx
+
+# But keep the example data file
+!examples/*.xlsx
