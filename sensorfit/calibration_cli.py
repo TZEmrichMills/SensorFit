@@ -14,9 +14,11 @@ from .calibration import (
     build_interval_subsets,
     CALIBRATED_COLUMN,
     calculate_turnover_before_inactivation,
+    get_model_display_name,
     interactive_interval_fitting,
     load_trace,
     persist_interval_subsets,
+    review_results,
     save_interval_with_fits,
     select_baseline,
     select_intervals,
@@ -107,37 +109,56 @@ def process_file(
     force: bool,
     summary_path: Path,
 ) -> tuple[Path | None, Path, bool]:
-    """Process a single file through the calibration workflow."""
+    """Process a single file through a phase-based state machine.
+
+    Phases: baseline → calibration → intervals → fitting → turnover → review → save.
+    Every phase can navigate backwards to the previous phase, and the review
+    screen can jump to any earlier phase.  File I/O is deferred until the
+    review screen is accepted.
+    """
     print(f"\nProcessing {path}")
     frame = load_trace(path, time_col_idx, current_col_idx)
-    time_col = frame.columns[0]  # Time column
-    current_col = frame.columns[1]  # Current column
-    
+    time_col = frame.columns[0]
+    current_col = frame.columns[1]
+
     time_values = frame[time_col].to_numpy(dtype=float)
     signal_values_raw = frame[current_col].to_numpy(dtype=float)
 
-    # Baseline selection - outer loop to allow going back from calibration
-    while True:
-        # Baseline selection - inner loop to allow redraw
-        while True:
-            baseline_result = select_baseline(time_values, signal_values_raw, window=20, filename=path.name)
-            
-            if baseline_result is None:
-                print(f"Dataset {path.name} discarded by user. Moving to next file.")
-                return None, path, False
-            
-            if baseline_result == "redraw":
-                print("Redrawing baseline...")
-                continue
-            
-            signal_values, (baseline_slope, baseline_intercept) = baseline_result
-            frame[current_col] = signal_values
-            break
+    # ── persistent state across phases ──────────────────────────
+    signal_values = None
+    calibration = None
+    current_calibration_values = calibration_values
+    intervals = None
+    subsets = None
+    all_fit_results: dict[int, dict[str, dict]] = {}
+    turnover_results: dict[int, float | None] = {}
 
-        # Calibration point selection
-        current_calibration_values = calibration_values
-        go_back_to_baseline = False
-        while True:
+    phase = "baseline"
+
+    while True:
+        # ────────────────────────────────────────────────────────
+        # PHASE: baseline
+        # ────────────────────────────────────────────────────────
+        if phase == "baseline":
+            while True:
+                baseline_result = select_baseline(
+                    time_values, signal_values_raw, window=20, filename=path.name
+                )
+                if baseline_result is None:
+                    print(f"Dataset {path.name} discarded by user.")
+                    return None, path, False
+                if baseline_result == "redraw":
+                    continue
+                signal_values, (_slope, _intercept) = baseline_result
+                frame[current_col] = signal_values
+                break
+            phase = "calibration"
+            continue
+
+        # ────────────────────────────────────────────────────────
+        # PHASE: calibration
+        # ────────────────────────────────────────────────────────
+        elif phase == "calibration":
             print(f"Using calibration values: {current_calibration_values}")
             result = select_points(
                 time_values,
@@ -147,127 +168,169 @@ def process_file(
                 update_calibration_callback,
                 filename=path.name,
             )
-            
-            # Check if user wants to discard or go back
             if result == "discard":
-                print(f"\nDataset {path.name} discarded by user during calibration point selection.")
+                print(f"\nDataset {path.name} discarded during calibration.")
                 return None, path, False
-            
             if result == "go_back_to_baseline":
                 print("\nReturning to baseline selection...")
-                go_back_to_baseline = True
-                # Break out of calibration loop to go back to baseline loop
-                break
-            
+                phase = "baseline"
+                continue
+
             indices, final_calibration_values = result
-            # Update current_calibration_values in case they were changed for this file
             current_calibration_values = final_calibration_values
-            mean_currents = [average_window(signal_values, idx, window) for idx in indices]
-
+            mean_currents = [
+                average_window(signal_values, idx, window) for idx in indices
+            ]
             calibration = build_calibration(mean_currents, final_calibration_values)
-
-            # Create Calibrated folder in output directory
-            calibrated_dir = output_dir / "Calibrated"
-            calibrated_dir.mkdir(parents=True, exist_ok=True)
-            
-            out_path = calibrated_dir / f"{path.stem}_calibrated.xlsx"
-            if out_path.exists() and not force:
-                raise FileExistsError(f"{out_path} already exists (use --force to overwrite)")
-
             frame[CALIBRATED_COLUMN] = apply_calibration(frame[current_col], calibration)
-            frame.to_excel(out_path, index=False)
 
-            summary_rows = zip(indices, mean_currents, final_calibration_values)
+            summary_rows = list(zip(indices, mean_currents, final_calibration_values))
             print("Selected points (index, mean current, µM):")
             for idx, current, conc in summary_rows:
                 print(f"  idx={idx:5d}, current={current: .4e} A, conc={conc: .3f} µM")
             print(f"Calibration: µM = {calibration.slope:.4e} * current + {calibration.intercept:.4f}")
-            print(f"Saved calibrated trace to {out_path} (in Calibrated folder)")
 
-            # Interval selection
-            intervals = select_intervals(time_values, frame[CALIBRATED_COLUMN].to_numpy(dtype=float), filename=path.name)
-            
+            phase = "intervals"
+            continue
+
+        # ────────────────────────────────────────────────────────
+        # PHASE: intervals
+        # ────────────────────────────────────────────────────────
+        elif phase == "intervals":
+            intervals = select_intervals(
+                time_values,
+                frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
+                filename=path.name,
+            )
             if intervals == "discard":
-                print(f"\nDataset {path.name} discarded by user during interval selection.")
+                print(f"\nDataset {path.name} discarded during interval selection.")
                 return None, path, False
-            
             if intervals is None:
                 print("\nReturning to calibration point selection...")
-                current_calibration_values = final_calibration_values
+                phase = "calibration"
                 continue
-            
             if not intervals:
                 print("No intervals selected; skipping subset export.")
+                # Still need to write calibrated file
+                calibrated_dir = output_dir / "Calibrated"
+                calibrated_dir.mkdir(parents=True, exist_ok=True)
+                out_path = calibrated_dir / f"{path.stem}_calibrated.xlsx"
+                frame.to_excel(out_path, index=False)
                 return out_path, path, False
-            
-            # Successfully completed all steps, break out of all loops
+
+            subsets = build_interval_subsets(frame, time_col, CALIBRATED_COLUMN, intervals)
+            if not subsets:
+                print("Intervals contained no data points; nothing saved.")
+                return None, path, False
+
+            phase = "fitting"
+            continue
+
+        # ────────────────────────────────────────────────────────
+        # PHASE: fitting
+        # ────────────────────────────────────────────────────────
+        elif phase == "fitting":
+            print(f"\n{'='*60}")
+            print("Interactive Fitting Interface")
+            print(f"{'='*60}")
+            fit_result = interactive_interval_fitting(
+                subsets, time_col, CALIBRATED_COLUMN, filename=path.name
+            )
+            if fit_result == "discard_file":
+                print(f"\nDataset {path.name} discarded during fitting.")
+                return None, path, False
+            if fit_result == "go_back_phase":
+                phase = "intervals"
+                continue
+            all_fit_results = fit_result
+
+            if all_fit_results:
+                print(f"\nFit results for {len(all_fit_results)} interval(s):")
+                for interval_idx, models in all_fit_results.items():
+                    display_names = [get_model_display_name(n) for n in models]
+                    print(f"  Interval #{interval_idx}: {', '.join(display_names)}")
+
+            phase = "turnover"
+            continue
+
+        # ────────────────────────────────────────────────────────
+        # PHASE: turnover
+        # ────────────────────────────────────────────────────────
+        elif phase == "turnover":
+            print(f"\n{'='*60}")
+            print("Calculate Maximum H₂O₂ Turnover Before Inactivation")
+            print(f"{'='*60}")
+            turnover_result = calculate_turnover_before_inactivation(
+                subsets, all_fit_results, time_col, CALIBRATED_COLUMN, filename=path.name
+            )
+            if turnover_result == "discard_file":
+                print(f"\nDataset {path.name} discarded during turnover calculation.")
+                return None, path, False
+            if turnover_result == "go_back_phase":
+                phase = "fitting"
+                continue
+            turnover_results = turnover_result
+
+            if turnover_results:
+                n_calc = len([v for v in turnover_results.values() if v is not None])
+                print(f"\nTurnover results for {n_calc} interval(s):")
+                for interval_idx, turnover in turnover_results.items():
+                    if turnover is not None:
+                        print(f"  Interval #{interval_idx}: {turnover:.3f} µM")
+                    else:
+                        print(f"  Interval #{interval_idx}: skipped")
+
+            phase = "review"
+            continue
+
+        # ────────────────────────────────────────────────────────
+        # PHASE: review
+        # ────────────────────────────────────────────────────────
+        elif phase == "review":
+            decision = review_results(
+                subsets, all_fit_results, turnover_results, filename=path.name
+            )
+            if decision == "discard":
+                print(f"\nDataset {path.name} discarded at review.")
+                return None, path, False
+            if decision == "accept":
+                phase = "save"
+                continue
+            # Any redo option maps directly to a phase name
+            if decision in ("baseline", "calibration", "intervals", "fitting", "turnover"):
+                print(f"\nRedoing {decision} phase...")
+                phase = decision
+                continue
+            # Fallback: treat as accept
+            phase = "save"
+            continue
+
+        # ────────────────────────────────────────────────────────
+        # PHASE: save  (terminal — writes files and returns)
+        # ────────────────────────────────────────────────────────
+        elif phase == "save":
             break
-        
-        # Check if we need to go back to baseline (from calibration)
-        if go_back_to_baseline:
-            continue  # Continue outer loop to redo baseline
-        
-        # If we get here, we've successfully completed calibration and intervals
-        break
 
-    # Save intervals (in Calibrated folder to keep organized)
-    subsets = build_interval_subsets(frame, time_col, CALIBRATED_COLUMN, intervals)
-    if not subsets:
-        print("Intervals were selected but contained no data points; nothing saved.")
-        return out_path, path, False
-
-    # Interactive fitting interface
-    print(f"\n{'='*60}")
-    print("Interactive Fitting Interface")
-    print(f"{'='*60}")
-    all_fit_results = interactive_interval_fitting(subsets, time_col, CALIBRATED_COLUMN, filename=path.name)
-    
-    # Check if any fits were performed
-    has_fits = len(all_fit_results) > 0
-    
-    if all_fit_results:
-        print(f"\nFit results for {len(all_fit_results)} interval(s):")
-        from .calibration import get_model_display_name
-        for interval_idx, models in all_fit_results.items():
-            display_names = [get_model_display_name(name) for name in models.keys()]
-            print(f"  Interval #{interval_idx}: {', '.join(display_names)}")
-    
-    # Calculate turnover before inactivation
-    print(f"\n{'='*60}")
-    print("Calculate Maximum H₂O₂ Turnover Before Inactivation")
-    print(f"{'='*60}")
-    turnover_results = calculate_turnover_before_inactivation(
-        subsets, all_fit_results, time_col, CALIBRATED_COLUMN, filename=path.name
-    )
-    
-    if turnover_results:
-        print(f"\nTurnover results for {len([v for v in turnover_results.values() if v is not None])} interval(s):")
-        for interval_idx, turnover in turnover_results.items():
-            if turnover is not None:
-                print(f"  Interval #{interval_idx}: {turnover:.3f} µM")
-            else:
-                print(f"  Interval #{interval_idx}: skipped")
-    
-    # Save intervals in Calibrated folder alongside the calibrated file
+    # ── Deferred file I/O ───────────────────────────────────────
     calibrated_dir = output_dir / "Calibrated"
+    calibrated_dir.mkdir(parents=True, exist_ok=True)
+    out_path = calibrated_dir / f"{path.stem}_calibrated.xlsx"
+    if out_path.exists() and not force:
+        raise FileExistsError(f"{out_path} already exists (use --force to overwrite)")
+    frame.to_excel(out_path, index=False)
+    print(f"Saved calibrated trace to {out_path}")
+
     interval_dir = calibrated_dir / f"{path.stem}_intervals"
-    
-    # Save each interval with fits to Excel
+    has_fits = len(all_fit_results) > 0
+
     print(f"\nSaving interval data and fits...")
     for subset in subsets:
-        # Get fit results for this interval (if any)
         interval_fits = all_fit_results.get(subset.index, None)
-        
-        # Get turnover value for this interval (if calculated)
         turnover_uM = turnover_results.get(subset.index, None)
-        
-        # Save interval data with fits to Excel
         excel_path = save_interval_with_fits(
             subset, time_col, CALIBRATED_COLUMN, interval_fits, interval_dir
         )
         print(f"  Saved: {excel_path.name}")
-        
-        # Append to summary Excel
         append_fit_summary(
             summary_path=summary_path,
             source_file=path.name,
@@ -277,24 +340,17 @@ def process_file(
             fit_results=interval_fits,
             turnover_uM=turnover_uM,
         )
-    
-    # Also save CSV files (for compatibility)
+
     persist_interval_subsets(subsets, interval_dir)
-    
-    print(f"\nInterval data stored under {interval_dir}")
-    print(f"Summary Excel: {summary_path}")
-    print(f"Saved {len(subsets)} interval(s)")
-    
-    # Display comprehensive summary after fitting all intervals
+
+    # ── Print summary ───────────────────────────────────────────
     print(f"\n{'='*60}")
     print("Fitting Summary for This File")
     print(f"{'='*60}")
     print(f"File: {path.name}")
     print(f"Total intervals: {len(subsets)}")
-    
     intervals_with_fits = len(all_fit_results)
     intervals_without_fits = len(subsets) - intervals_with_fits
-    
     if intervals_with_fits > 0:
         print(f"Intervals with fits applied: {intervals_with_fits}")
         print(f"Intervals without fits: {intervals_without_fits}")
@@ -305,14 +361,11 @@ def process_file(
                 time_range = f"{subset.start_time:.3f}-{subset.end_time:.3f} s"
                 print(f"  Interval #{interval_idx} ({time_range}): {', '.join(models.keys())}")
     else:
-        print(f"Intervals with fits applied: 0")
-        print(f"Intervals without fits: {len(subsets)}")
         print("  (No fits were applied to any intervals)")
-    
     print(f"\nOutput files:")
-    print(f"  • Calibrated data: {out_path}")
-    print(f"  • Interval data: {interval_dir}")
-    print(f"  • Summary Excel: {summary_path}")
+    print(f"  Calibrated data: {out_path}")
+    print(f"  Interval data: {interval_dir}")
+    print(f"  Summary Excel: {summary_path}")
     print(f"{'='*60}\n")
 
     return out_path, path, has_fits

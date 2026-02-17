@@ -1307,7 +1307,7 @@ def interactive_interval_fitting(
     time_col: str,
     calibrated_col: str,
     filename: str | None = None,
-) -> dict[int, dict[str, dict]]:
+) -> dict[int, dict[str, dict]] | str:
     """
     Interactive fitting interface for intervals.
     
@@ -1327,8 +1327,9 @@ def interactive_interval_fitting(
     
     Returns:
     --------
-    dict mapping interval index to dict of model results
-    {interval_index: {model_name: {fit_result_dict}}}
+    dict mapping interval index to dict of model results, OR
+    "go_back_phase" if user wants to return to interval selection, OR
+    "discard_file" if user wants to discard the entire file.
     """
     from .fitting import fit_IB, fit_Exponential, fit_GFI
     from .models import MODEL_FUNCS
@@ -1346,13 +1347,20 @@ def interactive_interval_fitting(
         time_values = subset.data[time_col].to_numpy(dtype=float)
         signal_values = subset.data[calibrated_col].to_numpy(dtype=float)
         
-        # State for this interval
-        interval_fits: dict[str, dict] = {}
+        # State for this interval — restore previous fits if navigating back
+        if subset.index in all_fit_results:
+            interval_fits: dict[str, dict] = dict(all_fit_results[subset.index])
+        else:
+            interval_fits: dict[str, dict] = {}
         selected_models = {"IB": False, "Exponential": False, "GFI": False, "LinearInitialRate": False}
+        # Pre-check models that already have fits (so they show on the plot)
+        for model_name in interval_fits:
+            if model_name in selected_models:
+                selected_models[model_name] = True
         manual_linear_active = False
         manual_linear_points: list[int] = []
         manual_linear_markers: list = []  # Store markers for selected points
-        navigation_state = {"action": None}  # "continue", "go_back", "discard"
+        navigation_state = {"action": None}  # "continue", "go_back", "discard", "go_back_phase", "discard_file"
         
         fig, (ax_data, ax_resid) = plt.subplots(
             2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [3, 1]}
@@ -1690,12 +1698,13 @@ def interactive_interval_fitting(
             plt.close(fig)
         
         def on_go_back_interval(_event):
-            """Go back to previous interval."""
+            """Go back to previous interval, or to previous phase if on first interval."""
             if current_idx > 0:
                 navigation_state["action"] = "go_back"
                 plt.close(fig)
             else:
-                print("  Already at first interval. Cannot go back further.")
+                navigation_state["action"] = "go_back_phase"
+                plt.close(fig)
         
         def on_discard_interval(_event):
             """Discard current interval without fitting."""
@@ -1703,6 +1712,11 @@ def interactive_interval_fitting(
             # Remove any fits for this interval
             if subset.index in all_fit_results:
                 del all_fit_results[subset.index]
+            plt.close(fig)
+        
+        def on_discard_file(_event):
+            """Discard the entire file."""
+            navigation_state["action"] = "discard_file"
             plt.close(fig)
         
         # Add checkboxes for model selection with equations
@@ -1756,21 +1770,18 @@ def interactive_interval_fitting(
         btn_clear_ax = fig.add_axes([0.78, 0.38, 0.2, 0.05])
         btn_goback_ax = fig.add_axes([0.78, 0.28, 0.2, 0.05])
         btn_discard_ax = fig.add_axes([0.78, 0.22, 0.2, 0.05])
-        btn_continue_ax = fig.add_axes([0.78, 0.16, 0.2, 0.05])
+        btn_discard_file_ax = fig.add_axes([0.78, 0.16, 0.2, 0.05])
+        btn_continue_ax = fig.add_axes([0.78, 0.10, 0.2, 0.05])
         
         btn_linear_auto = create_small_button(btn_linear_auto_ax, "Linear Auto", "#ffb347", "#ffa135")
         btn_linear_manual = create_small_button(btn_linear_manual_ax, "Linear Manual", "#ff7f0e", "#ff9500")
         btn_fit_all = create_small_button(btn_fit_all_ax, "Fit Selected", "#90ee90", "#7cd47c")
         btn_clear = create_small_button(btn_clear_ax, "Clear All", "#ffcc99", "#ffaa66")
-        btn_goback = create_small_button(btn_goback_ax, "Go Back", "#ffcc99", "#ffaa66")
+        goback_label = "Go Back" if current_idx > 0 else "Back to intervals"
+        btn_goback = create_small_button(btn_goback_ax, goback_label, "#ffcc99", "#ffaa66")
         btn_discard = create_small_button(btn_discard_ax, "Discard this interval", "#ff6666", "#ff4444")
+        btn_discard_file = create_small_button(btn_discard_file_ax, "Discard this file", "#ff3333", "#cc0000")
         btn_continue = create_small_button(btn_continue_ax, "Continue", "#1f77b4", "#1e6ba8")
-        
-        # Disable "Go Back" if this is the first interval
-        if current_idx == 0:
-            btn_goback.set_active(False)
-            btn_goback.color = "0.7"
-            btn_goback.hovercolor = "0.7"
         
         btn_linear_auto.on_clicked(on_linear_auto)
         btn_linear_manual.on_clicked(on_linear_manual)
@@ -1778,6 +1789,7 @@ def interactive_interval_fitting(
         btn_clear.on_clicked(on_clear_fits)
         btn_goback.on_clicked(on_go_back_interval)
         btn_discard.on_clicked(on_discard_interval)
+        btn_discard_file.on_clicked(on_discard_file)
         btn_continue.on_clicked(on_continue)
         
         # Instructions banner
@@ -1858,7 +1870,13 @@ def interactive_interval_fitting(
         
         # Handle navigation
         action = navigation_state.get("action")
-        if action == "discard":
+        if action == "discard_file":
+            print("  File discarded by user during fitting.")
+            return "discard_file"
+        elif action == "go_back_phase":
+            print("  Returning to interval selection.")
+            return "go_back_phase"
+        elif action == "discard":
             # Discard this interval - remove any fits and move to next
             if subset.index in all_fit_results:
                 del all_fit_results[subset.index]
@@ -1866,15 +1884,10 @@ def interactive_interval_fitting(
             current_idx += 1
             continue
         elif action == "go_back":
-            # Go back to previous interval
-            if current_idx > 0:
-                current_idx -= 1
-                print(f"  Going back to interval #{subsets[current_idx].index}.")
-                continue
-            else:
-                print("  Already at first interval.")
-                current_idx += 1
-                continue
+            # Go back to previous interval (only reachable when current_idx > 0)
+            current_idx -= 1
+            print(f"  Going back to interval #{subsets[current_idx].index}.")
+            continue
         elif action == "continue":
             # Store results for this interval and move to next
             if interval_fits:
@@ -1895,7 +1908,7 @@ def calculate_turnover_before_inactivation(
     time_col: str,
     calibrated_col: str,
     filename: str | None = None,
-) -> dict[int, float | None]:
+) -> dict[int, float | None] | str:
     """
     Calculate maximum H2O2 turnover before inactivation for each interval.
     
@@ -1920,7 +1933,9 @@ def calculate_turnover_before_inactivation(
     Returns:
     --------
     dict[int, float | None]
-        Dictionary mapping interval index to turnover value (µM), or None if skipped
+        Dictionary mapping interval index to turnover value (µM), or None if skipped.
+    OR "go_back_phase" if user wants to return to the fitting phase.
+    OR "discard_file" if user wants to discard the entire file.
     """
     if not subsets:
         return {}
@@ -2204,16 +2219,22 @@ def calculate_turnover_before_inactivation(
             plt.close(fig)
         
         def on_go_back(_event):
-            """Go back to previous interval."""
+            """Go back to previous interval, or to previous phase if on first interval."""
             if current_idx > 0:
                 navigation_state["action"] = "go_back"
                 plt.close(fig)
             else:
-                print("  Already at first interval. Cannot go back further.")
+                navigation_state["action"] = "go_back_phase"
+                plt.close(fig)
         
         def on_discard(_event):
             """Discard this interval."""
             navigation_state["action"] = "discard"
+            plt.close(fig)
+        
+        def on_discard_file(_event):
+            """Discard the entire file."""
+            navigation_state["action"] = "discard_file"
             plt.close(fig)
         
         # Add buttons
@@ -2223,21 +2244,18 @@ def calculate_turnover_before_inactivation(
         btn_skip_ax = fig.add_axes([0.78, 0.50, 0.2, 0.05])
         btn_goback_ax = fig.add_axes([0.78, 0.44, 0.2, 0.05])
         btn_discard_ax = fig.add_axes([0.78, 0.38, 0.2, 0.05])
-        btn_continue_ax = fig.add_axes([0.78, 0.32, 0.2, 0.05])
+        btn_discard_file_ax = fig.add_axes([0.78, 0.32, 0.2, 0.05])
+        btn_continue_ax = fig.add_axes([0.78, 0.26, 0.2, 0.05])
         
         btn_tailfit_auto = create_small_button(btn_tailfit_auto_ax, "Auto Tailfit", "#ffb347", "#ffa135")
         btn_tailfit_manual = create_small_button(btn_tailfit_manual_ax, "Manual Tail Fit", "#ff7f0e", "#ff9500")
         btn_clear = create_small_button(btn_clear_ax, "Clear Fit", "#ffcc99", "#ffaa66")
         btn_skip = create_small_button(btn_skip_ax, "Skip", "#cccccc", "#aaaaaa")
-        btn_goback = create_small_button(btn_goback_ax, "Go Back", "#ffcc99", "#ffaa66")
+        goback_label = "Go Back" if current_idx > 0 else "Back to fitting"
+        btn_goback = create_small_button(btn_goback_ax, goback_label, "#ffcc99", "#ffaa66")
         btn_discard = create_small_button(btn_discard_ax, "Discard this interval", "#ff6666", "#ff4444")
+        btn_discard_file = create_small_button(btn_discard_file_ax, "Discard this file", "#ff3333", "#cc0000")
         btn_continue = create_small_button(btn_continue_ax, "Continue", "#1f77b4", "#1e6ba8")
-        
-        # Disable "Go Back" if this is the first interval
-        if current_idx == 0:
-            btn_goback.set_active(False)
-            btn_goback.color = "0.7"
-            btn_goback.hovercolor = "0.7"
         
         btn_tailfit_auto.on_clicked(on_tailfit_auto)
         btn_tailfit_manual.on_clicked(on_tailfit_manual)
@@ -2245,6 +2263,7 @@ def calculate_turnover_before_inactivation(
         btn_skip.on_clicked(on_skip)
         btn_goback.on_clicked(on_go_back)
         btn_discard.on_clicked(on_discard)
+        btn_discard_file.on_clicked(on_discard_file)
         btn_continue.on_clicked(on_continue)
         
         # Instructions banner
@@ -2321,21 +2340,23 @@ def calculate_turnover_before_inactivation(
         
         # Handle navigation
         action = navigation_state.get("action")
-        if action == "discard":
-            # Discard this interval
-            print(f"  Interval #{subset.index} discarded.")
+        if action == "discard_file":
+            print("  File discarded by user during turnover calculation.")
+            return "discard_file"
+        elif action == "go_back_phase":
+            print("  Returning to fitting phase.")
+            return "go_back_phase"
+        elif action == "discard":
+            # Discard this interval — store None for consistency with skip
+            turnover_results[subset.index] = None
+            print(f"  Interval #{subset.index} discarded (no turnover calculated).")
             current_idx += 1
             continue
         elif action == "go_back":
-            # Go back to previous interval
-            if current_idx > 0:
-                current_idx -= 1
-                print(f"  Going back to interval #{subsets[current_idx].index}.")
-                continue
-            else:
-                print("  Already at first interval.")
-                current_idx += 1
-                continue
+            # Go back to previous interval (only reachable when current_idx > 0)
+            current_idx -= 1
+            print(f"  Going back to interval #{subsets[current_idx].index}.")
+            continue
         elif action == "skip":
             # Skip this interval
             turnover_results[subset.index] = None
@@ -2357,4 +2378,117 @@ def calculate_turnover_before_inactivation(
             current_idx += 1
     
     return turnover_results
+
+
+def review_results(
+    subsets: Sequence[IntervalSubset],
+    all_fit_results: dict[int, dict[str, dict]],
+    turnover_results: dict[int, float | None],
+    filename: str | None = None,
+) -> str:
+    """
+    Display a summary of all fits and turnover results and let the user
+    accept, redo any phase, or discard the file.
+
+    Returns:
+    --------
+    "accept" — save results and move on.
+    "baseline" / "calibration" / "intervals" / "fitting" / "turnover"
+        — redo that phase.
+    "discard" — discard the entire file.
+    """
+    fig, ax = plt.subplots(figsize=(10, 7))
+    plt.subplots_adjust(left=0.05, bottom=0.28, right=0.95, top=0.88)
+    ax.axis("off")
+
+    title = "Review Results"
+    if filename:
+        display_name = truncate_filename(filename)
+        title = f"{display_name} — {title}"
+    ax.set_title(title, fontsize=14, fontweight="bold")
+
+    # Build summary text
+    lines: list[str] = []
+    for subset in subsets:
+        idx = subset.index
+        time_range = f"{subset.start_time:.1f}–{subset.end_time:.1f} s"
+        fits = all_fit_results.get(idx, {})
+        turnover = turnover_results.get(idx, None)
+
+        if fits:
+            model_names = ", ".join(get_model_display_name(m) for m in fits)
+        else:
+            model_names = "none"
+
+        if turnover is not None:
+            turnover_str = f"{turnover:.3f} µM"
+        else:
+            turnover_str = "—"
+
+        lines.append(
+            f"Interval #{idx} ({time_range}):  "
+            f"fits = {model_names},  turnover = {turnover_str}"
+        )
+
+    summary = "\n".join(lines) if lines else "(no intervals)"
+    ax.text(
+        0.05, 0.95, summary,
+        transform=ax.transAxes,
+        fontsize=10, fontfamily="monospace",
+        verticalalignment="top",
+    )
+
+    state = {"action": None}
+
+    def _make_cb(action_name):
+        def cb(_event):
+            state["action"] = action_name
+            plt.close(fig)
+        return cb
+
+    # --- buttons (two rows) ---
+    btn_w, btn_h, gap = 0.14, 0.05, 0.015
+    # Row 1: redo buttons
+    row1_y = 0.14
+    labels_row1 = [
+        ("Redo baseline",     "baseline",     "#d0d0ff", "#a8a8ff"),
+        ("Redo calibration",  "calibration",  "#d0d0ff", "#a8a8ff"),
+        ("Redo intervals",    "intervals",    "#d0d0ff", "#a8a8ff"),
+        ("Redo fitting",      "fitting",      "#d0d0ff", "#a8a8ff"),
+        ("Redo turnover",     "turnover",     "#d0d0ff", "#a8a8ff"),
+    ]
+    x = 0.05
+    for label, action, col, hov in labels_row1:
+        bax = fig.add_axes([x, row1_y, btn_w, btn_h])
+        btn = create_small_button(bax, label, col, hov)
+        btn.on_clicked(_make_cb(action))
+        x += btn_w + gap
+
+    # Row 2: accept / discard
+    row2_y = 0.05
+    accept_ax = fig.add_axes([0.25, row2_y, 0.20, 0.06])
+    discard_ax = fig.add_axes([0.55, row2_y, 0.20, 0.06])
+    btn_accept = create_small_button(accept_ax, "Accept and save", "#90ee90", "#7cd47c")
+    btn_discard = create_small_button(discard_ax, "Discard this file", "#ff6666", "#ff4444")
+    btn_accept.on_clicked(_make_cb("accept"))
+    btn_discard.on_clicked(_make_cb("discard"))
+
+    add_instruction_banner(
+        fig,
+        "Review the results below. Click 'Accept and save' to finalise, "
+        "or use a 'Redo' button to go back to any processing step.",
+    )
+
+    print(
+        "\nReview results:\n"
+        "  • Check the summary above.\n"
+        "  • 'Accept and save' finalises this file.\n"
+        "  • 'Redo …' buttons let you repeat any step.\n"
+        "  • 'Discard this file' skips the file entirely."
+    )
+
+    plt.show()
+    plt.close(fig)
+
+    return state.get("action") or "accept"
 
