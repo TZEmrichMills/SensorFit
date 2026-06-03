@@ -108,6 +108,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _legacy_template_filename(group: "ControlGroup | None") -> str | None:
+    """Single-subgroup, single-control legacy shim.
+
+    For groups built before the multi-control restructure (or for new groups
+    that happen to contain exactly one sub-group with one control) we still
+    use the simple inline `control_subtract` phase inside ``process_file``.
+    This helper extracts the one template name; returns None if the group
+    has zero or multiple controls.
+    """
+    if group is None or not group.subgroups:
+        return None
+    if len(group.subgroups) != 1 or len(group.subgroups[0].controls) != 1:
+        return None
+    return group.subgroups[0].controls[0].template_filename
+
+
 def _prompt_yes_no_residual_activity() -> bool:
     """Small matplotlib yes/no asking whether this run is a residual-activity
     series.  Returns True if the user clicked Yes.
@@ -285,10 +301,20 @@ def process_file(
             # Branch to control-subtract phase for sample files whose group
             # already has a saved template.  Controls and ungrouped files
             # bypass straight to interval selection.
+            # NOTE: the old single-control subtraction phase is retained for
+            # legacy single-control single-subgroup groups (so anyone running
+            # with a controls.json built before the multi-control restructure
+            # still works the same way).  Groups with >=2 controls or >=2
+            # sub-groups go through the new GROUP-LEVEL planning phase after
+            # all files in the group are processed, not through this
+            # inline-per-file path.
+            _legacy_single_ctrl_template = _legacy_template_filename(control_group)
             if (
                 control_role == "sample"
                 and control_group is not None
-                and control_group.template_filename
+                and _legacy_single_ctrl_template is not None
+                and len(control_group.subgroups) == 1
+                and len(control_group.subgroups[0].controls) == 1
             ):
                 phase = "control_subtract"
             else:
@@ -300,14 +326,13 @@ def process_file(
         # ────────────────────────────────────────────────────────
         elif phase == "control_subtract":
             assert control_group is not None and calibrated_dir is not None
+            tpl_name = _legacy_template_filename(control_group)
             try:
-                ct, cy = load_control_template(
-                    calibrated_dir, control_group.template_filename
-                )
+                ct, cy = load_control_template(calibrated_dir, tpl_name)
             except Exception as exc:
                 print(
                     f"Warning: could not load control template "
-                    f"{control_group.template_filename}: {exc}.  Skipping subtraction."
+                    f"{tpl_name}: {exc}.  Skipping subtraction."
                 )
                 phase = "intervals"
                 continue
@@ -368,39 +393,52 @@ def process_file(
                 return None, path, False, control_info
 
             # For control files: pick the reference interval and save the
-            # template to disk so subsequent samples can subtract it.
+            # template to disk so subsequent samples can subtract it.  The
+            # template is recorded against the specific ControlSpec within
+            # the group's sub-group structure.
             if control_role == "control" and control_group is not None:
-                chosen = select_control_reference_interval(
-                    subsets, time_col, filename=path.name
-                )
-                if chosen is None:
-                    print("No reference interval chosen — control will not be subtracted from samples.")
-                    control_group.reference_interval_index = None
-                    control_group.template_filename = None
+                lookup = control_group.find_spec(path.name)
+                if lookup is None:
+                    # Shouldn't happen — main() puts the file in the group
+                    print(f"Warning: control {path.name} not found in group '{control_group.name}'; skipping reference selection.")
                 else:
-                    ref = next((s for s in subsets if s.index == chosen), subsets[0])
-                    if calibrated_dir is None:
-                        calibrated_dir_local = output_dir / "Calibrated"
+                    subgroup_idx, spec = lookup
+                    chosen = select_control_reference_interval(
+                        subsets, time_col, filename=path.name
+                    )
+                    if chosen is None:
+                        print("No reference interval chosen — control will not be subtracted from samples.")
+                        spec.reference_interval_index = None
+                        spec.template_filename = None
                     else:
-                        calibrated_dir_local = calibrated_dir
-                    tpl_path = save_control_template(
-                        calibrated_dir_local,
-                        control_group.name,
-                        ref.data[time_col].to_numpy(dtype=float),
-                        ref.data[CALIBRATED_COLUMN].to_numpy(dtype=float),
-                    )
-                    control_group.reference_interval_index = int(ref.index)
-                    control_group.template_filename = tpl_path.name
-                    control_info = {
-                        "role": "control",
-                        "group": control_group.name,
-                        "reference_interval_index": int(ref.index),
-                        "template_filename": tpl_path.name,
-                    }
-                    print(
-                        f"Saved control template for group '{control_group.name}' "
-                        f"(interval #{ref.index}) → {tpl_path}"
-                    )
+                        ref = next((s for s in subsets if s.index == chosen), subsets[0])
+                        if calibrated_dir is None:
+                            calibrated_dir_local = output_dir / "Calibrated"
+                        else:
+                            calibrated_dir_local = calibrated_dir
+                        # Disambiguate templates with the same file appearing
+                        # in different groups by prefixing with group name.
+                        template_key = f"{control_group.name}__sg{subgroup_idx}__{Path(path.stem).name}"
+                        tpl_path = save_control_template(
+                            calibrated_dir_local,
+                            template_key,
+                            ref.data[time_col].to_numpy(dtype=float),
+                            ref.data[CALIBRATED_COLUMN].to_numpy(dtype=float),
+                        )
+                        spec.reference_interval_index = int(ref.index)
+                        spec.template_filename = tpl_path.name
+                        control_info = {
+                            "role": "control",
+                            "group": control_group.name,
+                            "subgroup_index": subgroup_idx,
+                            "reference_interval_index": int(ref.index),
+                            "template_filename": tpl_path.name,
+                        }
+                        print(
+                            f"Saved control template for {control_group.name}/"
+                            f"{control_group.subgroups[subgroup_idx].name}/{path.name} "
+                            f"(interval #{ref.index}) → {tpl_path}"
+                        )
 
             # Opt-in residual-activity tagging — only ask when there are
             # multiple intervals (single-interval files have nothing to ratio).
@@ -735,21 +773,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("Grouping cancelled.  No subtraction will be performed.")
         else:
             groups = ui_result
-            # Carry over already-saved templates from existing_groups when the
-            # user re-opens the UI without changing anything.
+            # Carry over already-saved templates from existing_groups so a
+            # session can resume without re-processing controls.  Match by
+            # group name + control file name + sub-group index.
             if existing_groups:
                 for name, g in groups.items():
-                    if (
-                        name in existing_groups
-                        and g.control_file == existing_groups[name].control_file
-                        and existing_groups[name].template_filename is not None
-                    ):
-                        g.template_filename = existing_groups[name].template_filename
-                        g.reference_interval_index = existing_groups[name].reference_interval_index
+                    if name not in existing_groups:
+                        continue
+                    old_group = existing_groups[name]
+                    for sg_idx, sg in enumerate(g.subgroups):
+                        if sg_idx >= len(old_group.subgroups):
+                            break
+                        old_sg = old_group.subgroups[sg_idx]
+                        for spec in sg.controls:
+                            old_spec = next(
+                                (c for c in old_sg.controls if c.file_name == spec.file_name),
+                                None,
+                            )
+                            if old_spec and old_spec.template_filename:
+                                spec.template_filename = old_spec.template_filename
+                                spec.reference_interval_index = old_spec.reference_interval_index
             save_controls_manifest(groups, calibrated_out_dir)
             for g in groups.values():
-                role_of[g.control_file] = "control"
-                group_of[g.control_file] = g
+                for ctrl_name in g.all_control_files():
+                    role_of[ctrl_name] = "control"
+                    group_of[ctrl_name] = g
                 for s in g.sample_files:
                     role_of[s] = "sample"
                     group_of[s] = g

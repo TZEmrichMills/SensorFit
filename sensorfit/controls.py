@@ -41,32 +41,133 @@ MAX_EXTRAPOLATION_FRAC = 0.20  # 20 % of control duration
 
 
 @dataclass
-class ControlGroup:
-    """One control + the samples it should be subtracted from."""
+class ControlSpec:
+    """One control file inside a sub-group.
 
-    name: str
-    control_file: str  # bare filename, relative to input dir
-    sample_files: list[str] = field(default_factory=list)
+    After the control has been processed and the user has chosen the reference
+    interval, ``reference_interval_index`` and ``template_filename`` are
+    populated.  Until then they are None.
+    """
+
+    file_name: str
     reference_interval_index: int | None = None
-    template_filename: str | None = None  # filename inside _control_templates/
+    template_filename: str | None = None
 
     def to_dict(self) -> dict:
         return {
-            "name": self.name,
-            "control_file": self.control_file,
-            "sample_files": list(self.sample_files),
+            "file_name": self.file_name,
             "reference_interval_index": self.reference_interval_index,
             "template_filename": self.template_filename,
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "ControlGroup":
+    def from_dict(cls, d: dict) -> "ControlSpec":
         return cls(
-            name=d["name"],
-            control_file=d["control_file"],
-            sample_files=list(d.get("sample_files", [])),
+            file_name=d["file_name"],
             reference_interval_index=d.get("reference_interval_index"),
             template_filename=d.get("template_filename"),
+        )
+
+
+@dataclass
+class ControlSubgroup:
+    """A bundle of controls whose templates get **averaged** together at
+    subtraction time.  At least one control per sub-group.  Sub-groups inside
+    a ``ControlGroup`` are subtracted **sequentially**.
+    """
+
+    name: str  # display name, e.g. "Sub-group 1"
+    controls: list[ControlSpec] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "controls": [c.to_dict() for c in self.controls],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ControlSubgroup":
+        return cls(
+            name=d.get("name", "Sub-group"),
+            controls=[ControlSpec.from_dict(c) for c in d.get("controls", [])],
+        )
+
+
+@dataclass
+class ControlGroup:
+    """One experimental "group" — a set of controls (one or more sub-groups)
+    plus a set of samples those controls apply to.
+
+    Subtraction math for a sample: ``sample − avg(sub-group 0) − avg(sub-group 1) − …``
+    Sub-groups are applied in list order.
+
+    Attributes
+    ----------
+    name : str
+        Display / manifest name.
+    subgroups : list[ControlSubgroup]
+        Ordered list of control sub-groups.  Empty list = no subtraction
+        configured (the group is just a logical bundle).
+    sample_files : list[str]
+        Sample file names (bare names, relative to input dir).
+    """
+
+    name: str
+    subgroups: list[ControlSubgroup] = field(default_factory=list)
+    sample_files: list[str] = field(default_factory=list)
+
+    # Backward-compat shim: some callers want the "primary" control file (for
+    # logging or for the deprecated single-control API).  Returns the first
+    # control of the first sub-group, or "" if none.
+    @property
+    def control_file(self) -> str:  # pragma: no cover - shim only
+        if self.subgroups and self.subgroups[0].controls:
+            return self.subgroups[0].controls[0].file_name
+        return ""
+
+    def all_control_files(self) -> list[str]:
+        """Every control filename across all sub-groups, in order."""
+        out = []
+        for sg in self.subgroups:
+            for c in sg.controls:
+                out.append(c.file_name)
+        return out
+
+    def find_spec(self, file_name: str) -> tuple[int, ControlSpec] | None:
+        """Return (subgroup_index, spec) for the named control, or None."""
+        for i, sg in enumerate(self.subgroups):
+            for c in sg.controls:
+                if c.file_name == file_name:
+                    return i, c
+        return None
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "subgroups": [sg.to_dict() for sg in self.subgroups],
+            "sample_files": list(self.sample_files),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ControlGroup":
+        # Auto-upgrade legacy single-control manifests:
+        #   {name, control_file, sample_files, reference_interval_index?, template_filename?}
+        if "control_file" in d and "subgroups" not in d:
+            spec = ControlSpec(
+                file_name=d["control_file"],
+                reference_interval_index=d.get("reference_interval_index"),
+                template_filename=d.get("template_filename"),
+            )
+            sg = ControlSubgroup(name="Sub-group 1", controls=[spec])
+            return cls(
+                name=d["name"],
+                subgroups=[sg],
+                sample_files=list(d.get("sample_files", [])),
+            )
+        return cls(
+            name=d["name"],
+            subgroups=[ControlSubgroup.from_dict(sg) for sg in d.get("subgroups", [])],
+            sample_files=list(d.get("sample_files", [])),
         )
 
 
@@ -264,14 +365,15 @@ def show_grouping_ui(
 
     dialog = QDialog()
     dialog.setWindowTitle("SensorFit — Control / Sample Grouping")
-    dialog.resize(900, 600)
+    dialog.resize(1000, 650)
 
     layout = QVBoxLayout(dialog)
     layout.addWidget(QLabel(
         "Group controls with their samples.  Files left ungrouped are processed normally.\n"
-        "1. Select files on the left and click 'New group from selected' to make one a control + samples.\n"
-        "2. Select a group on the right and use the buttons to edit it.\n"
-        "Click Done to begin processing (controls first, then samples)."
+        "• Each group can have one or more control sub-groups + a samples list.\n"
+        "• Controls inside the same sub-group are AVERAGED before subtraction.\n"
+        "• Different sub-groups are subtracted SEQUENTIALLY in order (top → bottom).\n"
+        "• Click Done to begin processing — controls first, then samples, then per-group subtraction planning."
     ))
 
     body = QHBoxLayout()
@@ -288,11 +390,16 @@ def show_grouping_ui(
     # Right: groups tree
     right_box = QVBoxLayout()
     body.addLayout(right_box, 1)
-    right_box.addWidget(QLabel("Groups (control → samples)"))
+    right_box.addWidget(QLabel("Groups → sub-groups (averaged) → controls;  Samples"))
     group_tree = QTreeWidget()
-    group_tree.setHeaderLabels(["Group / file", "Role"])
-    group_tree.setColumnWidth(0, 320)
+    group_tree.setHeaderLabels(["Tree", "Type"])
+    group_tree.setColumnWidth(0, 400)
     right_box.addWidget(group_tree, 1)
+
+    # We use Qt.UserRole metadata to identify what each tree item represents.
+    # Roles: "group", "subgroup", "samples_holder", "control_file", "sample_file"
+    TYPE_ROLE = Qt.UserRole
+    META_ROLE = Qt.UserRole + 1  # used to store (group_name, subgroup_idx) etc.
 
     # State
     file_names = [f.name for f in files]
@@ -301,18 +408,33 @@ def show_grouping_ui(
         for g in existing_groups.values():
             groups[g.name] = ControlGroup(
                 name=g.name,
-                control_file=g.control_file,
+                subgroups=[
+                    ControlSubgroup(
+                        name=sg.name,
+                        controls=[
+                            ControlSpec(
+                                file_name=c.file_name,
+                                reference_interval_index=c.reference_interval_index,
+                                template_filename=c.template_filename,
+                            )
+                            for c in sg.controls
+                        ],
+                    )
+                    for sg in g.subgroups
+                ],
                 sample_files=list(g.sample_files),
-                reference_interval_index=g.reference_interval_index,
-                template_filename=g.template_filename,
             )
 
     def assigned_names() -> set[str]:
         out = set()
         for g in groups.values():
-            out.add(g.control_file)
+            out.update(g.all_control_files())
             out.update(g.sample_files)
         return out
+
+    def _set_item_type(item, type_str: str, meta=None) -> None:
+        item.setData(0, TYPE_ROLE, type_str)
+        item.setData(0, META_ROLE, meta)
 
     def refresh_views() -> None:
         assigned = assigned_names()
@@ -320,122 +442,208 @@ def show_grouping_ui(
         for name in file_names:
             if name in assigned:
                 continue
-            item = QListWidgetItem(name)
-            file_list.addItem(item)
+            file_list.addItem(QListWidgetItem(name))
 
         group_tree.clear()
         for g in groups.values():
-            parent = QTreeWidgetItem([g.name, ""])
-            parent.setExpanded(True)
-            ctrl = QTreeWidgetItem([g.control_file, "control"])
-            ctrl.setForeground(0, Qt.darkBlue)
-            parent.addChild(ctrl)
-            for s in g.sample_files:
-                samp = QTreeWidgetItem([s, "sample"])
-                parent.addChild(samp)
-            group_tree.addTopLevelItem(parent)
-            parent.setExpanded(True)
+            grp_item = QTreeWidgetItem([g.name, "group"])
+            grp_item.setForeground(0, Qt.darkBlue)
+            _set_item_type(grp_item, "group", g.name)
+            grp_item.setExpanded(True)
 
+            for sg_idx, sg in enumerate(g.subgroups):
+                tag = " (averaged)" if len(sg.controls) > 1 else ""
+                sg_item = QTreeWidgetItem([f"{sg.name}{tag}", "sub-group"])
+                sg_item.setForeground(0, Qt.darkGreen)
+                _set_item_type(sg_item, "subgroup", (g.name, sg_idx))
+                for spec in sg.controls:
+                    label = spec.file_name
+                    if spec.template_filename:
+                        label += "  ✓"
+                    c_item = QTreeWidgetItem([label, "control"])
+                    _set_item_type(c_item, "control_file", (g.name, sg_idx, spec.file_name))
+                    sg_item.addChild(c_item)
+                grp_item.addChild(sg_item)
+                sg_item.setExpanded(True)
+
+            samples_item = QTreeWidgetItem(["Samples", ""])
+            samples_item.setForeground(0, Qt.darkRed)
+            _set_item_type(samples_item, "samples_holder", g.name)
+            for s in g.sample_files:
+                s_item = QTreeWidgetItem([s, "sample"])
+                _set_item_type(s_item, "sample_file", (g.name, s))
+                samples_item.addChild(s_item)
+            grp_item.addChild(samples_item)
+            samples_item.setExpanded(True)
+
+            group_tree.addTopLevelItem(grp_item)
+
+    # ── Tree helpers ──────────────────────────────────────────────────
+    def _current_kind() -> tuple[str | None, object | None]:
+        item = group_tree.currentItem()
+        if item is None:
+            return None, None
+        return item.data(0, TYPE_ROLE), item.data(0, META_ROLE)
+
+    def _group_of_selection() -> ControlGroup | None:
+        kind, meta = _current_kind()
+        if kind == "group":
+            return groups.get(meta)
+        if kind == "subgroup":
+            return groups.get(meta[0])
+        if kind == "samples_holder":
+            return groups.get(meta)
+        if kind == "control_file":
+            return groups.get(meta[0])
+        if kind == "sample_file":
+            return groups.get(meta[0])
+        return None
+
+    # ── Button actions ────────────────────────────────────────────────
     def new_group(_=None) -> None:
-        selected = [i.text() for i in file_list.selectedItems()]
-        if not selected:
-            QMessageBox.information(dialog, "New group", "Select at least one file in the left list first.")
-            return
-        # First selected becomes control by default
-        control_name = selected[0]
-        default_group_name = f"Group_{len(groups) + 1}"
-        name, ok = QInputDialog.getText(
-            dialog, "Group name", "Group name:", text=default_group_name
-        )
+        default = f"Group_{len(groups) + 1}"
+        name, ok = QInputDialog.getText(dialog, "Group name", "Group name:", text=default)
         if not ok or not name.strip():
             return
         name = name.strip()
         if name in groups:
             QMessageBox.warning(dialog, "Group name", f"A group named '{name}' already exists.")
             return
+        # Start with one empty sub-group so the user can immediately add controls.
         groups[name] = ControlGroup(
             name=name,
-            control_file=control_name,
-            sample_files=selected[1:],
+            subgroups=[ControlSubgroup(name="Sub-group 1", controls=[])],
+            sample_files=[],
         )
         refresh_views()
 
-    def add_to_selected_group(_=None) -> None:
+    def new_subgroup(_=None) -> None:
+        g = _group_of_selection()
+        if g is None:
+            QMessageBox.information(dialog, "Sub-group", "Select a group (or item inside one) on the right first.")
+            return
+        g.subgroups.append(
+            ControlSubgroup(name=f"Sub-group {len(g.subgroups) + 1}", controls=[])
+        )
+        refresh_views()
+
+    def add_files_as_controls(_=None) -> None:
         files_selected = [i.text() for i in file_list.selectedItems()]
         if not files_selected:
-            QMessageBox.information(dialog, "Add to group", "Select files on the left.")
+            QMessageBox.information(dialog, "Add as controls", "Select files on the left first.")
             return
-        group_item = group_tree.currentItem()
-        if group_item is None or group_item.parent() is not None:
-            QMessageBox.information(dialog, "Add to group", "Select a group (top-level) on the right.")
-            return
-        g = groups[group_item.text(0)]
-        g.sample_files.extend(files_selected)
-        refresh_views()
-
-    def remove_selected_from_group(_=None) -> None:
-        item = group_tree.currentItem()
-        if item is None:
-            return
-        if item.parent() is None:
-            # removing a whole group
-            name = item.text(0)
-            if name in groups:
-                del groups[name]
+        kind, meta = _current_kind()
+        # Accept either a sub-group selection or a group selection (defaults
+        # to the last sub-group of that group)
+        if kind == "subgroup":
+            g = groups[meta[0]]
+            sg = g.subgroups[meta[1]]
+        elif kind == "group":
+            g = groups[meta]
+            if not g.subgroups:
+                g.subgroups.append(ControlSubgroup(name="Sub-group 1", controls=[]))
+            sg = g.subgroups[-1]
         else:
-            group_name = item.parent().text(0)
-            file_name = item.text(0)
-            g = groups[group_name]
-            if file_name == g.control_file:
-                QMessageBox.information(
-                    dialog,
-                    "Remove",
-                    "This file is the control for the group.  Delete the whole group instead (select the top-level entry).",
-                )
-                return
-            if file_name in g.sample_files:
-                g.sample_files.remove(file_name)
+            QMessageBox.information(
+                dialog,
+                "Add as controls",
+                "Select the target sub-group (or its parent group) on the right first.",
+            )
+            return
+        for fn in files_selected:
+            sg.controls.append(ControlSpec(file_name=fn))
         refresh_views()
 
-    def promote_to_control(_=None) -> None:
-        item = group_tree.currentItem()
-        if item is None or item.parent() is None:
-            QMessageBox.information(dialog, "Promote", "Select a sample inside a group.")
+    def add_files_as_samples(_=None) -> None:
+        files_selected = [i.text() for i in file_list.selectedItems()]
+        if not files_selected:
+            QMessageBox.information(dialog, "Add as samples", "Select files on the left first.")
             return
-        group_name = item.parent().text(0)
-        new_ctrl = item.text(0)
-        g = groups[group_name]
-        old_ctrl = g.control_file
-        if new_ctrl not in g.sample_files:
+        g = _group_of_selection()
+        if g is None:
+            QMessageBox.information(dialog, "Add as samples", "Select a target group on the right first.")
             return
-        g.sample_files.remove(new_ctrl)
-        g.sample_files.insert(0, old_ctrl)
-        g.control_file = new_ctrl
-        # Reset reference interval since the control changed
-        g.reference_interval_index = None
-        g.template_filename = None
+        for fn in files_selected:
+            if fn not in g.sample_files:
+                g.sample_files.append(fn)
+        refresh_views()
+
+    def move_subgroup(direction: int):
+        def _act(_=None):
+            kind, meta = _current_kind()
+            if kind != "subgroup":
+                QMessageBox.information(dialog, "Move", "Select a sub-group to reorder.")
+                return
+            g = groups[meta[0]]
+            idx = meta[1]
+            new_idx = idx + direction
+            if 0 <= new_idx < len(g.subgroups):
+                g.subgroups[idx], g.subgroups[new_idx] = g.subgroups[new_idx], g.subgroups[idx]
+                # Refresh names so they match new positions
+                for i, sg in enumerate(g.subgroups, start=1):
+                    sg.name = f"Sub-group {i}"
+                refresh_views()
+        return _act
+
+    def remove_selected(_=None) -> None:
+        kind, meta = _current_kind()
+        if kind is None:
+            return
+        if kind == "group":
+            groups.pop(meta, None)
+        elif kind == "subgroup":
+            g = groups[meta[0]]
+            del g.subgroups[meta[1]]
+            for i, sg in enumerate(g.subgroups, start=1):
+                sg.name = f"Sub-group {i}"
+        elif kind == "control_file":
+            g = groups[meta[0]]
+            sg = g.subgroups[meta[1]]
+            sg.controls = [c for c in sg.controls if c.file_name != meta[2]]
+        elif kind == "sample_file":
+            g = groups[meta[0]]
+            g.sample_files.remove(meta[1])
+        elif kind == "samples_holder":
+            g = groups[meta]
+            g.sample_files.clear()
         refresh_views()
 
     # Buttons
-    btn_row = QHBoxLayout()
-    layout.addLayout(btn_row)
-    b_new = QPushButton("New group from selected")
-    b_add = QPushButton("Add selected → current group")
-    b_promote = QPushButton("Make selected sample the control")
-    b_remove = QPushButton("Remove selected / group")
+    btn_row1 = QHBoxLayout()
+    btn_row2 = QHBoxLayout()
+    layout.addLayout(btn_row1)
+    layout.addLayout(btn_row2)
+    b_new = QPushButton("New group")
+    b_subg = QPushButton("New sub-group in selected group")
+    b_addc = QPushButton("Add selected files → sub-group (controls)")
+    b_adds = QPushButton("Add selected files → samples")
+    b_up = QPushButton("↑ Move sub-group up")
+    b_down = QPushButton("↓ Move sub-group down")
+    b_rm = QPushButton("Remove selected")
     b_done = QPushButton("Done")
     b_cancel = QPushButton("Cancel")
-    for b in (b_new, b_add, b_promote, b_remove, b_done, b_cancel):
-        btn_row.addWidget(b)
+    for b in (b_new, b_subg, b_addc, b_adds):
+        btn_row1.addWidget(b)
+    for b in (b_up, b_down, b_rm, b_done, b_cancel):
+        btn_row2.addWidget(b)
 
     b_new.clicked.connect(new_group)
-    b_add.clicked.connect(add_to_selected_group)
-    b_promote.clicked.connect(promote_to_control)
-    b_remove.clicked.connect(remove_selected_from_group)
+    b_subg.clicked.connect(new_subgroup)
+    b_addc.clicked.connect(add_files_as_controls)
+    b_adds.clicked.connect(add_files_as_samples)
+    b_up.clicked.connect(move_subgroup(-1))
+    b_down.clicked.connect(move_subgroup(+1))
+    b_rm.clicked.connect(remove_selected)
 
     result = {"action": None}
 
     def on_done() -> None:
+        # Sanity-check: drop sub-groups with zero controls so saved manifest stays clean
+        for g in list(groups.values()):
+            g.subgroups = [sg for sg in g.subgroups if sg.controls]
+            # Optionally drop groups with zero controls AND zero samples
+            if not g.subgroups and not g.sample_files:
+                del groups[g.name]
         result["action"] = "done"
         dialog.accept()
 

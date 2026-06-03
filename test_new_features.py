@@ -85,9 +85,11 @@ def test_fit_summary_filter() -> bool:
 # ──────────────────────────────────────────────────────────────────────────
 
 def test_controls_manifest_roundtrip() -> bool:
-    _section("Commit 2: controls manifest round-trip")
+    _section("Commit 2: controls manifest round-trip (new multi-control model)")
+    import json
     from sensorfit.controls import (
-        ControlGroup, save_controls_manifest, load_controls_manifest,
+        ControlGroup, ControlSubgroup, ControlSpec,
+        save_controls_manifest, load_controls_manifest,
     )
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -95,25 +97,76 @@ def test_controls_manifest_roundtrip() -> bool:
         groups = {
             "G_A": ControlGroup(
                 name="G_A",
-                control_file="ctrl1.xlsx",
+                subgroups=[
+                    ControlSubgroup(
+                        name="Sub-group 1",
+                        controls=[
+                            ControlSpec(
+                                file_name="ctrl1.xlsx",
+                                reference_interval_index=2,
+                                template_filename="G_A_ctrl1.csv",
+                            ),
+                            ControlSpec(
+                                file_name="ctrl1b.xlsx",
+                                reference_interval_index=1,
+                                template_filename="G_A_ctrl1b.csv",
+                            ),
+                        ],
+                    ),
+                    ControlSubgroup(
+                        name="Sub-group 2",
+                        controls=[
+                            ControlSpec(file_name="ctrl2.xlsx"),
+                        ],
+                    ),
+                ],
                 sample_files=["s1.xlsx", "s2.xlsx"],
-                reference_interval_index=2,
-                template_filename="G_A.csv",
             ),
             "G_B": ControlGroup(
                 name="G_B",
-                control_file="ctrl2.xlsx",
+                subgroups=[
+                    ControlSubgroup(name="Sub-group 1", controls=[ControlSpec(file_name="ctrl3.xlsx")]),
+                ],
                 sample_files=["s3.xlsx"],
             ),
         }
         save_controls_manifest(groups, calib)
         loaded = load_controls_manifest(calib)
         assert set(loaded) == set(groups)
+        assert len(loaded["G_A"].subgroups) == 2
+        assert len(loaded["G_A"].subgroups[0].controls) == 2
+        assert loaded["G_A"].subgroups[0].controls[0].reference_interval_index == 2
+        assert loaded["G_A"].subgroups[0].controls[0].template_filename == "G_A_ctrl1.csv"
         assert loaded["G_A"].sample_files == ["s1.xlsx", "s2.xlsx"]
-        assert loaded["G_A"].reference_interval_index == 2
-        assert loaded["G_A"].template_filename == "G_A.csv"
-        assert loaded["G_B"].reference_interval_index is None
-        print("  ✓ manifest round-trip preserves all ControlGroup fields")
+        print("  ✓ new multi-control manifest round-trips (2 subgroups, 3 controls in G_A)")
+
+    # Legacy auto-upgrade: a manifest written in the old single-control format
+    # should load into a single-subgroup, single-control group.
+    with tempfile.TemporaryDirectory() as tmp:
+        calib = Path(tmp) / "Calibrated"
+        calib.mkdir(parents=True)
+        legacy_payload = {
+            "version": 1,
+            "groups": [
+                {
+                    "name": "G_legacy",
+                    "control_file": "old_ctrl.xlsx",
+                    "sample_files": ["s1.xlsx"],
+                    "reference_interval_index": 1,
+                    "template_filename": "old_ctrl.csv",
+                }
+            ],
+        }
+        with open(calib / "controls.json", "w") as fh:
+            json.dump(legacy_payload, fh)
+        loaded = load_controls_manifest(calib)
+        assert loaded is not None and "G_legacy" in loaded
+        g = loaded["G_legacy"]
+        assert len(g.subgroups) == 1 and len(g.subgroups[0].controls) == 1
+        assert g.subgroups[0].controls[0].file_name == "old_ctrl.xlsx"
+        assert g.subgroups[0].controls[0].template_filename == "old_ctrl.csv"
+        assert g.sample_files == ["s1.xlsx"]
+        print("  ✓ legacy single-control manifest auto-upgrades to new nested format")
     return True
 
 

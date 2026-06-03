@@ -18,6 +18,8 @@ from .calibration import (
 )
 from .controls import (
     ControlGroup,
+    ControlSubgroup,
+    ControlSpec,
     show_grouping_ui,
     save_controls_manifest,
     load_controls_manifest,
@@ -58,6 +60,8 @@ __all__ = [
     "interactive_interval_fitting",
     # Control-subtraction exports
     "ControlGroup",
+    "ControlSubgroup",
+    "ControlSpec",
     "show_grouping_ui",
     "save_controls_manifest",
     "load_controls_manifest",
