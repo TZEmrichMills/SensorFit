@@ -473,8 +473,8 @@ def select_control_reference_interval(
     if len(subsets) == 1:
         return subsets[0].index
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    plt.subplots_adjust(left=0.1, bottom=0.20, right=0.98, top=0.82)
+    fig, ax = plt.subplots(figsize=(10, 6.4))
+    plt.subplots_adjust(left=0.1, bottom=0.20, right=0.98, top=0.78)
 
     colours = plt.cm.tab10.colors
     for i, s in enumerate(subsets):
@@ -489,14 +489,20 @@ def select_control_reference_interval(
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("H2O2 (µM)")
     ax.legend(loc="best", fontsize=8)
-    title = "Pick the control-reference interval (click the matching button below)"
+    # Consolidate filename + instructions into a single banner so the title
+    # and banner never overlap.
+    header = ""
     if filename:
-        title = f"{truncate_filename(filename)}\n{title}"
-    ax.set_title(title)
+        header = f"{truncate_filename(filename)}\n"
     add_instruction_banner(
         fig,
-        "Choose which interval of this CONTROL file should be subtracted from "
-        "the sample files in this group.",
+        header + (
+            "Pick the control-reference interval: choose which interval of this "
+            "CONTROL file should be subtracted from the sample files in this "
+            "group (click the matching button below)."
+        ),
+        y=0.97,
+        width=95,
     )
 
     choice = {"idx": None}
@@ -554,11 +560,25 @@ def interactive_subtract(
     # should "start".
     anchor = {"t0": float(sample_time[0])}
 
-    fig, ax = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
-    plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.86, hspace=0.25)
+    fig, ax = plt.subplots(2, 1, figsize=(11, 7.4), sharex=True)
+    plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.80, hspace=0.25)
 
     line_sample, = ax[0].plot(sample_time, sample_h2o2, color="tab:green", lw=1.3, label="Sample (calibrated)")
     line_control, = ax[0].plot([], [], color="tab:red", lw=1.2, alpha=0.75, label="Control template (aligned)")
+    # Anchor markers: a tall dashed line spanning each subplot's full height
+    # plus a triangle on the time axis.  Much more visible than the implicit
+    # "where the red line begins".
+    anchor_line_top = ax[0].axvline(
+        anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9, label="Anchor (control t=0)",
+    )
+    anchor_line_bot = ax[1].axvline(
+        anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9,
+    )
+    anchor_text = ax[0].annotate(
+        "", xy=(anchor["t0"], 0), xycoords=("data", "axes fraction"),
+        xytext=(6, 6), textcoords="offset points",
+        color="#8B008B", fontsize=9, fontweight="bold",
+    )
     ax[0].set_ylabel("H2O2 (µM)")
     ax[0].legend(loc="upper right", fontsize=9)
 
@@ -573,21 +593,22 @@ def interactive_subtract(
         fontsize=8, va="top", color="darkred",
     )
 
-    title_parts = []
+    # Combine filename, group, and instructions into a single banner so they
+    # never overlap.  No separate suptitle.
+    header_parts = []
     if filename:
-        title_parts.append(truncate_filename(filename))
+        header_parts.append(truncate_filename(filename))
     if group_name:
-        title_parts.append(f"control group: {group_name}")
-    title_parts.append("Click on the sample to re-anchor control start; or use buttons below.")
-    fig.suptitle("  |  ".join(title_parts), fontsize=10)
-
-    add_instruction_banner(
-        fig,
-        "Top: sample (green) and control (red) aligned on the same time axis.  "
-        "Bottom: sample minus control.  Re-anchor by clicking on the upper plot.  "
-        "When the alignment looks correct, click Accept to subtract.",
-        y=0.99,
+        header_parts.append(f"control group: {group_name}")
+    header_str = "  |  ".join(header_parts) if header_parts else ""
+    banner_text = (
+        (header_str + "\n") if header_str else ""
+    ) + (
+        "Top: sample (green) and control (red).  Bottom: sample − control.  "
+        "Click on the upper plot to re-anchor the control's t=0 (purple dashed line).  "
+        "When alignment looks right, click Accept & subtract."
     )
+    add_instruction_banner(fig, banner_text, y=0.985, width=110)
 
     def redraw() -> None:
         # Shift control onto sample's time axis at the current anchor.
@@ -596,6 +617,11 @@ def interactive_subtract(
         diff = sample_h2o2 - interp
         line_control.set_data(sample_time, interp)
         line_diff.set_data(sample_time, diff)
+        # Update anchor markers
+        anchor_line_top.set_xdata([anchor["t0"], anchor["t0"]])
+        anchor_line_bot.set_xdata([anchor["t0"], anchor["t0"]])
+        anchor_text.set_text(f"anchor t={anchor['t0']:.2f} s")
+        anchor_text.xy = (anchor["t0"], 0)
         for a in ax:
             a.relim()
             a.autoscale_view()
