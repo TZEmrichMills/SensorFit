@@ -7,6 +7,7 @@ Interactive tool for calibrating amperometric sensor traces to H₂O₂ concentr
 - [Quick Start](#quick-start)
 - [What to Expect When You Run SensorFit](#what-to-expect-when-you-run-sensorfit)
 - [Command Line Arguments](#command-line-arguments)
+- [Advanced features](#advanced-features) — control subtraction, residual activity, back-extrapolation, resilient summary
 - [Post-processing: Collecting Intervals](#post-processing-collecting-intervals)
 - [Detailed Installation Guide](#detailed-installation-guide)
 - [Troubleshooting](#troubleshooting)
@@ -102,7 +103,9 @@ The turnover value is displayed on the plot and recorded in the summary.
 
 ### 6. Next File
 
-Results (calibrated data, interval Excel files, fit parameters) are saved under a `Calibrated/` folder. The original file is moved to a `Processed/` folder. A running `fit_summary.xlsx` is updated with all fit results across files. SensorFit then opens the next file and repeats from step 1.
+Results (calibrated data, interval Excel files, fit parameters) are saved under a `Calibrated/` folder. The original file is moved to a `Processed/` folder. A running `fit_summary.xlsx` is updated with all fit results across files **inside `Calibrated/`** (it used to live at the root of the input directory; see the [Advanced features](#advanced-features) section for the resilience fix). SensorFit then opens the next file and repeats from step 1.
+
+If a session is interrupted (Ctrl-C, crash, lost power), just re-run the same command — SensorFit detects the existing `Calibrated/fit_summary.xlsx` and resumes appending to it. Files already in `Processed/` are skipped automatically.
 
 ---
 
@@ -119,6 +122,77 @@ Results (calibrated data, interval Excel files, fit parameters) are saved under 
 | `--window` | `50` | Samples to average around each click |
 | `--calibration-values` | `"0,20,40,60,80,100"` | Comma-separated µM H₂O₂ concentrations |
 | `--force` | off | Overwrite existing output files |
+| `--control-mode` | off | Open a grouping UI at session start so a control trace (no-enzyme, etc.) can be subtracted from selected sample files. See [Control subtraction](#control-subtraction) below. Auto-enabled if `Calibrated/controls.json` already exists. |
+
+---
+
+## Advanced features
+
+These features are all **opt-in** — if you don't use them, SensorFit behaves exactly as before. Each feature adds extra columns to `fit_summary.xlsx` only when used.
+
+### Control subtraction
+
+Many experimental designs involve measuring a **no-enzyme control** (or any other baseline-style trace) and subtracting it from the corresponding with-enzyme samples. SensorFit can do this in one pass.
+
+**Run:**
+
+```bash
+python -m sensorfit.calibration_cli --input-dir /path/to/folder --num-points 6 --calibration-values "0,20,40,60,80,100" --control-mode --force
+```
+
+**Flow:**
+
+1. A grouping window opens listing every unprocessed file in the input folder. Select files on the left, click **New group from selected** — the first selected file becomes the control and the rest become its samples. You can rename groups, add files to existing groups, or promote a sample to be the control. Files left ungrouped are processed normally. The grouping is saved to `Calibrated/controls.json` so an interrupted session can resume.
+2. SensorFit reorders the queue: **all controls first**, then samples of each group, then any ungrouped files. Each control goes through the normal baseline → calibration → interval-selection flow. After selecting intervals on a control, you're asked which interval is the **subtraction reference**. That interval is saved as `Calibrated/_control_templates/<group_name>.csv` (time-zeroed at the interval start).
+3. When a sample comes up, after calibration you see a new screen showing the sample (green) and the aligned control template (red) on the same time axis, with the subtracted result below. Click on the sample plot to **re-anchor** the control. Choose **Accept & subtract**, **Skip**, or **Back**.
+4. After subtraction, the corrected `H2O2_uM` trace replaces the original calibrated trace, and you continue with normal interval selection / fitting / turnover.
+
+The per-interval Excel files and the `fit_summary.xlsx` rows for subtracted samples carry two extra columns: `control_subtracted` (bool) and `control_group` (the group name).
+
+**Multiple control types** are supported via separate groups. A group's "control" can be anything you want subtracted — no-enzyme runs, buffer-only baselines, etc.
+
+### Multi-addition residual activity
+
+If a single run contained **multiple successive H₂O₂ additions** (addition 1 → consume → addition 2 → consume → …), each addition typically becomes its own interval. The ratio of the second interval's initial rate to the first interval's initial rate gives the **residual activity** — how much of the enzyme's original activity remains after the first addition's consumption.
+
+**How to use it:**
+
+1. Define ≥2 intervals during the normal interval-selection step.
+2. After confirming intervals, a small dialog asks **"Multi-addition residual-activity series?"** Click Yes.
+3. A checkbox dialog lists every interval — tick the ones that belong to the series (usually all of them) and click **Save selection**.
+4. After fitting, ratios are written to a new `residual_activity_ratio` column in `fit_summary.xlsx`:
+   - The first interval in the series gets `1.0`.
+   - Each later interval gets `best_initial_rate / first_interval_initial_rate`.
+   - Intervals outside the series get NaN.
+
+This replaces the by-hand computation in the `Rate ratio` table of the older analysis Excels.
+
+### H₂O₂-injection-start back-extrapolation
+
+When a reaction begins with an H₂O₂ injection and you used a **two-point calibration** (pre-addition = 0 µM, just-after-addition = e.g. 100 µM), the calibrated concentrations are systematically under-estimated: the enzyme has already consumed some H₂O₂ during the instrument deadtime (~1–2 s before the first reliable reading). The correction is:
+
+1. **Back-extrapolate** the fitted Exponential model to `t_start − deadtime` to recover the true [H₂O₂] at the moment of addition.
+2. Compute the **stretch factor** `back_extrap_uM / nominal_uM` — by how much the calibration under-estimated.
+3. Compute the **stretched initial rate** = `rate_at_back × stretch_factor`. This combines the steeper slope at the (earlier) true t₀ with the calibration rescale.
+
+**How to use it:**
+
+1. Fit at least an Exponential model to the relevant interval (the back-extrap also works with a `LinearInitialRate` fit but is less accurate).
+2. After the fitting phase, a dialog asks **"H₂O₂-injection-start back-extrapolation?"** Click Yes.
+3. For each interval, a preview screen lets you enter the **deadtime** (default 1.5 s) and the **nominal H₂O₂ added** (default = the observed initial value). Click **Compute** to preview the back-extrapolated curve (red, dashed) and the computed values. Click **Accept & record** to save, **Skip** to pass on this interval, or **Back** to abort the back-extrap phase.
+
+Six new columns are added to `fit_summary.xlsx` for accepted intervals: `back_extrap_applied`, `back_extrap_deadtime_s`, `back_extrap_nominal_uM`, `back_extrap_H2O2_at_true_t0_uM`, `back_extrap_stretch_factor`, `back_extrap_stretch_initial_rate_uM_per_s`. These mirror the columns in older hand-computed analyses (`Back extrap`, `Stretch factor`, `Stretch initial rate`).
+
+### Resilient `fit_summary.xlsx`
+
+`fit_summary.xlsx` now lives **inside `Calibrated/`** rather than at the root of the input directory. This prevents two issues that bit earlier versions:
+
+- SensorFit no longer tries to "process" its own summary as input data (the summary used to be discovered as a `.xlsx` in the input folder).
+- An interrupted session can be restarted with the same command, and SensorFit will resume appending to the existing summary instead of creating a duplicate.
+
+A legacy `fit_summary.xlsx` at the root of an input directory is **automatically migrated** into `Calibrated/` on first run, so existing experiments continue cleanly.
+
+Re-running a file (move it from `Processed/` back to the root and re-launch) now **replaces** the corresponding row(s) in `fit_summary.xlsx` rather than duplicating them.
 
 ---
 
