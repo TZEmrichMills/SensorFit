@@ -27,6 +27,10 @@ from .controls import (
     interactive_subtract,
     select_control_reference_interval,
 )
+from .residual_activity import (
+    compute_residual_activity,
+    tag_residual_activity_series,
+)
 
 __all__ = [
     "MODEL_FUNCS",
@@ -57,5 +61,8 @@ __all__ = [
     "interpolate_control_to_grid",
     "interactive_subtract",
     "select_control_reference_interval",
+    # Residual-activity exports
+    "compute_residual_activity",
+    "tag_residual_activity_series",
 ]
 
