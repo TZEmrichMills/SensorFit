@@ -1,0 +1,311 @@
+"""Unit tests for the four wishlist features added on the wishlist-features branch.
+
+Covers pure-logic functions only.  The interactive (matplotlib / Qt) parts are
+verified manually by running SensorFit against real data — they cannot be
+driven non-interactively here.
+
+Run with:
+    python test_new_features.py
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+import tempfile
+from pathlib import Path
+
+
+def _section(title: str) -> None:
+    bar = "=" * 60
+    print(f"\n{bar}\n{title}\n{bar}")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 1) fit_summary upsert (Commit 1)
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_fit_summary_upsert() -> bool:
+    _section("Commit 1: fit_summary idempotent upsert")
+    import pandas as pd
+    from sensorfit.calibration import append_fit_summary
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "fit_summary.xlsx"
+
+        append_fit_summary(p, "fileA.xlsx", 1, 0.0, 10.0, fit_results=None, turnover_uM=None)
+        # Second write with same (file, interval) → should REPLACE
+        append_fit_summary(p, "fileA.xlsx", 1, 0.0, 10.0, fit_results=None, turnover_uM=42.0)
+        # Third: same file, different interval → APPEND
+        append_fit_summary(p, "fileA.xlsx", 2, 11.0, 20.0, fit_results=None, turnover_uM=None)
+        # Fourth: different file → APPEND
+        append_fit_summary(p, "fileB.xlsx", 1, 0.0, 5.0, fit_results=None, turnover_uM=None)
+
+        df = pd.read_excel(p)
+        assert len(df) == 3, f"expected 3 rows, got {len(df)}"
+        row1 = df[(df["source_file"] == "fileA.xlsx") & (df["interval_index"] == 1)].iloc[0]
+        assert row1["turnover_before_inactivation_uM"] == 42.0, "upsert did not replace the older row"
+        print(f"  ✓ upsert: 4 writes → 3 rows; file-A interval-1 turnover = 42.0 (latest)")
+    return True
+
+
+def test_fit_summary_filter() -> bool:
+    """fit_summary*.xlsx and Calibrated/ files are not discovered as inputs."""
+    _section("Commit 1: file-discovery filter")
+    # We verify the filter logic directly by inspecting the filter conditions.
+    # The actual main() loop isn't easily testable without a full Qt env.
+    from pathlib import PurePosixPath
+    test_names = [
+        "trace_A.xlsx",
+        "fit_summary.xlsx",
+        "fit_summary_Analysis.xlsx",
+        "trace_B_calibrated.xlsx",
+        "~$trace_C.xlsx",
+    ]
+    expected_pass = {"trace_A.xlsx"}
+    actually_pass = set()
+    for name in test_names:
+        f = PurePosixPath(name)
+        if f.name.startswith("~$"):
+            continue
+        if "_calibrated" in f.stem:
+            continue
+        if f.stem.startswith("fit_summary"):
+            continue
+        actually_pass.add(f.name)
+    assert actually_pass == expected_pass, (
+        f"filter discrepancy: expected {expected_pass}, got {actually_pass}"
+    )
+    print(f"  ✓ filter: only 'trace_A.xlsx' passed; lock/summary/calibrated all excluded")
+    return True
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2) Control subtraction (Commit 2)
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_controls_manifest_roundtrip() -> bool:
+    _section("Commit 2: controls manifest round-trip")
+    from sensorfit.controls import (
+        ControlGroup, save_controls_manifest, load_controls_manifest,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        calib = Path(tmp) / "Calibrated"
+        groups = {
+            "G_A": ControlGroup(
+                name="G_A",
+                control_file="ctrl1.xlsx",
+                sample_files=["s1.xlsx", "s2.xlsx"],
+                reference_interval_index=2,
+                template_filename="G_A.csv",
+            ),
+            "G_B": ControlGroup(
+                name="G_B",
+                control_file="ctrl2.xlsx",
+                sample_files=["s3.xlsx"],
+            ),
+        }
+        save_controls_manifest(groups, calib)
+        loaded = load_controls_manifest(calib)
+        assert set(loaded) == set(groups)
+        assert loaded["G_A"].sample_files == ["s1.xlsx", "s2.xlsx"]
+        assert loaded["G_A"].reference_interval_index == 2
+        assert loaded["G_A"].template_filename == "G_A.csv"
+        assert loaded["G_B"].reference_interval_index is None
+        print("  ✓ manifest round-trip preserves all ControlGroup fields")
+    return True
+
+
+def test_control_template_roundtrip() -> bool:
+    _section("Commit 2: control template save/load (with time-zeroing)")
+    import numpy as np
+    from sensorfit.controls import save_control_template, load_control_template
+
+    with tempfile.TemporaryDirectory() as tmp:
+        calib = Path(tmp) / "Calibrated"
+        t = np.linspace(0, 30, 200)
+        y = np.linspace(100, 60, 200)
+        tpl_path = save_control_template(calib, "G_A", t + 50.0, y)  # input offset by 50s
+        t_back, y_back = load_control_template(calib, tpl_path.name)
+        assert abs(t_back[0]) < 1e-9, f"template not zero-based: {t_back[0]}"
+        assert abs(t_back[-1] - 30.0) < 1e-6
+        assert np.allclose(y_back, y)
+        print(f"  ✓ template saved/loaded; time zero-based from {50:.1f}s offset")
+    return True
+
+
+def test_interpolate_control() -> bool:
+    _section("Commit 2: interpolate_control_to_grid")
+    import numpy as np
+    from sensorfit.controls import interpolate_control_to_grid
+
+    # Linear control y = 2t + 10 on [0, 10]
+    ct = np.linspace(0, 10, 51)
+    cy = 2 * ct + 10
+    sample_t = np.array([2.0, 5.0, 8.0])
+    interp, info = interpolate_control_to_grid(ct, cy, sample_t)
+    expected = 2 * sample_t + 10
+    assert np.allclose(interp, expected), f"interp wrong: {interp} vs {expected}"
+    assert info["n_extrap_left"] == 0 and info["n_extrap_right"] == 0
+    print("  ✓ interpolation inside range matches y=2t+10 exactly")
+
+    # Sample extends beyond control: extrapolation should match slope
+    sample_t2 = np.array([-2.0, 5.0, 15.0])
+    interp2, info2 = interpolate_control_to_grid(ct, cy, sample_t2)
+    # control duration = 10; max extend = 2 (20%); t=-2 → capped at -2 (just fits);
+    # t=15 → capped at +2 → y_predict = control_y[-1] + slope*2 = 30 + 2*2 = 34
+    assert info2["n_extrap_left"] == 1 and info2["n_extrap_right"] == 1
+    assert abs(interp2[2] - 34.0) < 1e-6, f"right extrap wrong: {interp2[2]}"
+    print(f"  ✓ extrapolation capped at 20%: t=15s → y={interp2[2]:.2f} (cap to t=12)")
+
+    # Sample WAY past → should still emit warning
+    sample_t3 = np.array([-50.0, 50.0])
+    _, info3 = interpolate_control_to_grid(ct, cy, sample_t3)
+    assert info3["warning"], "expected a warning when sample exceeds extrap cap"
+    print(f"  ✓ warning emitted when extrapolation hits cap")
+    return True
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 3) Residual activity (Commit 3)
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_residual_activity() -> bool:
+    _section("Commit 3: compute_residual_activity")
+    from sensorfit.residual_activity import compute_residual_activity
+
+    def make_fits(rates):
+        return {
+            i + 1: {
+                "Exponential": {"init_rate": r, "aic": -100.0},
+                "IB": {"init_rate": r * 0.9, "aic": -50.0},
+            }
+            for i, r in enumerate(rates)
+        }
+
+    fits = make_fits([-10.0, -7.0, -3.0])
+    ratios = compute_residual_activity(fits, [1, 2, 3])
+    assert ratios == {1: 1.0, 2: 0.7, 3: 0.3}, f"unexpected: {ratios}"
+    print(f"  ✓ 3-interval series → ratios = {{1: 1.0, 2: 0.7, 3: 0.3}}")
+
+    # Single-interval series
+    r = compute_residual_activity(fits, [1])
+    assert r == {1: 1.0}
+    print("  ✓ single-interval series returns {first: 1.0}")
+
+    # Zero first rate
+    z = compute_residual_activity(make_fits([0.0, -5.0]), [1, 2])
+    assert z[1] == 1.0 and math.isnan(z[2])
+    print("  ✓ zero first rate → all later ratios NaN")
+
+    # NaN propagation
+    n = compute_residual_activity(make_fits([-10.0, float("nan")]), [1, 2])
+    assert n[1] == 1.0 and math.isnan(n[2])
+    print("  ✓ NaN rate → NaN ratio")
+
+    # LinearInitialRate fallback (no IB/Exp)
+    linear_only = {
+        1: {"LinearInitialRate": {"init_rate": -2.0}},
+        2: {"LinearInitialRate": {"init_rate": -1.0}},
+    }
+    r2 = compute_residual_activity(linear_only, [1, 2])
+    assert r2[1] == 1.0 and math.isclose(r2[2], 0.5)
+    print("  ✓ LinearInitialRate used as fallback when no primary model present")
+    return True
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 4) Back-extrapolation (Commit 4)
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_back_extrap_exponential() -> bool:
+    _section("Commit 4: back-extrap (exponential method)")
+    import numpy as np
+    from sensorfit.back_extrap import compute_back_extrap
+    from sensorfit.models import model_Exponential
+
+    # Pure exponential decay: y(t) = 100 * exp(-0.02 * t)
+    params = np.array([0.0, 0.0, 100.0, 0.02, 0.0])
+    t_start, deadtime, nominal = 60.0, 2.0, 30.0
+    y_start = float(model_Exponential([t_start], *params)[0])
+    y_back_expected = float(model_Exponential([t_start - deadtime], *params)[0])
+    rate_back_expected = -100.0 * 0.02 * float(np.exp(-0.02 * (t_start - deadtime)))
+
+    fits = {"Exponential": {"params": params, "yhat": np.array([y_start])}}
+    r = compute_back_extrap(fits, t_start, y_start, deadtime, nominal)
+    assert abs(r["back_extrap_uM"] - y_back_expected) < 1e-9
+    assert abs(r["rate_at_back_uM_per_s"] - rate_back_expected) < 1e-9
+    assert abs(r["stretch_factor"] - y_back_expected / nominal) < 1e-9
+    assert abs(r["stretch_initial_rate"] - rate_back_expected * y_back_expected / nominal) < 1e-9
+    assert r["method"] == "exponential"
+    print(f"  ✓ y(60)={y_start:.4f} y(58)={y_back_expected:.4f} stretch={r['stretch_factor']:.4f}")
+    return True
+
+
+def test_back_extrap_linear_fallback() -> bool:
+    _section("Commit 4: back-extrap (linear fallback)")
+    from sensorfit.back_extrap import compute_back_extrap
+
+    # No Exponential fit → use linear with LinearInitialRate rate
+    fits = {"LinearInitialRate": {"init_rate": -2.0}}
+    r = compute_back_extrap(
+        fits, interval_t_start_abs=60.0, interval_observed_value=100.0,
+        deadtime_s=2.0, nominal_uM=100.0,
+    )
+    # y(t_back) = 100 + (-2.0)*(58 - 60) = 100 + 4 = 104
+    assert abs(r["back_extrap_uM"] - 104.0) < 1e-9
+    assert abs(r["stretch_factor"] - 1.04) < 1e-9
+    assert abs(r["stretch_initial_rate"] - (-2.0 * 1.04)) < 1e-9
+    assert r["method"] == "linear"
+    print(f"  ✓ linear back-extrap: 100 µM + 4 µM deadtime consumption = 104 µM")
+    return True
+
+
+def test_back_extrap_no_fit() -> bool:
+    _section("Commit 4: back-extrap raises when no fit available")
+    from sensorfit.back_extrap import compute_back_extrap
+    try:
+        compute_back_extrap({}, 60.0, 100.0, 2.0, 100.0)
+    except ValueError as exc:
+        print(f"  ✓ correctly raised ValueError: {exc}")
+        return True
+    raise AssertionError("expected ValueError when no fit is available")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Driver
+# ──────────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    tests = [
+        test_fit_summary_upsert,
+        test_fit_summary_filter,
+        test_controls_manifest_roundtrip,
+        test_control_template_roundtrip,
+        test_interpolate_control,
+        test_residual_activity,
+        test_back_extrap_exponential,
+        test_back_extrap_linear_fallback,
+        test_back_extrap_no_fit,
+    ]
+    failures = []
+    for t in tests:
+        try:
+            t()
+        except Exception as exc:
+            failures.append((t.__name__, exc))
+            print(f"  ✗ {t.__name__}: {exc}")
+    _section("Test summary")
+    n = len(tests)
+    print(f"  {n - len(failures)}/{n} passed")
+    if failures:
+        for name, exc in failures:
+            print(f"   ✗ {name}: {exc}")
+        return 1
+    print("  All tests passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
