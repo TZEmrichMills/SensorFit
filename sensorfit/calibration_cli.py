@@ -38,6 +38,7 @@ from .residual_activity import (
     compute_residual_activity,
     tag_residual_activity_series,
 )
+from .back_extrap import offer_back_extrap_for_file
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -222,6 +223,7 @@ def process_file(
     control_info: dict | None = None
     residual_activity_series: list[int] = []  # interval indices tagged as a series
     residual_activity_ratios: dict[int, float] = {}  # filled after fitting
+    back_extrap_results: dict[int, dict] = {}  # filled in back_extrap phase
 
     phase = "baseline"
 
@@ -463,6 +465,30 @@ def process_file(
                 for idx, ratio in sorted(residual_activity_ratios.items()):
                     print(f"  Interval #{idx}: {ratio:.4f}")
 
+            phase = "back_extrap"
+            continue
+
+        # ────────────────────────────────────────────────────────
+        # PHASE: back_extrap (opt-in, per-interval H₂O₂-injection-start)
+        # ────────────────────────────────────────────────────────
+        elif phase == "back_extrap":
+            # Only meaningful if at least one interval was fit
+            if all_fit_results:
+                back_extrap_results = offer_back_extrap_for_file(
+                    subsets,
+                    all_fit_results,
+                    time_col=time_col,
+                    filename=path.name,
+                )
+                if back_extrap_results:
+                    print("Back-extrapolation recorded for:")
+                    for idx, r in sorted(back_extrap_results.items()):
+                        print(
+                            f"  Interval #{idx}: back_extrap={r['back_extrap_uM']:.3f} µM, "
+                            f"stretch_factor={r['stretch_factor']:.4f}, "
+                            f"stretch_rate={r['stretch_initial_rate']:.4f} µM/s "
+                            f"(method={r['method']})"
+                        )
             phase = "turnover"
             continue
 
@@ -561,6 +587,7 @@ def process_file(
                 else None
             ),
             residual_activity_ratio=residual_activity_ratios.get(subset.index),
+            back_extrap=back_extrap_results.get(subset.index),
         )
 
     persist_interval_subsets(subsets, interval_dir)

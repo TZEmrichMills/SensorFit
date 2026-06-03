@@ -31,6 +31,11 @@ from .residual_activity import (
     compute_residual_activity,
     tag_residual_activity_series,
 )
+from .back_extrap import (
+    compute_back_extrap,
+    prompt_back_extrap_for_interval,
+    offer_back_extrap_for_file,
+)
 
 __all__ = [
     "MODEL_FUNCS",
@@ -64,5 +69,9 @@ __all__ = [
     # Residual-activity exports
     "compute_residual_activity",
     "tag_residual_activity_series",
+    # Back-extrapolation exports
+    "compute_back_extrap",
+    "prompt_back_extrap_for_interval",
+    "offer_back_extrap_for_file",
 ]
 
