@@ -1,6 +1,6 @@
 """SensorFit - A package for fitting sensor timecourse data."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .models import MODEL_FUNCS
 from .fitting import fit_IB, fit_Exponential, fit_GFI
@@ -15,6 +15,17 @@ from .calibration import (
     build_interval_subsets,
     persist_interval_subsets,
     interactive_interval_fitting,
+)
+from .controls import (
+    ControlGroup,
+    show_grouping_ui,
+    save_controls_manifest,
+    load_controls_manifest,
+    save_control_template,
+    load_control_template,
+    interpolate_control_to_grid,
+    interactive_subtract,
+    select_control_reference_interval,
 )
 
 __all__ = [
@@ -36,5 +47,15 @@ __all__ = [
     "build_interval_subsets",
     "persist_interval_subsets",
     "interactive_interval_fitting",
+    # Control-subtraction exports
+    "ControlGroup",
+    "show_grouping_ui",
+    "save_controls_manifest",
+    "load_controls_manifest",
+    "save_control_template",
+    "load_control_template",
+    "interpolate_control_to_grid",
+    "interactive_subtract",
+    "select_control_reference_interval",
 ]
 

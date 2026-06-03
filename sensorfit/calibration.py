@@ -1039,6 +1039,10 @@ def append_fit_summary(
     end_time: float,
     fit_results: dict[str, dict] | None,
     turnover_uM: float | None = None,
+    control_subtracted: bool | None = None,
+    control_group: str | None = None,
+    residual_activity_ratio: float | None = None,
+    back_extrap: dict | None = None,
 ) -> None:
     """
     Append fit parameters to summary Excel file (creates if doesn't exist).
@@ -1071,6 +1075,29 @@ def append_fit_summary(
         "duration_s": end_time - start_time,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+    # Control-subtraction provenance
+    if control_subtracted is not None:
+        row_data["control_subtracted"] = bool(control_subtracted)
+    if control_group is not None:
+        row_data["control_group"] = str(control_group)
+
+    # Residual-activity series ratio (1.0 for the series's first interval,
+    # rate_n / rate_1 for later intervals).  NaN if this interval isn't part
+    # of any tagged series.
+    if residual_activity_ratio is not None:
+        row_data["residual_activity_ratio"] = float(residual_activity_ratio)
+
+    # H2O2-injection-start back-extrapolation columns
+    if back_extrap is not None:
+        row_data["back_extrap_applied"] = True
+        row_data["back_extrap_deadtime_s"] = float(back_extrap.get("deadtime_s", float("nan")))
+        row_data["back_extrap_nominal_uM"] = float(back_extrap.get("nominal_uM", float("nan")))
+        row_data["back_extrap_H2O2_at_true_t0_uM"] = float(back_extrap.get("back_extrap_uM", float("nan")))
+        row_data["back_extrap_stretch_factor"] = float(back_extrap.get("stretch_factor", float("nan")))
+        row_data["back_extrap_stretch_initial_rate_uM_per_s"] = float(
+            back_extrap.get("stretch_initial_rate", float("nan"))
+        )
     
     # Add fit parameters for each model
     if fit_results:
@@ -1185,7 +1212,20 @@ def append_fit_summary(
     # Reorder columns to put important columns first (best_model, initial_rate, turnover)
     # Get the desired order: basic info, then best_model columns, then model-specific columns
     basic_cols = ["source_file", "interval_index", "start_time_s", "end_time_s", "duration_s", "timestamp"]
-    important_cols = ["best_model", "best_model_initial_rate_uM_per_s", "turnover_before_inactivation_uM"]
+    important_cols = [
+        "best_model",
+        "best_model_initial_rate_uM_per_s",
+        "turnover_before_inactivation_uM",
+        "control_subtracted",
+        "control_group",
+        "residual_activity_ratio",
+        "back_extrap_applied",
+        "back_extrap_deadtime_s",
+        "back_extrap_nominal_uM",
+        "back_extrap_H2O2_at_true_t0_uM",
+        "back_extrap_stretch_factor",
+        "back_extrap_stretch_initial_rate_uM_per_s",
+    ]
     
     # Build ordered column list
     ordered_cols = []
