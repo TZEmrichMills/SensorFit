@@ -382,9 +382,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.output_dir is None:
         args.output_dir = args.input_dir
 
-    # Create summary Excel path (session-level, in output directory)
-    summary_path = args.output_dir / "fit_summary.xlsx"
-    print(f"Summary Excel: {summary_path} (will append, not overwrite)")
+    # Summary Excel lives inside Calibrated/ so it is never re-discovered as an
+    # input file and an interrupted-then-restarted session resumes the same
+    # file (Calibrated/ is excluded from file discovery below).
+    calibrated_out_dir = args.output_dir / "Calibrated"
+    calibrated_out_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = calibrated_out_dir / "fit_summary.xlsx"
+
+    # Migrate any legacy fit_summary.xlsx sitting at the root of the output
+    # directory (previous SensorFit versions put it there).  Move rather than
+    # copy to avoid silent duplication.
+    legacy_summary = args.output_dir / "fit_summary.xlsx"
+    if legacy_summary.exists() and not summary_path.exists():
+        try:
+            shutil.move(str(legacy_summary), str(summary_path))
+            print(f"Migrated legacy fit_summary.xlsx → {summary_path}")
+        except OSError as exc:
+            print(f"Warning: could not migrate {legacy_summary}: {exc}")
+
+    if summary_path.exists():
+        try:
+            import pandas as _pd
+            _existing = _pd.read_excel(summary_path, engine="openpyxl")
+            n_rows = len(_existing)
+            n_files = (
+                _existing["source_file"].nunique()
+                if "source_file" in _existing.columns
+                else 0
+            )
+            print(
+                f"Resuming: fit_summary contains {n_rows} row(s) from {n_files} file(s) — new rows will append."
+            )
+        except Exception as exc:
+            print(f"Existing summary at {summary_path} could not be read ({exc}); will be overwritten on next write.")
+    else:
+        print(f"Summary Excel: {summary_path} (will be created on first save)")
 
     # Discover files (exclude already calibrated files and files in Calibrated folder)
     calibrated_dir = args.input_dir / "Calibrated"
@@ -402,6 +434,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # 1. Files that already have "_calibrated" in their name
     # 2. Files in the Calibrated folder
     # 3. Files in the Processed folder
+    # 4. Any fit_summary* spreadsheet (belt-and-braces; the summary should now
+    #    live in Calibrated/ but a legacy file may still be at the root mid-run)
     files = []
     processed_dir_path = args.input_dir / "Processed"
     for f in all_files:
@@ -414,6 +448,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             continue
         # Skip if filename already contains "_calibrated"
         if "_calibrated" in f.stem:
+            continue
+        # Skip the summary file and any analysis copies of it
+        if f.stem.startswith("fit_summary"):
             continue
         files.append(f)
     

@@ -1167,7 +1167,17 @@ def append_fit_summary(
             df = pd.DataFrame()
     else:
         df = pd.DataFrame()
-    
+
+    # Idempotent upsert: if a row for the same (source_file, interval_index)
+    # already exists, drop it so the new row replaces it cleanly when a user
+    # redoes a file.
+    if not df.empty and "source_file" in df.columns and "interval_index" in df.columns:
+        same_key = (df["source_file"] == source_file) & (
+            df["interval_index"] == interval_index
+        )
+        if same_key.any():
+            df = df.loc[~same_key].reset_index(drop=True)
+
     # Append new row
     new_row = pd.DataFrame([row_data])
     df = pd.concat([df, new_row], ignore_index=True)
