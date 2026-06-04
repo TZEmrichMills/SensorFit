@@ -39,6 +39,11 @@ from .residual_activity import (
     tag_residual_activity_series,
 )
 from .back_extrap import offer_back_extrap_for_file
+from .group_planning import (
+    SampleState,
+    offer_refit_for_corrected_intervals,
+    run_group_planning,
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -254,7 +259,7 @@ def process_file(
                 )
                 if baseline_result is None:
                     print(f"Dataset {path.name} discarded by user.")
-                    return None, path, False, control_info
+                    return None, path, False, control_info, None
                 if baseline_result == "redraw":
                     continue
                 signal_values, (_slope, _intercept) = baseline_result
@@ -278,7 +283,7 @@ def process_file(
             )
             if result == "discard":
                 print(f"\nDataset {path.name} discarded during calibration.")
-                return None, path, False, control_info
+                return None, path, False, control_info, None
             if result == "go_back_to_baseline":
                 print("\nReturning to baseline selection...")
                 phase = "baseline"
@@ -373,7 +378,7 @@ def process_file(
             )
             if intervals == "discard":
                 print(f"\nDataset {path.name} discarded during interval selection.")
-                return None, path, False, control_info
+                return None, path, False, control_info, None
             if intervals is None:
                 print("\nReturning to calibration point selection...")
                 phase = "calibration"
@@ -385,12 +390,12 @@ def process_file(
                 calibrated_dir_local.mkdir(parents=True, exist_ok=True)
                 out_path = calibrated_dir_local / f"{path.stem}_calibrated.xlsx"
                 frame.to_excel(out_path, index=False)
-                return out_path, path, False, control_info
+                return out_path, path, False, control_info, None
 
             subsets = build_interval_subsets(frame, time_col, CALIBRATED_COLUMN, intervals)
             if not subsets:
                 print("Intervals contained no data points; nothing saved.")
-                return None, path, False, control_info
+                return None, path, False, control_info, None
 
             # For control files: pick the reference interval and save the
             # template to disk so subsequent samples can subtract it.  The
@@ -481,7 +486,7 @@ def process_file(
             )
             if fit_result == "discard_file":
                 print(f"\nDataset {path.name} discarded during fitting.")
-                return None, path, False, control_info
+                return None, path, False, control_info, None
             if fit_result == "go_back_phase":
                 phase = "intervals"
                 continue
@@ -542,7 +547,7 @@ def process_file(
             )
             if turnover_result == "discard_file":
                 print(f"\nDataset {path.name} discarded during turnover calculation.")
-                return None, path, False, control_info
+                return None, path, False, control_info, None
             if turnover_result == "go_back_phase":
                 phase = "fitting"
                 continue
@@ -569,7 +574,7 @@ def process_file(
             )
             if decision == "discard":
                 print(f"\nDataset {path.name} discarded at review.")
-                return None, path, False, control_info
+                return None, path, False, control_info, None
             if decision == "accept":
                 phase = "save"
                 continue
@@ -663,7 +668,21 @@ def process_file(
             "subtracted": bool(control_subtracted),
         }
 
-    return out_path, path, has_fits, control_info
+    # Build a SampleState payload so the group orchestration can run
+    # planning + optional re-fit later.  Only meaningful for grouped sample
+    # files; controls and ungrouped files get None here.
+    sample_state: SampleState | None = None
+    if control_role == "sample" and control_group is not None and subsets:
+        sample_state = SampleState(
+            file_name=path.name,
+            calibrated_frame=frame.copy(),
+            time_col=time_col,
+            subsets=list(subsets),
+            fit_results=dict(all_fit_results),
+            turnover_results=dict(turnover_results),
+        )
+
+    return out_path, path, has_fits, control_info, sample_state
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -803,14 +822,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     group_of[s] = g
             print(f"  {len(groups)} group(s) defined.  Manifest saved to {calibrated_out_dir / 'controls.json'}")
 
-    # Reorder file queue: controls first (so templates exist before samples
-    # need them), then samples within each group, then ungrouped files.
-    if groups:
-        controls = [f for f in files if role_of.get(f.name) == "control"]
-        samples = [f for f in files if role_of.get(f.name) == "sample"]
-        ungrouped = [f for f in files if f.name not in role_of]
-        files = controls + samples + ungrouped
-
     # Use mutable containers for calibration values and num_points
     session_calibration = {"values": calibration_values}
     session_num_points = {"value": args.num_points}
@@ -825,73 +836,194 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Number of calibration points updated for all remaining files: {session_num_points['value']}")
             print(f"Calibration values updated for all remaining files: {new_values}")
 
-    # Track statistics
+    # ── Statistics + small helper to process one file ─────────────────────
     total_files = len(files)
-    discarded_count = 0
-    successfully_fit_count = 0
+    stats = {"discarded": 0, "successful": 0}
 
-    for file_path in files:
+    def _move_to_processed(p: Path) -> bool:
+        """Move file to Processed/.  Returns False if move was blocked
+        (caller should exit)."""
+        processed_path = processed_dir / p.name
+        if processed_path.exists():
+            print(f"Warning: {processed_path} already exists; skipping move.")
+            return True
         try:
-            file_role = role_of.get(file_path.name)
-            file_group = group_of.get(file_path.name)
-            out_path, original_path, has_fits, control_info = process_file(
-                path=file_path,
-                output_dir=args.output_dir,
-                time_col_idx=args.time_col,
-                current_col_idx=args.current_col,
-                num_points=session_num_points["value"],
-                window=args.window,
-                calibration_values=session_calibration["values"],
-                update_calibration_callback=update_calibration,
-                force=args.force,
-                summary_path=summary_path,
-                control_role=file_role,
-                control_group=file_group,
-                calibrated_dir=calibrated_out_dir,
+            shutil.move(str(p), str(processed_path))
+            return True
+        except OSError as e:
+            if sys.platform == "win32" and "being used by another process" in str(e):
+                print(f"Warning: File {p.name} is locked. Please close it and try again.")
+                return False
+            raise
+
+    def run_one(file_path: Path, role: str | None, grp: ControlGroup | None) -> SampleState | None:
+        """Call process_file and handle the post-processing housekeeping.
+        Returns the SampleState if available; else None."""
+        out_path, original_path, has_fits, control_info, sample_state = process_file(
+            path=file_path,
+            output_dir=args.output_dir,
+            time_col_idx=args.time_col,
+            current_col_idx=args.current_col,
+            num_points=session_num_points["value"],
+            window=args.window,
+            calibration_values=session_calibration["values"],
+            update_calibration_callback=update_calibration,
+            force=args.force,
+            summary_path=summary_path,
+            control_role=role,
+            control_group=grp,
+            calibrated_dir=calibrated_out_dir,
+        )
+        # Persist manifest after each control so an interrupted session
+        # can resume with saved templates intact.
+        if role == "control" and groups:
+            save_controls_manifest(groups, calibrated_out_dir)
+        if not _move_to_processed(original_path):
+            raise SystemExit(1)
+        if out_path is None:
+            stats["discarded"] += 1
+            print(f"Dataset discarded; moved file to {processed_dir / original_path.name}")
+        else:
+            if has_fits:
+                stats["successful"] += 1
+            print(f"Calibration successful; moved original file to {processed_dir / original_path.name}")
+        return sample_state
+
+    # ── Group-by-group orchestration ──────────────────────────────────────
+    # Process each group as a unit:
+    #   1) all controls (templates saved as we go)
+    #   2) all samples (state accumulated)
+    #   3) per-group subtraction-planning UI
+    #   4) optional re-fit + re-turnover on corrected intervals
+    #   5) write "corrected" rows to fit_summary + save corrected interval files
+    # Then process any ungrouped files normally.
+    by_name: dict[str, Path] = {p.name: p for p in files}
+
+    for group in groups.values():
+        print(f"\n{'#' * 60}")
+        print(f"Group '{group.name}' — {len(group.all_control_files())} control(s) "
+              f"in {len(group.subgroups)} sub-group(s); "
+              f"{len(group.sample_files)} sample(s)")
+        print(f"{'#' * 60}")
+
+        # 1) Process controls
+        for ctrl_name in group.all_control_files():
+            ctrl_path = by_name.get(ctrl_name)
+            if ctrl_path is None:
+                print(f"Skipping control '{ctrl_name}' — not found in input directory.")
+                continue
+            try:
+                run_one(ctrl_path, "control", group)
+            except SystemExit as exc:
+                return int(exc.code)
+            except Exception as exc:
+                print(f"Failed to process control {ctrl_path}: {exc}")
+                import traceback
+                traceback.print_exc()
+                return 1
+
+        # 2) Process samples and accumulate SampleState
+        sample_states: list[SampleState] = []
+        for sample_name in group.sample_files:
+            sample_path = by_name.get(sample_name)
+            if sample_path is None:
+                print(f"Skipping sample '{sample_name}' — not found in input directory.")
+                continue
+            try:
+                state = run_one(sample_path, "sample", group)
+                if state is not None:
+                    sample_states.append(state)
+            except SystemExit as exc:
+                return int(exc.code)
+            except Exception as exc:
+                print(f"Failed to process sample {sample_path}: {exc}")
+                import traceback
+                traceback.print_exc()
+                return 1
+
+        # 3) + 4) Planning + optional re-fit (only meaningful for multi-control
+        # or multi-subgroup groups; legacy single-control already did inline
+        # subtraction inside process_file)
+        is_legacy_single = (
+            len(group.subgroups) == 1
+            and len(group.subgroups[0].controls) == 1
+        )
+        if sample_states and not is_legacy_single:
+            updated = run_group_planning(group, sample_states, calibrated_out_dir)
+            offer_refit_for_corrected_intervals(
+                updated,
+                interactive_interval_fitting,
+                calculate_turnover_before_inactivation,
             )
-            # Persist the manifest after each control so that an interrupted
-            # session can resume with the templates already saved.
-            if file_role == "control" and groups:
-                save_controls_manifest(groups, calibrated_out_dir)
-            # Move processed file to Processed folder (whether successful or discarded)
-            processed_path = processed_dir / original_path.name
-            if processed_path.exists():
-                print(f"Warning: {processed_path} already exists; skipping move.")
-            else:
-                # Use pathlib for cross-platform path handling
-                # Convert to string for shutil.move which handles both platforms
-                try:
-                    shutil.move(str(original_path), str(processed_path))
-                except OSError as e:
-                    # Handle Windows file locking issues
-                    if sys.platform == "win32" and "being used by another process" in str(e):
-                        print(f"Warning: File {original_path.name} is locked. Please close it and try again.")
-                        return 1
-                    raise
-                if out_path is None:
-                    discarded_count += 1
-                    print(f"Dataset discarded; moved file to {processed_path}")
-                else:
-                    if has_fits:
-                        successfully_fit_count += 1
-                    print(f"Calibration successful; moved original file to {processed_path}")
+            # 5) Persist corrected outputs
+            _persist_group_corrected_outputs(
+                group, updated, calibrated_out_dir, summary_path
+            )
+
+    # 6) Process any ungrouped files normally
+    for file_path in files:
+        if file_path.name in role_of:
+            continue
+        try:
+            run_one(file_path, None, None)
+        except SystemExit as exc:
+            return int(exc.code)
         except Exception as exc:
             print(f"Failed to process {file_path}: {exc}")
             import traceback
             traceback.print_exc()
             return 1
-    
-    # Display final summary
+
+    # ── Final summary ─────────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print("Processing Complete")
     print(f"{'='*60}")
     print(f"Total files processed: {total_files}")
-    print(f"Files discarded: {discarded_count}")
-    print(f"Files successfully fitted: {successfully_fit_count}")
+    print(f"Files discarded: {stats['discarded']}")
+    print(f"Files successfully fitted: {stats['successful']}")
     print(f"Summary Excel: {summary_path}")
     print(f"{'='*60}\n")
-    
+
     return 0
+
+
+def _persist_group_corrected_outputs(
+    group: ControlGroup,
+    sample_states: dict[str, "SampleState"],
+    calibrated_dir: Path,
+    summary_path: Path,
+) -> None:
+    """Save corrected interval excels and append `variant=corrected` rows to
+    fit_summary.  Pre-subtraction `variant=original` rows were already written
+    by process_file's save phase.
+    """
+    for state in sample_states.values():
+        if not state.corrected_subsets:
+            continue
+        interval_dir = calibrated_dir / f"{Path(state.file_name).stem}_intervals"
+        interval_dir.mkdir(parents=True, exist_ok=True)
+        for idx, corrected in state.corrected_subsets.items():
+            # Per-interval corrected Excel
+            out_path = interval_dir / f"interval_{idx:02d}_corrected.xlsx"
+            corrected.data.to_excel(out_path, index=False)
+            print(f"  Saved corrected interval → {out_path.name}")
+
+            # Choose post-subtraction fits/turnover where available
+            post_fits = state.refit_results.get(idx, None)
+            post_turn = state.refit_turnover.get(idx, None)
+            append_fit_summary(
+                summary_path=summary_path,
+                source_file=state.file_name,
+                interval_index=idx,
+                start_time=corrected.start_time,
+                end_time=corrected.end_time,
+                fit_results=post_fits if post_fits else None,
+                turnover_uM=post_turn,
+                control_subtracted=True,
+                control_group=group.name,
+                correction_meta=state.correction_meta.get(idx),
+                variant="corrected",
+            )
 
 
 if __name__ == "__main__":

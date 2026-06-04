@@ -1043,6 +1043,8 @@ def append_fit_summary(
     control_group: str | None = None,
     residual_activity_ratio: float | None = None,
     back_extrap: dict | None = None,
+    variant: str = "original",
+    correction_meta: dict | None = None,
 ) -> None:
     """
     Append fit parameters to summary Excel file (creates if doesn't exist).
@@ -1070,6 +1072,7 @@ def append_fit_summary(
     row_data = {
         "source_file": source_file,
         "interval_index": interval_index,
+        "variant": variant,
         "start_time_s": start_time,
         "end_time_s": end_time,
         "duration_s": end_time - start_time,
@@ -1081,6 +1084,14 @@ def append_fit_summary(
         row_data["control_subtracted"] = bool(control_subtracted)
     if control_group is not None:
         row_data["control_group"] = str(control_group)
+    if correction_meta is not None:
+        # Flatten the per-row correction metadata into columns
+        if "n_subgroups" in correction_meta:
+            row_data["correction_n_subgroups"] = int(correction_meta["n_subgroups"])
+        if "anchor_t0" in correction_meta:
+            row_data["correction_anchor_t0_s"] = float(correction_meta["anchor_t0"])
+        if "subgroup_descriptions" in correction_meta:
+            row_data["correction_chain"] = " | ".join(correction_meta["subgroup_descriptions"])
 
     # Residual-activity series ratio (1.0 for the series's first interval,
     # rate_n / rate_1 for later intervals).  NaN if this interval isn't part
@@ -1195,12 +1206,19 @@ def append_fit_summary(
     else:
         df = pd.DataFrame()
 
-    # Idempotent upsert: if a row for the same (source_file, interval_index)
-    # already exists, drop it so the new row replaces it cleanly when a user
-    # redoes a file.
+    # Idempotent upsert: if a row for the same
+    # (source_file, interval_index, variant) already exists, drop it so the
+    # new row replaces it cleanly when a user redoes a file.  Variant lets
+    # us record an "original" (pre-subtraction) row AND a "corrected"
+    # (post-subtraction) row for the same interval without colliding.
     if not df.empty and "source_file" in df.columns and "interval_index" in df.columns:
-        same_key = (df["source_file"] == source_file) & (
-            df["interval_index"] == interval_index
+        # Default variant on legacy rows = "original"
+        if "variant" not in df.columns:
+            df["variant"] = "original"
+        same_key = (
+            (df["source_file"] == source_file)
+            & (df["interval_index"] == interval_index)
+            & (df["variant"].fillna("original") == variant)
         )
         if same_key.any():
             df = df.loc[~same_key].reset_index(drop=True)
@@ -1211,13 +1229,16 @@ def append_fit_summary(
     
     # Reorder columns to put important columns first (best_model, initial_rate, turnover)
     # Get the desired order: basic info, then best_model columns, then model-specific columns
-    basic_cols = ["source_file", "interval_index", "start_time_s", "end_time_s", "duration_s", "timestamp"]
+    basic_cols = ["source_file", "interval_index", "variant", "start_time_s", "end_time_s", "duration_s", "timestamp"]
     important_cols = [
         "best_model",
         "best_model_initial_rate_uM_per_s",
         "turnover_before_inactivation_uM",
         "control_subtracted",
         "control_group",
+        "correction_n_subgroups",
+        "correction_anchor_t0_s",
+        "correction_chain",
         "residual_activity_ratio",
         "back_extrap_applied",
         "back_extrap_deadtime_s",

@@ -130,9 +130,9 @@ If a session is interrupted (Ctrl-C, crash, lost power), just re-run the same co
 
 These features are all **opt-in** — if you don't use them, SensorFit behaves exactly as before. Each feature adds extra columns to `fit_summary.xlsx` only when used.
 
-### Control subtraction
+### Control subtraction (multi-control groups, group-as-unit flow)
 
-Many experimental designs involve measuring a **no-enzyme control** (or any other baseline-style trace) and subtracting it from the corresponding with-enzyme samples. SensorFit can do this in one pass.
+Many experimental designs involve measuring one or more **control runs** (no-enzyme, no-substrate, buffer-only, etc.) and subtracting them from related sample runs. SensorFit groups controls with samples and handles subtraction at the **interval level**, after all files in the group have been calibrated and intervals delineated.
 
 **Run:**
 
@@ -140,16 +140,46 @@ Many experimental designs involve measuring a **no-enzyme control** (or any othe
 python -m sensorfit.calibration_cli --input-dir /path/to/folder --num-points 6 --calibration-values "0,20,40,60,80,100" --control-mode --force
 ```
 
-**Flow:**
+**Grouping window (session start).**
 
-1. A grouping window opens listing every unprocessed file in the input folder. Select files on the left, click **New group from selected** — the first selected file becomes the control and the rest become its samples. You can rename groups, add files to existing groups, or promote a sample to be the control. Files left ungrouped are processed normally. The grouping is saved to `Calibrated/controls.json` so an interrupted session can resume.
-2. SensorFit reorders the queue: **all controls first**, then samples of each group, then any ungrouped files. Each control goes through the normal baseline → calibration → interval-selection flow. After selecting intervals on a control, you're asked which interval is the **subtraction reference**. That interval is saved as `Calibrated/_control_templates/<group_name>.csv` (time-zeroed at the interval start).
-3. When a sample comes up, after calibration you see a new screen showing the sample (green) and the aligned control template (red) on the same time axis, with the subtracted result below. Click on the sample plot to **re-anchor** the control. Choose **Accept & subtract**, **Skip**, or **Back**.
-4. After subtraction, the corrected `H2O2_uM` trace replaces the original calibrated trace, and you continue with normal interval selection / fitting / turnover.
+A Qt window opens listing every unprocessed file. Each *group* is built as a tree:
 
-The per-interval Excel files and the `fit_summary.xlsx` rows for subtracted samples carry two extra columns: `control_subtracted` (bool) and `control_group` (the group name).
+```
+Group_A
+├── Sub-group 1 (averaged)
+│   ├── noEnz_noSub_1.xlsx
+│   └── noEnz_noSub_2.xlsx
+├── Sub-group 2
+│   └── noEnz_1.xlsx
+└── Samples
+    ├── treatment_1.xlsx
+    └── treatment_2.xlsx
+```
 
-**Multiple control types** are supported via separate groups. A group's "control" can be anything you want subtracted — no-enzyme runs, buffer-only baselines, etc.
+- Controls inside the **same sub-group** are **averaged** before subtraction.
+- Different sub-groups are **subtracted sequentially** (top → bottom).
+- For each sample interval the user later chooses to correct, the effective subtraction is:
+  `sample(t) − mean(Sub-group 1)(t) − mean(Sub-group 2)(t) − …`
+
+Buttons: **New group**, **New sub-group in selected group**, **Add selected files → sub-group (controls)**, **Add selected files → samples**, **↑ / ↓ Move sub-group up/down**, **Remove selected**, **Done**. The grouping is saved to `Calibrated/controls.json` so an interrupted session can resume.
+
+Files left ungrouped are processed normally, with no subtraction step.
+
+**Group-as-unit processing.** Each group is fully processed end-to-end before the next group begins:
+
+1. **Controls** in the group are processed first, one by one, through the normal baseline → calibration → intervals → fits → turnover flow. After interval selection on each control, you pick which interval is the **subtraction reference**; that interval is saved as a CSV in `Calibrated/_control_templates/`.
+2. **Samples** in the group are processed next, also through the full pipeline. Their state (calibrated frame, intervals, fits, turnover) is kept in memory for the next step.
+3. **Subtraction planning UI** opens once all samples are done: a check-list of every sample interval. Tick the ones you want corrected. Defaults to all-unticked so calibration ladders / blank phases are left alone — you opt in per interval.
+4. **Preview & subtract.** For each ticked interval, a preview screen shows the sample (green), each sub-group's averaged contribution (orange dashed), their combined sum (red), the anchor as a **purple dashed vertical line**, and the corrected result below in blue. Click on the upper plot to **re-anchor** the controls' t = 0. **Accept & subtract**, **Skip this interval**, or **Back**.
+5. **Optional re-fit.** After subtraction, for each sample with corrected intervals you're asked **"Re-fit corrected intervals?"** Yes runs the existing fitting + turnover GUIs on the subtracted data; No keeps the pre-subtraction fits.
+
+**Outputs.** Each corrected interval is saved alongside the original as `interval_NN_corrected.xlsx` in the sample's `_intervals/` folder. `fit_summary.xlsx` carries **two rows per corrected interval** distinguished by a new `variant` column:
+- `variant = "original"` — pre-subtraction fit results (always written).
+- `variant = "corrected"` — post-subtraction fit results, with `control_subtracted = True`, `control_group = <name>`, `correction_n_subgroups`, `correction_anchor_t0_s`, and `correction_chain` (a human-readable summary of which controls were applied).
+
+You can filter / pivot by `variant` in Excel to compare before vs. after subtraction directly.
+
+**Legacy single-control groups** (one sub-group with exactly one control file — what PR #1 supported) still work via the original inline `control_subtract` phase during sample processing, with the same UX as before.
 
 ### Multi-addition residual activity
 

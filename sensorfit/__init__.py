@@ -38,6 +38,14 @@ from .back_extrap import (
     prompt_back_extrap_for_interval,
     offer_back_extrap_for_file,
 )
+from .group_planning import (
+    SampleState,
+    build_subtraction_chain,
+    planning_picker,
+    preview_and_apply_subtraction,
+    run_group_planning,
+    offer_refit_for_corrected_intervals,
+)
 
 __all__ = [
     "MODEL_FUNCS",
@@ -77,5 +85,12 @@ __all__ = [
     "compute_back_extrap",
     "prompt_back_extrap_for_interval",
     "offer_back_extrap_for_file",
+    # Group-planning exports
+    "SampleState",
+    "build_subtraction_chain",
+    "planning_picker",
+    "preview_and_apply_subtraction",
+    "run_group_planning",
+    "offer_refit_for_corrected_intervals",
 ]
 

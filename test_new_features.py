@@ -26,7 +26,7 @@ def _section(title: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 def test_fit_summary_upsert() -> bool:
-    _section("Commit 1: fit_summary idempotent upsert")
+    _section("Commit 1: fit_summary idempotent upsert (with variant column)")
     import pandas as pd
     from sensorfit.calibration import append_fit_summary
 
@@ -34,18 +34,26 @@ def test_fit_summary_upsert() -> bool:
         p = Path(tmp) / "fit_summary.xlsx"
 
         append_fit_summary(p, "fileA.xlsx", 1, 0.0, 10.0, fit_results=None, turnover_uM=None)
-        # Second write with same (file, interval) → should REPLACE
+        # Second write with same (file, interval, variant=original) → REPLACE
         append_fit_summary(p, "fileA.xlsx", 1, 0.0, 10.0, fit_results=None, turnover_uM=42.0)
         # Third: same file, different interval → APPEND
         append_fit_summary(p, "fileA.xlsx", 2, 11.0, 20.0, fit_results=None, turnover_uM=None)
         # Fourth: different file → APPEND
         append_fit_summary(p, "fileB.xlsx", 1, 0.0, 5.0, fit_results=None, turnover_uM=None)
+        # Fifth: same fileA interval 1 but variant=corrected → APPEND
+        append_fit_summary(p, "fileA.xlsx", 1, 0.0, 10.0, fit_results=None,
+                           turnover_uM=99.0, variant="corrected", control_group="G_A")
 
         df = pd.read_excel(p)
-        assert len(df) == 3, f"expected 3 rows, got {len(df)}"
-        row1 = df[(df["source_file"] == "fileA.xlsx") & (df["interval_index"] == 1)].iloc[0]
-        assert row1["turnover_before_inactivation_uM"] == 42.0, "upsert did not replace the older row"
-        print(f"  ✓ upsert: 4 writes → 3 rows; file-A interval-1 turnover = 42.0 (latest)")
+        assert len(df) == 4, f"expected 4 rows, got {len(df)}"
+        row_orig = df[(df["source_file"] == "fileA.xlsx") & (df["interval_index"] == 1)
+                      & (df["variant"] == "original")].iloc[0]
+        row_corr = df[(df["source_file"] == "fileA.xlsx") & (df["interval_index"] == 1)
+                      & (df["variant"] == "corrected")].iloc[0]
+        assert row_orig["turnover_before_inactivation_uM"] == 42.0
+        assert row_corr["turnover_before_inactivation_uM"] == 99.0
+        assert row_corr["control_group"] == "G_A"
+        print(f"  ✓ upsert: 5 writes → 4 rows; original + corrected variants coexist")
     return True
 
 
@@ -315,6 +323,56 @@ def test_back_extrap_linear_fallback() -> bool:
     return True
 
 
+def test_build_subtraction_chain() -> bool:
+    _section("Restructure: build_subtraction_chain (averaged-within / sequential-across)")
+    import numpy as np
+    from sensorfit.group_planning import build_subtraction_chain
+
+    ct = np.linspace(0, 10, 51)
+    sample_t = np.linspace(100, 110, 51)
+    anchor = 100.0
+
+    # 1) Single sub-group of two constants (5 and 7) → averaged to 6
+    combined, per_sg = build_subtraction_chain(
+        sample_t,
+        [[(ct, np.full_like(ct, 5.0)), (ct, np.full_like(ct, 7.0))]],
+        anchor,
+    )
+    assert np.allclose(combined, 6.0)
+    assert len(per_sg) == 1
+    print("  ✓ single sub-group of 2 controls (5, 7) → avg = 6")
+
+    # 2) Two sub-groups subtracted sequentially: 3 + 2 = 5
+    combined, per_sg = build_subtraction_chain(
+        sample_t,
+        [[(ct, np.full_like(ct, 3.0))], [(ct, np.full_like(ct, 2.0))]],
+        anchor,
+    )
+    assert np.allclose(combined, 5.0)
+    assert len(per_sg) == 2
+    print("  ✓ two sub-groups (3, 2) → sum = 5")
+
+    # 3) Empty chain → zero correction
+    combined, per_sg = build_subtraction_chain(sample_t, [], anchor)
+    assert np.allclose(combined, 0.0)
+    assert per_sg == []
+    print("  ✓ empty chain → zero correction")
+
+    # 4) Averaging templates of different lengths
+    ct_short = np.linspace(0, 8, 41)
+    cy_short = ct_short * 0.5  # 0..4
+    ct_long = np.linspace(0, 10, 51)
+    cy_long = ct_long * 1.0    # 0..10
+    sample_t = np.array([100.0, 105.0])
+    combined, _ = build_subtraction_chain(
+        sample_t, [[(ct_short, cy_short), (ct_long, cy_long)]], 100.0
+    )
+    # At t=105 (5s after anchor): short=2.5, long=5.0, avg=3.75
+    assert abs(combined[1] - 3.75) < 1e-6
+    print("  ✓ averaging of different-length templates (0.5*t and 1.0*t at t=5s → avg=3.75)")
+    return True
+
+
 def test_back_extrap_no_fit() -> bool:
     _section("Commit 4: back-extrap raises when no fit available")
     from sensorfit.back_extrap import compute_back_extrap
@@ -341,6 +399,7 @@ def main() -> int:
         test_back_extrap_exponential,
         test_back_extrap_linear_fallback,
         test_back_extrap_no_fit,
+        test_build_subtraction_chain,
     ]
     failures = []
     for t in tests:
