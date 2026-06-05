@@ -7,7 +7,7 @@ Interactive tool for calibrating amperometric sensor traces to H₂O₂ concentr
 - [Quick Start](#quick-start)
 - [What to Expect When You Run SensorFit](#what-to-expect-when-you-run-sensorfit)
 - [Command Line Arguments](#command-line-arguments)
-- [Advanced features](#advanced-features) — control subtraction, residual activity, back-extrapolation, resilient summary
+- [Advanced features](#advanced-features) — control subtraction, residual activity, back-extrapolation, skip calibration, resilient summary
 - [Post-processing: Collecting Intervals](#post-processing-collecting-intervals)
 - [Detailed Installation Guide](#detailed-installation-guide)
 - [Troubleshooting](#troubleshooting)
@@ -122,7 +122,8 @@ If a session is interrupted (Ctrl-C, crash, lost power), just re-run the same co
 | `--window` | `50` | Samples to average around each click |
 | `--calibration-values` | `"0,20,40,60,80,100"` | Comma-separated µM H₂O₂ concentrations |
 | `--force` | off | Overwrite existing output files |
-| `--control-mode` | off | Open a grouping UI at session start so a control trace (no-enzyme, etc.) can be subtracted from selected sample files. See [Control subtraction](#control-subtraction) below. Auto-enabled if `Calibrated/controls.json` already exists. |
+| `--control-mode` | off | Open a grouping UI at session start so a control trace (no-enzyme, etc.) can be subtracted from selected sample files. See [Control subtraction](#control-subtraction-multi-control-groups-group-as-unit-flow) below. Auto-enabled if `Calibrated/controls.json` already exists. |
+| `--skip-calibration` | off | Treat input files as already-calibrated [H₂O₂] vs time and skip the baseline / calibration phases entirely. `--current-col` is interpreted as the µM H₂O₂ column. See [Skip calibration](#skip-calibration-fitting-only-mode) below. |
 
 ---
 
@@ -212,6 +213,33 @@ When a reaction begins with an H₂O₂ injection and you used a **two-point cal
 3. For each interval, a preview screen lets you enter the **deadtime** (default 1.5 s) and the **nominal H₂O₂ added** (default = the observed initial value). Click **Compute** to preview the back-extrapolated curve (red, dashed) and the computed values. Click **Accept & record** to save, **Skip** to pass on this interval, or **Back** to abort the back-extrap phase.
 
 Six new columns are added to `fit_summary.xlsx` for accepted intervals: `back_extrap_applied`, `back_extrap_deadtime_s`, `back_extrap_nominal_uM`, `back_extrap_H2O2_at_true_t0_uM`, `back_extrap_stretch_factor`, `back_extrap_stretch_initial_rate_uM_per_s`. These mirror the columns in older hand-computed analyses (`Back extrap`, `Stretch factor`, `Stretch initial rate`).
+
+### Skip calibration (fitting-only mode)
+
+If your input files are already calibrated `[H₂O₂] (µM) vs time (s)` — for example because they came from another pipeline or were previously control-subtracted outside SensorFit — pass `--skip-calibration` and SensorFit becomes a fitting-only tool. The baseline and calibration phases are bypassed entirely; you start at interval selection.
+
+**Run:**
+
+```bash
+python -m sensorfit.calibration_cli \
+  --input-dir "/path/to/already-calibrated-folder" \
+  --time-col 0 \
+  --current-col 3 \
+  --skip-calibration \
+  --force
+```
+
+Use `--time-col` / `--current-col` to point at the right columns. The "current" column is interpreted as **µM H₂O₂** (no scaling applied) and copied straight into the calibrated trace.
+
+**Sanity check:** on each file SensorFit prints the [H₂O₂] range and warns if the column you picked looks like raw current (|max| < 0.1) instead of pre-calibrated H₂O₂.
+
+**What you still get:**
+
+- Interval selection, fitting (IB / Exponential / GFI / LinearInitialRate), max-H₂O₂-turnover, residual-activity, and back-extrapolation all work as normal.
+- The Review screen hides the "Redo baseline" / "Redo calibration" buttons since they're not applicable.
+- `fit_summary.xlsx` rows carry a new `calibration_skipped = True` column for these files (NaN for normal files), so you can filter them in Excel.
+
+**Combined with control mode:** if you have pre-calibrated controls *and* pre-calibrated samples that still need control subtraction, you can pass both `--control-mode --skip-calibration` together — the controls just have their calibration phase skipped too.
 
 ### Resilient `fit_summary.xlsx`
 

@@ -1045,6 +1045,7 @@ def append_fit_summary(
     back_extrap: dict | None = None,
     variant: str = "original",
     correction_meta: dict | None = None,
+    calibration_skipped: bool | None = None,
 ) -> None:
     """
     Append fit parameters to summary Excel file (creates if doesn't exist).
@@ -1084,6 +1085,8 @@ def append_fit_summary(
         row_data["control_subtracted"] = bool(control_subtracted)
     if control_group is not None:
         row_data["control_group"] = str(control_group)
+    if calibration_skipped is not None:
+        row_data["calibration_skipped"] = bool(calibration_skipped)
     if correction_meta is not None:
         # Flatten the per-row correction metadata into columns
         if "n_subgroups" in correction_meta:
@@ -1234,6 +1237,7 @@ def append_fit_summary(
         "best_model",
         "best_model_initial_rate_uM_per_s",
         "turnover_before_inactivation_uM",
+        "calibration_skipped",
         "control_subtracted",
         "control_group",
         "correction_n_subgroups",
@@ -2456,10 +2460,18 @@ def review_results(
     all_fit_results: dict[int, dict[str, dict]],
     turnover_results: dict[int, float | None],
     filename: str | None = None,
+    skip_calibration: bool = False,
 ) -> str:
     """
     Display a summary of all fits and turnover results and let the user
     accept, redo any phase, or discard the file.
+
+    Parameters
+    ----------
+    skip_calibration : bool
+        When True, the "Redo baseline" and "Redo calibration" buttons are
+        hidden (those phases were never run because the input was already
+        calibrated [H₂O₂]).
 
     Returns:
     --------
@@ -2519,15 +2531,20 @@ def review_results(
 
     # --- buttons (two rows) ---
     btn_w, btn_h, gap = 0.14, 0.05, 0.015
-    # Row 1: redo buttons
+    # Row 1: redo buttons.  Baseline + calibration are hidden in skip-
+    # calibration mode (those phases never ran).
     row1_y = 0.14
-    labels_row1 = [
+    all_redo_labels = [
         ("Redo baseline",     "baseline",     "#d0d0ff", "#a8a8ff"),
         ("Redo calibration",  "calibration",  "#d0d0ff", "#a8a8ff"),
         ("Redo intervals",    "intervals",    "#d0d0ff", "#a8a8ff"),
         ("Redo fitting",      "fitting",      "#d0d0ff", "#a8a8ff"),
         ("Redo turnover",     "turnover",     "#d0d0ff", "#a8a8ff"),
     ]
+    if skip_calibration:
+        labels_row1 = [t for t in all_redo_labels if t[1] not in ("baseline", "calibration")]
+    else:
+        labels_row1 = all_redo_labels
     x = 0.05
     for label, action, col, hov in labels_row1:
         bax = fig.add_axes([x, row1_y, btn_w, btn_h])

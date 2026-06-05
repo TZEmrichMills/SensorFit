@@ -323,6 +323,69 @@ def test_back_extrap_linear_fallback() -> bool:
     return True
 
 
+def test_skip_calibration_provenance() -> bool:
+    _section("Skip-calibration: fit_summary records calibration_skipped flag")
+    import pandas as pd
+    from sensorfit.calibration import append_fit_summary
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "fit_summary.xlsx"
+        # Pretend we processed one file in skip mode
+        append_fit_summary(
+            p, "precalibrated_A.csv", 1, 0.0, 30.0,
+            fit_results=None, turnover_uM=None, calibration_skipped=True,
+        )
+        # Plus a normal file (no flag)
+        append_fit_summary(
+            p, "raw_B.xlsx", 1, 0.0, 30.0,
+            fit_results=None, turnover_uM=None,
+        )
+        df = pd.read_excel(p)
+        assert "calibration_skipped" in df.columns
+        flag_skip = df[df["source_file"] == "precalibrated_A.csv"]["calibration_skipped"].iloc[0]
+        flag_norm = df[df["source_file"] == "raw_B.xlsx"]["calibration_skipped"]
+        assert bool(flag_skip) is True
+        # Normal row should have NaN (column exists due to skip row, but this row was None)
+        assert flag_norm.isna().all() or flag_norm.iloc[0] is None
+        print("  ✓ calibration_skipped=True recorded for skip-mode row; NaN for normal row")
+    return True
+
+
+def test_skip_calibration_loads_real_csv() -> bool:
+    """End-to-end check that load_trace + skip-cal-style frame setup works
+    on the user's real pre-calibrated CSVs."""
+    _section("Skip-calibration: load_trace + frame setup against real data")
+    import pandas as pd
+    from sensorfit.calibration import load_trace, CALIBRATED_COLUMN
+
+    folder = Path(
+        "/Users/tom/Jottacloud/Tommy/01_NMBU_workspace/Supervision/Rannei_Skaali_PhD/"
+        "Assays/Sensor/Peroxi-Temperature-variation/260602_Rannei_arrhenius_att3/"
+        "Subtracted_Traces_for_Rannei/IBFits"
+    )
+    if not folder.exists():
+        print(f"  (skipped — folder not available: {folder})")
+        return True
+
+    csvs = sorted([p for p in folder.glob("*.csv") if not p.name.startswith("~$")])[:2]
+    assert csvs, "expected ≥1 CSV in real-data folder"
+    for path in csvs:
+        # Mirror what process_file does in skip mode: load with --time-col=0, --current-col=3
+        frame = load_trace(path, time_col_idx=0, current_col_idx=3)
+        time_col, current_col = frame.columns[0], frame.columns[1]
+        assert time_col == "tau_s", f"unexpected time col: {time_col}"
+        assert current_col == "H2O2_corr_uM", f"unexpected current col: {current_col}"
+        # Skip-mode frame setup: CALIBRATED_COLUMN := current_col
+        frame[CALIBRATED_COLUMN] = frame[current_col].values
+        # H2O2 should be in a sensible range (tens to hundreds µM)
+        h2o2 = frame[CALIBRATED_COLUMN]
+        assert h2o2.notna().all(), f"NaNs in {path.name}"
+        assert abs(h2o2.max()) > 1, f"{path.name}: looks empty (max={h2o2.max()})"
+        assert abs(h2o2.max()) < 10000, f"{path.name}: implausibly large (max={h2o2.max()})"
+        print(f"  ✓ {path.name}: {len(frame)} rows, [H₂O₂] range = [{h2o2.min():.2f}, {h2o2.max():.2f}] µM")
+    return True
+
+
 def test_build_subtraction_chain() -> bool:
     _section("Restructure: build_subtraction_chain (averaged-within / sequential-across)")
     import numpy as np
@@ -400,6 +463,8 @@ def main() -> int:
         test_back_extrap_linear_fallback,
         test_back_extrap_no_fit,
         test_build_subtraction_chain,
+        test_skip_calibration_provenance,
+        test_skip_calibration_loads_real_csv,
     ]
     failures = []
     for t in tests:

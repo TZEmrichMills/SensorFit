@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
+
 from .calibration import (
     apply_calibration,
     append_fit_summary,
@@ -110,6 +112,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Calibrated/controls.json already exists from a prior session."
         ),
     )
+    parser.add_argument(
+        "--skip-calibration",
+        action="store_true",
+        help=(
+            "Treat input files as ALREADY-CALIBRATED [H₂O₂] vs time.  Skips the "
+            "baseline and calibration phases entirely — SensorFit becomes a "
+            "fitting-only tool.  --current-col is interpreted as the µM H₂O₂ "
+            "column; the values are copied straight into the calibrated trace."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -195,6 +207,7 @@ def process_file(
     control_role: str | None = None,
     control_group: "ControlGroup | None" = None,
     calibrated_dir: Path | None = None,
+    skip_calibration: bool = False,
 ) -> tuple[Path | None, Path, bool, "dict | None"]:
     """Process a single file through a phase-based state machine.
 
@@ -216,6 +229,12 @@ def process_file(
         file, and (for samples) the path to the already-saved control template.
     calibrated_dir : Path | None
         Where the Calibrated/ folder lives.  Required for control templates.
+    skip_calibration : bool
+        If True, treat ``current_col_idx`` as the already-calibrated [H₂O₂]
+        column (µM).  Baseline and calibration phases are skipped entirely
+        and the values are copied directly into the calibrated trace.  Use
+        when SensorFit is run purely as a fitting tool against pre-processed
+        data (typically from another pipeline).
 
     Returns
     -------
@@ -232,6 +251,28 @@ def process_file(
     time_values = frame[time_col].to_numpy(dtype=float)
     signal_values_raw = frame[current_col].to_numpy(dtype=float)
 
+    # In skip-calibration mode the "current" column already holds [H₂O₂] (µM).
+    # Sanity check: pure-current amperometry data is typically in the µA / nA
+    # range (|values| < 0.01).  Pre-calibrated H₂O₂ is typically tens to
+    # hundreds of µM.  We don't reject either way (some experiments may sit
+    # in unusual ranges) but warn loudly so the user notices if they forgot
+    # to pass --current-col for a non-default column.
+    if skip_calibration:
+        if np.all(np.isfinite(signal_values_raw)):
+            abs_max = float(np.max(np.abs(signal_values_raw)))
+            if abs_max < 0.1:
+                print(
+                    f"  ⚠  --skip-calibration is on but the selected column "
+                    f"(index {current_col_idx}, header '{current_col}') has |max| "
+                    f"= {abs_max:.4g} — looks like raw current, not [H₂O₂] in µM.  "
+                    "Re-check --current-col / --time-col."
+                )
+            else:
+                print(
+                    f"  Skip-calibration: using column '{current_col}' as [H₂O₂] (µM); "
+                    f"range = [{np.min(signal_values_raw):.2f}, {np.max(signal_values_raw):.2f}] µM."
+                )
+
     # ── persistent state across phases ──────────────────────────
     signal_values = None
     calibration = None
@@ -246,7 +287,15 @@ def process_file(
     residual_activity_ratios: dict[int, float] = {}  # filled after fitting
     back_extrap_results: dict[int, dict] = {}  # filled in back_extrap phase
 
-    phase = "baseline"
+    # In skip-calibration mode the baseline and calibration phases are bypassed
+    # entirely.  The CALIBRATED_COLUMN is populated directly from the input
+    # current column (which the user has confirmed holds µM H₂O₂).
+    if skip_calibration:
+        signal_values = signal_values_raw.copy()
+        frame[CALIBRATED_COLUMN] = signal_values
+        phase = "intervals"
+    else:
+        phase = "baseline"
 
     while True:
         # ────────────────────────────────────────────────────────
@@ -380,6 +429,10 @@ def process_file(
                 print(f"\nDataset {path.name} discarded during interval selection.")
                 return None, path, False, control_info, None
             if intervals is None:
+                if skip_calibration:
+                    # No calibration phase to return to — re-open intervals.
+                    print("\nNothing to go back to in skip-calibration mode; reopening interval selection.")
+                    continue
                 print("\nReturning to calibration point selection...")
                 phase = "calibration"
                 continue
@@ -570,7 +623,9 @@ def process_file(
         # ────────────────────────────────────────────────────────
         elif phase == "review":
             decision = review_results(
-                subsets, all_fit_results, turnover_results, filename=path.name
+                subsets, all_fit_results, turnover_results,
+                filename=path.name,
+                skip_calibration=skip_calibration,
             )
             if decision == "discard":
                 print(f"\nDataset {path.name} discarded at review.")
@@ -578,7 +633,12 @@ def process_file(
             if decision == "accept":
                 phase = "save"
                 continue
-            # Any redo option maps directly to a phase name
+            # Any redo option maps directly to a phase name.  In skip-
+            # calibration mode, baseline / calibration are not available;
+            # but defend in depth in case some other entry point passes one.
+            if decision in ("baseline", "calibration") and skip_calibration:
+                print(f"  (baseline/calibration not available in skip-calibration mode; staying at review)")
+                continue
             if decision in ("baseline", "calibration", "intervals", "fitting", "turnover"):
                 print(f"\nRedoing {decision} phase...")
                 phase = decision
@@ -631,6 +691,7 @@ def process_file(
             ),
             residual_activity_ratio=residual_activity_ratios.get(subset.index),
             back_extrap=back_extrap_results.get(subset.index),
+            calibration_skipped=True if skip_calibration else None,
         )
 
     persist_interval_subsets(subsets, interval_dir)
@@ -689,8 +750,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Main entry point for calibration CLI."""
     args = parse_args(argv)
     
-    # Parse calibration values
-    calibration_values = parse_calibration_values(args.calibration_values, args.num_points)
+    # Parse calibration values.  In skip-calibration mode they're unused but
+    # may still have been supplied — accept either way.
+    if args.skip_calibration:
+        print(
+            "\n=== Skip-calibration mode ===\n"
+            f"Treating input files as already-calibrated [H₂O₂] vs time.\n"
+            f"  --time-col    = {args.time_col}\n"
+            f"  --current-col = {args.current_col}  (interpreted as µM H₂O₂)\n"
+            "Baseline and calibration phases will be bypassed.\n"
+        )
+        # When skipping calibration we still need a values list for the signature
+        # but it's never used.  Tolerate an empty / mismatched --calibration-values.
+        try:
+            calibration_values = parse_calibration_values(args.calibration_values, args.num_points)
+        except ValueError:
+            calibration_values = [0.0] * args.num_points
+    else:
+        calibration_values = parse_calibration_values(args.calibration_values, args.num_points)
 
     # Set output directory
     if args.output_dir is None:
@@ -873,6 +950,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             control_role=role,
             control_group=grp,
             calibrated_dir=calibrated_out_dir,
+            skip_calibration=args.skip_calibration,
         )
         # Persist manifest after each control so an interrupted session
         # can resume with saved templates intact.
