@@ -628,6 +628,79 @@ def select_baseline(
         return None
 
 
+def _fit_back_extrap_calibration_exponential(
+    time_values: np.ndarray,
+    signal_values: np.ndarray,
+    fit_start_idx: int,
+    fit_end_idx: int,
+    max_t_idx: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Fit a single exponential between `fit_start_idx` and `fit_end_idx`,
+    then evaluate it back at `time_values[max_t_idx]`.
+
+    Returns
+    -------
+    (fit_t, fit_y, extrap_t, extrap_value)
+        ``fit_t`` / ``fit_y`` are the in-range fitted curve coordinates for
+        plotting; ``extrap_t`` is the array of time-values from
+        ``time_values[max_t_idx]`` up to the start of the fit (for the red
+        dashed extrapolation line); ``extrap_value`` is the fitted current
+        at ``time_values[max_t_idx]``.
+
+    Uses ``model_Exponential`` from sensorfit.models (a*t + b + c*exp(-k*(t-t0)))
+    with three seed sets — same robustness pattern as `fit_Exponential`.
+    """
+    from scipy.optimize import curve_fit
+    from .models import model_Exponential
+
+    if fit_end_idx <= fit_start_idx + 4:
+        raise ValueError("Back-extrap fit needs >4 data points between fit-start and fit-end.")
+
+    t = time_values[fit_start_idx : fit_end_idx + 1].astype(float)
+    y = signal_values[fit_start_idx : fit_end_idx + 1].astype(float)
+
+    dur = float(t[-1] - t[0]) if t[-1] != t[0] else 1.0
+    amp_seed = float(y[0] - y[-1])
+    slope_seed = (y[-1] - y[0]) / dur
+
+    seeds = [
+        [slope_seed * 0.5, float(y[-1]), amp_seed * 0.5, 1.0 / max(dur * 0.3, 1e-3), float(t[0])],
+        [slope_seed * 0.3, float(y[-1]), amp_seed * 0.3, 1.0 / max(dur * 0.5, 1e-3), float(t[0])],
+        [slope_seed * 0.7, float(y[-1]), amp_seed * 0.7, 1.0 / max(dur * 0.2, 1e-3), float(t[0])],
+    ]
+    lb = [-abs(slope_seed) * 10 - 1e-9, float(min(y)) - 10 * abs(amp_seed) - 100,
+          -10 * abs(amp_seed) - 100, 0.0, float(t[0]) - dur]
+    ub = [ abs(slope_seed) * 10 + 1e-9, float(max(y)) + 10 * abs(amp_seed) + 100,
+           10 * abs(amp_seed) + 100, 10.0 / max(dur * 0.02, 1e-3), float(t[-1]) + dur]
+
+    best_popt = None
+    best_rss = float("inf")
+    last_err = None
+    for p0 in seeds:
+        try:
+            popt, _ = curve_fit(model_Exponential, t, y, p0=p0, bounds=(lb, ub), maxfev=12000)
+            yhat = model_Exponential(t, *popt)
+            if not np.all(np.isfinite(yhat)):
+                continue
+            rss = float(np.sum((y - yhat) ** 2))
+            if rss < best_rss:
+                best_rss = rss
+                best_popt = popt
+        except (RuntimeError, ValueError, TypeError) as exc:
+            last_err = exc
+    if best_popt is None:
+        raise RuntimeError(f"Back-extrap exponential fit failed: {last_err}")
+
+    fit_y = model_Exponential(t, *best_popt)
+    # Extrapolation: from t[fit_start] BACK to time_values[max_t_idx]
+    t_back = float(time_values[max_t_idx])
+    extrap_t = np.linspace(t_back, float(t[0]), 60)
+    extrap_y = model_Exponential(extrap_t, *best_popt)
+    extrap_value = float(model_Exponential(np.array([t_back]), *best_popt)[0])
+
+    return t, fit_y, extrap_t, extrap_y, extrap_value
+
+
 def select_points(
     time_values: np.ndarray,
     signal_values: np.ndarray,
@@ -635,20 +708,41 @@ def select_points(
     current_calibration_values: list[float],
     update_calibration_callback: Callable[[list[float], bool], None] | None = None,
     filename: str | None = None,
-) -> tuple[list[int], list[float]] | str:
-    """Select calibration points interactively."""
+    window: int = 50,
+) -> tuple[list[int], list[float]] | tuple[list[int], list[float], list[float]] | str:
+    """Select calibration points interactively.
+
+    Two modes via the toggle at top-left:
+
+    - **Standard** (default): the existing N-point calibration. Pick
+      ``num_points`` points; the linear calibration is built downstream.
+      Returns ``(indices, calibration_values)``.
+    - **Back-extrap (4-pt)**: pick 4 points in order — (1) baseline /
+      [H₂O₂]=0, (2) timepoint that corresponds to peak [H₂O₂] (its
+      *current* value will be back-extrapolated, so noise/deadtime here
+      is fine), (3) start of the exponential-fit region, (4) end of it.
+      The exponential is fit between (3) and (4) and evaluated at the
+      timepoint of click (2); that extrapolated value becomes the
+      "max-current" anchor. Returns
+      ``(indices, calibration_values, mean_currents_override)`` where
+      ``mean_currents_override`` is ``[zero_avg_current, extrap_value]``.
+
+    A window-size TextBox at top-centre lets the user change the click
+    averaging window on the fly (default = the ``window`` kwarg).
+    """
     fig, ax = plt.subplots(figsize=(14, 7))
-    plt.subplots_adjust(left=0.1, bottom=0.18, right=0.95, top=0.80)
+    plt.subplots_adjust(left=0.1, bottom=0.18, right=0.95, top=0.74)
     line, = ax.plot(time_values, signal_values, lw=1)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Current (A)")
-    
+
     selected_indices: list[int] = []
     selected_markers: list = []
-    
+
     # Use a mutable container for num_points so it can be updated
     num_points_ref = {"value": num_points}
-    
+    current_window = {"value": int(window)}
+
     state = {
         "calibration_values": current_calibration_values.copy(),
         "selection_enabled": True,
@@ -657,74 +751,226 @@ def select_points(
         "discard": False,
     }
 
+    # Mode-toggle and per-click window controls along the top of the figure
+    mode_state = {"mode": "standard"}  # "standard" | "back_extrap"
+    back_extrap_state = {
+        "fit_artists": [],       # matplotlib artists drawn from the back-extrap fit
+        "extrap_value": None,    # back-extrapolated current at click-2's t
+        "fit_succeeded": False,  # gates the Accept button in back-extrap mode
+    }
+
+    ax_mode_std = fig.add_axes([0.05, 0.85, 0.12, 0.05])
+    ax_mode_be = fig.add_axes([0.18, 0.85, 0.14, 0.05])
+    ax_window = fig.add_axes([0.42, 0.86, 0.06, 0.04])
+    btn_mode_std = create_small_button(ax_mode_std, "Standard", "#90ee90", "#7cd47c")
+    btn_mode_be = create_small_button(ax_mode_be, "Back-extrap (4-pt)", "0.85", "0.75")
+    tb_window = TextBox(ax_window, "Window ±", initial=str(current_window["value"]))
+
+    BACK_EXTRAP_ROLES = ["[H₂O₂]=0", "t([H₂O₂]max)", "fit-start", "fit-end"]
+    BACK_EXTRAP_COLORS = ["gold", "darkorange", "tab:blue", "tab:blue"]
+
+    def _effective_num_points() -> int:
+        return 4 if mode_state["mode"] == "back_extrap" else num_points_ref["value"]
+
     def update_title() -> None:
-        current_num_points = num_points_ref["value"]
-        remaining = current_num_points - len(selected_indices)
-        if remaining > 0:
-            title = f"Select {remaining} more calibration point(s). Use zoom/pan tools, then click when ready."
+        target = _effective_num_points()
+        remaining = target - len(selected_indices)
+        if mode_state["mode"] == "back_extrap":
+            if remaining > 0:
+                next_role = BACK_EXTRAP_ROLES[len(selected_indices)]
+                title = (
+                    f"Back-extrap mode: click {remaining} more point(s).  "
+                    f"Next click = {next_role}."
+                )
+            elif back_extrap_state["fit_succeeded"]:
+                title = (
+                    f"Back-extrap fit OK.  Extrapolated current at click-2 = "
+                    f"{back_extrap_state['extrap_value']:.4e} A.  "
+                    "Continue to apply, or Retry."
+                )
+            else:
+                title = "Back-extrap fit failed.  Click Retry."
         else:
-            title = f"All {current_num_points} points selected. Use buttons below to Continue or Retry."
+            if remaining > 0:
+                title = (
+                    f"Standard mode: select {remaining} more calibration point(s).  "
+                    f"Use zoom/pan or hotkey 'z'."
+                )
+            else:
+                title = f"All {target} points selected.  Continue or Retry."
         if filename:
             display_name = truncate_filename(filename)
             title = f"{display_name}\n{title}"
         ax.set_title(title)
         fig.canvas.draw_idle()
-    
+
+    def _toolbar_active() -> bool:
+        toolbar = fig.canvas.toolbar
+        if toolbar is None:
+            return False
+        if getattr(toolbar, "mode", "") in ("zoom rect", "pan/zoom", "zoom", "pan"):
+            return True
+        is_active = getattr(toolbar, "_active", None)
+        if is_active and is_active not in ("", None):
+            s = str(is_active).upper()
+            if "ZOOM" in s or "PAN" in s:
+                return True
+        return False
+
+    def _clear_back_extrap_overlay() -> None:
+        for artist in back_extrap_state["fit_artists"]:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        back_extrap_state["fit_artists"] = []
+        back_extrap_state["extrap_value"] = None
+        back_extrap_state["fit_succeeded"] = False
+
+    def _run_back_extrap_fit() -> None:
+        """Fit + draw the back-extrapolation overlay using the 4 stored clicks."""
+        _clear_back_extrap_overlay()
+        zero_idx, max_t_idx, fit_start_idx, fit_end_idx = selected_indices
+        # Ensure ordering (fit-start < fit-end and both > max_t_idx)
+        if fit_end_idx <= fit_start_idx:
+            print("  ✗ Back-extrap: fit-end must come after fit-start.  Click Retry.")
+            return
+        if fit_start_idx <= max_t_idx:
+            print("  ✗ Back-extrap: fit-start must come after the [H₂O₂]max timepoint.  Click Retry.")
+            return
+        try:
+            fit_t, fit_y, extrap_t, extrap_y, extrap_value = _fit_back_extrap_calibration_exponential(
+                time_values, signal_values, fit_start_idx, fit_end_idx, max_t_idx
+            )
+        except Exception as exc:
+            print(f"  ✗ Back-extrap fit failed: {exc}.  Click Retry.")
+            return
+
+        # Draw the fitted exponential in solid red, then a dashed extrapolation
+        # back from fit-start to the time of max-t (click 2).
+        line_fit, = ax.plot(fit_t, fit_y, "r-", lw=1.6, label="Exp fit")
+        line_extrap, = ax.plot(extrap_t, extrap_y, "r--", lw=1.6, alpha=0.85, label="Back-extrap")
+        # Highlight the extrapolated point at the t of click 2
+        t_b = float(time_values[max_t_idx])
+        circle, = ax.plot(
+            [t_b], [extrap_value],
+            "o", ms=14, mfc="none", mec="red", mew=2.5, zorder=6,
+            label="Back-extrap value",
+        )
+        ax.legend(loc="best", fontsize=9)
+        back_extrap_state["fit_artists"] = [line_fit, line_extrap, circle]
+        back_extrap_state["extrap_value"] = float(extrap_value)
+        back_extrap_state["fit_succeeded"] = True
+        print(
+            f"  ✓ Back-extrap fit succeeded; extrapolated I at t={t_b:.3f}s = "
+            f"{extrap_value:.4e} A."
+        )
+
     def on_button_press(event) -> None:
         if event.button != 1 or event.inaxes != ax:
             return
-        
-        current_num_points = num_points_ref["value"]
-        if len(selected_indices) >= current_num_points:
+
+        target = _effective_num_points()
+        if len(selected_indices) >= target:
             return
-        
-        toolbar = fig.canvas.toolbar
-        if toolbar is not None:
-            mode = getattr(toolbar, 'mode', '')
-            is_active = getattr(toolbar, '_active', None)
-            if mode in ('zoom rect', 'pan/zoom', 'zoom', 'pan'):
-                return
-            if is_active and is_active not in ('', None):
-                active_str = str(is_active).upper()
-                if 'ZOOM' in active_str or 'PAN' in active_str:
-                    return
-        
+
+        if _toolbar_active():
+            return
+
         idx = int(np.abs(time_values - event.xdata).argmin())
         selected_indices.append(idx)
-        
-        marker, = ax.plot(
-            time_values[idx],
-            signal_values[idx],
-            "ro",
-            ms=10,
-            markeredgecolor="yellow",
-            markeredgewidth=2,
-            zorder=5,
-        )
+
+        if mode_state["mode"] == "back_extrap":
+            colour = BACK_EXTRAP_COLORS[len(selected_indices) - 1]
+            role = BACK_EXTRAP_ROLES[len(selected_indices) - 1]
+            marker, = ax.plot(
+                time_values[idx], signal_values[idx],
+                "o", ms=12, mfc=colour, mec="black", mew=1.5, zorder=5,
+                label=f"{role}",
+            )
+        else:
+            marker, = ax.plot(
+                time_values[idx],
+                signal_values[idx],
+                "ro", ms=10,
+                markeredgecolor="yellow", markeredgewidth=2, zorder=5,
+            )
         selected_markers.append(marker)
         fig.canvas.draw_idle()
-        
         update_title()
-        
-        current_num_points = num_points_ref["value"]
-        if len(selected_indices) == current_num_points:
-            print(f"\nAll {current_num_points} calibration points selected.")
+
+        if mode_state["mode"] == "back_extrap" and len(selected_indices) == 4:
+            _run_back_extrap_fit()
+            update_title()
+        elif mode_state["mode"] == "standard" and len(selected_indices) == target:
+            print(f"\nAll {target} calibration points selected.")
             print("Click 'Continue' to proceed or 'Retry' to select again.")
 
+    def on_mode_standard(_event=None) -> None:
+        if mode_state["mode"] == "standard":
+            return
+        mode_state["mode"] = "standard"
+        btn_mode_std.color = "#90ee90"
+        btn_mode_be.color = "0.85"
+        # Reset state when switching modes
+        on_retry(None)
+        print("Calibration mode → Standard (N-point)")
+
+    def on_mode_back_extrap(_event=None) -> None:
+        if mode_state["mode"] == "back_extrap":
+            return
+        mode_state["mode"] = "back_extrap"
+        btn_mode_std.color = "0.85"
+        btn_mode_be.color = "#90ee90"
+        on_retry(None)
+        print("Calibration mode → Back-extrap (4-pt)")
+        print("  Click 4 points in order: [H₂O₂]=0, t([H₂O₂]max), fit-start, fit-end.")
+
+    def on_window_submit(text: str) -> None:
+        try:
+            w = int(float(text))
+        except ValueError:
+            print(f"Window must be a positive integer; got '{text}'.")
+            tb_window.set_val(str(current_window["value"]))
+            return
+        if w < 1:
+            print(f"Window must be ≥1.")
+            tb_window.set_val(str(current_window["value"]))
+            return
+        current_window["value"] = w
+        print(f"Calibration window updated to ±{w}.")
+
     def on_continue(_event) -> None:
-        current_num_points = num_points_ref["value"]
-        if len(selected_indices) == current_num_points:
-            # Save final values
+        target = _effective_num_points()
+        if mode_state["mode"] == "back_extrap":
+            if len(selected_indices) != 4:
+                print("Back-extrap mode needs all 4 points selected.")
+                return
+            if not back_extrap_state["fit_succeeded"]:
+                print("Back-extrap fit hasn't succeeded yet.  Click Retry and re-pick.")
+                return
+            state["action"] = "continue"
+            plt.close(fig)
+            return
+        if len(selected_indices) == target:
             state["action"] = "continue"
             plt.close(fig)
         else:
-            print(f"Please select all {current_num_points} points before continuing.")
+            print(f"Please select all {target} points before continuing.")
 
     def on_retry(_event) -> None:
         selected_indices.clear()
         while selected_markers:
             marker = selected_markers.pop()
-            marker.remove()
+            try:
+                marker.remove()
+            except Exception:
+                pass
+        _clear_back_extrap_overlay()
+        # Remove any leftover legend artists from prior fits
+        leg = ax.get_legend()
+        if leg is not None:
+            leg.remove()
         state["action"] = None
         fig.canvas.draw_idle()
         update_title()
@@ -761,14 +1007,17 @@ def select_points(
             fig.canvas.draw_idle()
     
     fig.canvas.mpl_connect("button_press_event", on_button_press)
+    btn_mode_std.on_clicked(on_mode_standard)
+    btn_mode_be.on_clicked(on_mode_back_extrap)
+    tb_window.on_submit(on_window_submit)
 
-    # Add instructions text box
-    instructions_text = (
-        f"Click on the plot to select {num_points} calibration points. Use zoom/pan tools to "
-        "explore data (deselect them before clicking). Selected points appear as red circles. "
-        "Use 'Change calibration values' to edit values or change the number of points."
+    add_instruction_banner(
+        fig,
+        "Top-left: choose Standard (N-point ladder) or Back-extrap (4-pt with "
+        "exponential extrapolation).  Top-centre: window TextBox (±samples).  "
+        "Click on the plot to add points.  Buttons below: Change-values, Retry, "
+        "Go Back, Discard, Continue.",
     )
-    add_instruction_banner(fig, instructions_text)
     
     # Create buttons - adjust layout to fit "Change calibration values" button
     ax_change_cal = plt.axes([0.05, 0.11, 0.18, 0.04])
@@ -792,14 +1041,13 @@ def select_points(
     
     print(
         "\nCalibration point selection:\n"
-        "  • Use the toolbar zoom/pan buttons to explore the data.\n"
-        "  • When ready to select points, deselect zoom/pan tools.\n"
-        "  • Then left-click on the plot to select calibration points.\n"
-        "  • Selected points will be marked with red circles.\n"
-        f"  • Select {num_points} points total, then click 'Continue' or 'Retry'.\n"
-        "  • Use 'Change calibration values' to edit calibration values or change the number of points.\n"
-        "  • Use 'Go Back' to return to baseline selection.\n"
-        "  • Use 'Discard' to skip this file entirely.\n"
+        "  • Standard mode: pick N points across a [H₂O₂] ladder.\n"
+        "  • Back-extrap mode (4-pt): pick zero / t-of-max / fit-start / fit-end;\n"
+        "    SensorFit fits an exponential between the last two and extrapolates\n"
+        "    BACK to the t-of-max click → use this when the run starts with H₂O₂\n"
+        "    injection and the deadtime keeps you from a clean max-[H₂O₂] point.\n"
+        "  • Window TextBox: type a new value and press Enter.\n"
+        "  • Buttons: Change values | Retry | Go Back | Discard | Continue.\n"
         "  • Zoom: press z to toggle zoom-rectangle mode; drag to zoom; r to reset."
     )
 
@@ -812,11 +1060,33 @@ def select_points(
 
     if state["go_back_to_baseline"]:
         return "go_back_to_baseline"
-    
+
+    if mode_state["mode"] == "back_extrap":
+        if state["action"] != "continue" or len(selected_indices) != 4 or not back_extrap_state["fit_succeeded"]:
+            raise RuntimeError("Back-extrap selection incomplete or fit failed.")
+        zero_idx = selected_indices[0]
+        max_t_idx = selected_indices[1]
+        # Two-point calibration anchors: (zero_avg_current, 0 µM) and
+        # (extrap_value, max_uM where max_uM = LAST entry of calibration_values).
+        cvals = state["calibration_values"]
+        if not cvals:
+            raise RuntimeError("Calibration values list is empty.")
+        zero_uM = float(cvals[0])
+        max_uM = float(cvals[-1])
+        zero_avg = float(average_window(signal_values, zero_idx, current_window["value"]))
+        extrap_value = float(back_extrap_state["extrap_value"])
+        # Return 3-tuple: caller detects the override and uses these mean_currents
+        # in place of computing from indices.
+        return (
+            [zero_idx, max_t_idx],
+            [zero_uM, max_uM],
+            [zero_avg, extrap_value],
+        )
+
     final_num_points = num_points_ref["value"]
     if state["action"] != "continue" or len(selected_indices) != final_num_points:
         raise RuntimeError(f"Selection incomplete or cancelled: {len(selected_indices)}/{final_num_points} points selected.")
-    
+
     return selected_indices, state["calibration_values"]
 
 

@@ -409,6 +409,38 @@ def test_fit_baseline_polynomial() -> bool:
     raise AssertionError("expected ValueError for 1 click")
 
 
+def test_back_extrap_calibration_fit() -> bool:
+    _section("C4: 4-point back-extrap calibration exponential fit")
+    import matplotlib
+    matplotlib.use("Agg")
+    import numpy as np
+    from sensorfit.calibration import _fit_back_extrap_calibration_exponential
+
+    # Simulate a reaction starting with H2O2 injection: deadtime junk before
+    # t=3, then a clean exponential decay y = 100*exp(-0.05*(t-3)) afterwards.
+    t = np.linspace(0, 30, 1000)
+    y = np.where(t < 3, 50.0, 100 * np.exp(-0.05 * (t - 3)))
+
+    max_t_idx = int(np.argmin(np.abs(t - 3.0)))     # true [H2O2]max moment
+    fit_start_idx = int(np.argmin(np.abs(t - 5.0)))  # after deadtime
+    fit_end_idx = int(np.argmin(np.abs(t - 25.0)))
+
+    _, _, _, _, extrap_value = _fit_back_extrap_calibration_exponential(
+        t, y, fit_start_idx, fit_end_idx, max_t_idx
+    )
+    # True value at t=3 is 100; allow a small fit-tolerance
+    assert abs(extrap_value - 100.0) < 1.0, f"expected ~100, got {extrap_value}"
+    print(f"  ✓ exponential fit back-extrapolates to {extrap_value:.3f} (true 100)")
+
+    # Too few points → ValueError
+    try:
+        _fit_back_extrap_calibration_exponential(t, y, 100, 102, 50)
+    except ValueError:
+        print("  ✓ ValueError when fit window has <5 points")
+        return True
+    raise AssertionError("expected ValueError for narrow fit window")
+
+
 def test_zoom_hotkey_install() -> bool:
     _section("C2: zoom_hotkey.install_zoom_keys wires up cleanly")
     # Headless mode for CI / non-interactive testing
@@ -511,6 +543,7 @@ def main() -> int:
         test_back_extrap_linear_fallback,
         test_back_extrap_no_fit,
         test_fit_baseline_polynomial,
+        test_back_extrap_calibration_fit,
         test_zoom_hotkey_install,
         test_build_subtraction_chain,
         test_skip_calibration_provenance,

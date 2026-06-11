@@ -286,6 +286,7 @@ def process_file(
                 current_calibration_values,
                 update_calibration_callback,
                 filename=path.name,
+                window=window,
             )
             if result == "discard":
                 print(f"\nDataset {path.name} discarded during calibration.")
@@ -295,11 +296,18 @@ def process_file(
                 phase = "baseline"
                 continue
 
-            indices, final_calibration_values = result
+            # select_points may return a 2-tuple (standard mode) or a 3-tuple
+            # (back-extrap mode, where the 3rd element overrides mean_currents).
+            if len(result) == 3:
+                indices, final_calibration_values, mean_currents_override = result
+                mean_currents = list(mean_currents_override)
+                print("Using back-extrap calibration (4-pt exponential extrapolation).")
+            else:
+                indices, final_calibration_values = result
+                mean_currents = [
+                    average_window(signal_values, idx, window) for idx in indices
+                ]
             current_calibration_values = final_calibration_values
-            mean_currents = [
-                average_window(signal_values, idx, window) for idx in indices
-            ]
             calibration = build_calibration(mean_currents, final_calibration_values)
             frame[CALIBRATED_COLUMN] = apply_calibration(frame[current_col], calibration)
 
