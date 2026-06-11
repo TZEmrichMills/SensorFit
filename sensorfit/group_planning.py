@@ -384,6 +384,8 @@ def preview_and_apply_subtraction(
     btn_back.on_clicked(on_back)
 
     redraw()
+    from .zoom_hotkey import install_zoom_keys
+    install_zoom_keys(fig, list(ax))
     plt.show()
     plt.close(fig)
 

@@ -732,6 +732,8 @@ def select_control_reference_interval(
         b.on_clicked(make_picker(s.index))
         btns.append(b)
 
+    from .zoom_hotkey import install_zoom_keys
+    install_zoom_keys(fig, ax)
     plt.show()
     plt.close(fig)
     return choice["idx"]
@@ -883,6 +885,8 @@ def interactive_subtract(
     btn_back.on_clicked(on_back)
 
     redraw()
+    from .zoom_hotkey import install_zoom_keys
+    install_zoom_keys(fig, list(ax))
     plt.show()
     plt.close(fig)
 

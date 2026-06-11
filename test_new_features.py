@@ -366,6 +366,31 @@ def test_skip_calibration_loads_real_csv() -> bool:
     return True
 
 
+def test_zoom_hotkey_install() -> bool:
+    _section("C2: zoom_hotkey.install_zoom_keys wires up cleanly")
+    # Headless mode for CI / non-interactive testing
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sensorfit.zoom_hotkey import install_zoom_keys
+
+    fig, ax = plt.subplots()
+    ax.plot([0, 1, 2], [0, 1, 0])
+    state = install_zoom_keys(fig, ax)
+    assert state["zoom_active"] is False
+    assert id(ax) in state["selectors"]
+    plt.close(fig)
+    print("  ✓ single-axis install: zoom inactive at start, selector created")
+
+    # Multi-axes form
+    fig, ax_pair = plt.subplots(2, 1)
+    state2 = install_zoom_keys(fig, list(ax_pair))
+    assert len(state2["selectors"]) == 2
+    plt.close(fig)
+    print("  ✓ two-axis install: both selectors created")
+    return True
+
+
 def test_build_subtraction_chain() -> bool:
     _section("Restructure: build_subtraction_chain (averaged-within / sequential-across)")
     import numpy as np
@@ -442,6 +467,7 @@ def main() -> int:
         test_back_extrap_exponential,
         test_back_extrap_linear_fallback,
         test_back_extrap_no_fit,
+        test_zoom_hotkey_install,
         test_build_subtraction_chain,
         test_skip_calibration_provenance,
         test_skip_calibration_loads_real_csv,

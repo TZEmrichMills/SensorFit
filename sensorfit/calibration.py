@@ -24,6 +24,8 @@ from matplotlib.widgets import Button, CheckButtons, TextBox
 import numpy as np
 import pandas as pd
 
+from .zoom_hotkey import install_zoom_keys
+
 
 @dataclass
 class CalibrationResult:
@@ -364,9 +366,11 @@ def select_baseline(
             "  • Each click averages 20 surrounding points.\n"
             "  • A red dashed line will appear connecting the two points.\n"
             "  • Use buttons: Continue (view corrected data), Redraw (select again), "
-            "Skip baseline (use raw signal as-is), or Discard (skip this file)."
+            "Skip baseline (use raw signal as-is), or Discard (skip this file).\n"
+            "  • Zoom: press z to toggle zoom-rectangle mode; drag to zoom; r to reset."
         )
 
+        install_zoom_keys(fig, ax)
         plt.show()
         plt.close(fig)
 
@@ -642,15 +646,17 @@ def select_points(
         f"  • Select {num_points} points total, then click 'Continue' or 'Retry'.\n"
         "  • Use 'Change calibration values' to edit calibration values or change the number of points.\n"
         "  • Use 'Go Back' to return to baseline selection.\n"
-        "  • Use 'Discard' to skip this file entirely."
+        "  • Use 'Discard' to skip this file entirely.\n"
+        "  • Zoom: press z to toggle zoom-rectangle mode; drag to zoom; r to reset."
     )
 
+    install_zoom_keys(fig, ax)
     plt.show()
     plt.close(fig)
-    
+
     if state["discard"]:
         return "discard"
-    
+
     if state["go_back_to_baseline"]:
         return "go_back_to_baseline"
     
@@ -873,12 +879,14 @@ def select_intervals(
     def on_key(event) -> None:
         if event.key == "enter":
             confirm_and_close()
-        elif event.key in {"escape", "r"}:
+        elif event.key == "escape":
             clear_intervals()
         elif event.key == "b":
             go_back_to_calibration()
         elif event.key == "u":
             remove_last_interval()
+        # NB: 'r' is reserved for the zoom-reset hotkey installed by
+        # install_zoom_keys.  Use the Reselect button or Escape to clear.
 
     fig.canvas.mpl_connect("button_press_event", on_button_press)
     fig.canvas.mpl_connect("key_press_event", on_key)
@@ -923,8 +931,10 @@ def select_intervals(
         "  • The interval will be marked with an orange span.\n"
         "  • Repeat to select multiple intervals.\n"
         "  • Use buttons: 'Remove Last', 'Reselect', 'Go Back', 'Discard', 'Continue'.\n"
-        "  • Keyboard shortcuts: Enter = Continue, Escape/R = Reselect, B = Go Back, U = Remove Last."
+        "  • Keyboard shortcuts: Enter = Continue, Escape = Reselect, B = Go Back, U = Remove Last.\n"
+        "  • Zoom: z toggles zoom-rectangle mode; drag to zoom; r resets the view."
     )
+    install_zoom_keys(fig, ax)
     plt.show()
     plt.close(fig)
     
@@ -1910,9 +1920,10 @@ def interactive_interval_fitting(
                 manual_linear_markers.clear()
                 manual_linear_points.clear()
                 apply_linear_fit_from_indices(start_idx, end_idx, "manual")
-        
+
         click_cid = fig.canvas.mpl_connect("button_press_event", handle_manual_click)
-        
+
+        install_zoom_keys(fig, [ax_data, ax_resid])
         plt.show()
         fig.canvas.mpl_disconnect(click_cid)
         plt.close(fig)
@@ -2380,9 +2391,10 @@ def calculate_turnover_before_inactivation(
                 manual_tail_markers.clear()
                 manual_tail_points.clear()
                 apply_manual_tail_fit(start_idx, end_idx)
-        
+
         click_cid = fig.canvas.mpl_connect("button_press_event", handle_manual_click)
-        
+
+        install_zoom_keys(fig, ax)
         plt.show()
         fig.canvas.mpl_disconnect(click_cid)
         plt.close(fig)
