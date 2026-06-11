@@ -1,6 +1,6 @@
 """SensorFit - A package for fitting sensor timecourse data."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .models import MODEL_FUNCS
 from .fitting import fit_IB, fit_Exponential, fit_GFI
@@ -29,15 +29,7 @@ from .controls import (
     interactive_subtract,
     select_control_reference_interval,
 )
-from .residual_activity import (
-    compute_residual_activity,
-    tag_residual_activity_series,
-)
-from .back_extrap import (
-    compute_back_extrap,
-    prompt_back_extrap_for_interval,
-    offer_back_extrap_for_file,
-)
+from .back_extrap import compute_back_extrap
 from .group_planning import (
     SampleState,
     build_subtraction_chain,
@@ -78,13 +70,8 @@ __all__ = [
     "interpolate_control_to_grid",
     "interactive_subtract",
     "select_control_reference_interval",
-    # Residual-activity exports
-    "compute_residual_activity",
-    "tag_residual_activity_series",
-    # Back-extrapolation exports
+    # Back-extrapolation (math only; standalone UI removed)
     "compute_back_extrap",
-    "prompt_back_extrap_for_interval",
-    "offer_back_extrap_for_file",
     # Group-planning exports
     "SampleState",
     "build_subtraction_chain",
@@ -93,4 +80,3 @@ __all__ = [
     "run_group_planning",
     "offer_refit_for_corrected_intervals",
 ]
-

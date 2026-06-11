@@ -36,11 +36,6 @@ from .controls import (
     select_control_reference_interval,
     show_grouping_ui,
 )
-from .residual_activity import (
-    compute_residual_activity,
-    tag_residual_activity_series,
-)
-from .back_extrap import offer_back_extrap_for_file
 from .group_planning import (
     SampleState,
     offer_refit_for_corrected_intervals,
@@ -139,45 +134,6 @@ def _legacy_template_filename(group: "ControlGroup | None") -> str | None:
     if len(group.subgroups) != 1 or len(group.subgroups[0].controls) != 1:
         return None
     return group.subgroups[0].controls[0].template_filename
-
-
-def _prompt_yes_no_residual_activity() -> bool:
-    """Small matplotlib yes/no asking whether this run is a residual-activity
-    series.  Returns True if the user clicked Yes.
-    """
-    import matplotlib.pyplot as plt
-    from .calibration import create_small_button
-
-    fig, ax = plt.subplots(figsize=(6.5, 2.6))
-    ax.axis("off")
-    ax.text(
-        0.5, 0.62,
-        "Multi-addition residual-activity series?\n\n"
-        "If this run had successive H₂O₂ additions and you want SensorFit\n"
-        "to compute rate-ratios between them, click Yes to tag the\n"
-        "intervals.  Otherwise click No to continue normally.",
-        ha="center", va="center", fontsize=10, wrap=True,
-    )
-    fig.suptitle("Residual activity (opt-in)", fontsize=11, fontweight="bold")
-    state = {"choice": False}
-
-    def on_yes(_e=None):
-        state["choice"] = True
-        plt.close(fig)
-
-    def on_no(_e=None):
-        state["choice"] = False
-        plt.close(fig)
-
-    ax_yes = fig.add_axes([0.20, 0.10, 0.25, 0.16])
-    ax_no = fig.add_axes([0.55, 0.10, 0.25, 0.16])
-    btn_yes = create_small_button(ax_yes, "Yes — tag intervals", "#90ee90", "#7cd47c")
-    btn_no = create_small_button(ax_no, "No — skip", "0.9", "0.8")
-    btn_yes.on_clicked(on_yes)
-    btn_no.on_clicked(on_no)
-    plt.show()
-    plt.close(fig)
-    return state["choice"]
 
 
 def parse_calibration_values(arg: str, num_points: int) -> list[float]:
@@ -283,9 +239,6 @@ def process_file(
     turnover_results: dict[int, float | None] = {}
     control_subtracted = False
     control_info: dict | None = None
-    residual_activity_series: list[int] = []  # interval indices tagged as a series
-    residual_activity_ratios: dict[int, float] = {}  # filled after fitting
-    back_extrap_results: dict[int, dict] = {}  # filled in back_extrap phase
 
     # In skip-calibration mode the baseline and calibration phases are bypassed
     # entirely.  The CALIBRATED_COLUMN is populated directly from the input
@@ -498,32 +451,6 @@ def process_file(
                             f"(interval #{ref.index}) → {tpl_path}"
                         )
 
-            # Opt-in residual-activity tagging — only ask when there are
-            # multiple intervals (single-interval files have nothing to ratio).
-            if len(subsets) >= 2 and control_role != "control":
-                if not _prompt_yes_no_residual_activity():
-                    pass  # user said no; series stays empty
-                else:
-                    summaries = [
-                        (s.index, s.start_time, s.end_time) for s in subsets
-                    ]
-                    pre = residual_activity_series or [s.index for s in subsets]
-                    residual_activity_series = tag_residual_activity_series(
-                        summaries, filename=path.name, pre_selected=pre
-                    )
-                    if len(residual_activity_series) < 2:
-                        if residual_activity_series:
-                            print(
-                                "Only one interval tagged — need ≥2 for a ratio.  "
-                                "Tag dropped."
-                            )
-                        residual_activity_series = []
-                    else:
-                        print(
-                            f"Residual-activity series tagged: intervals "
-                            f"{residual_activity_series} (ratios computed after fitting)."
-                        )
-
             phase = "fitting"
             continue
 
@@ -551,40 +478,6 @@ def process_file(
                     display_names = [get_model_display_name(n) for n in models]
                     print(f"  Interval #{interval_idx}: {', '.join(display_names)}")
 
-            # Compute residual-activity ratios (only meaningful if the user
-            # tagged a series during the intervals phase).
-            if residual_activity_series:
-                residual_activity_ratios = compute_residual_activity(
-                    all_fit_results, residual_activity_series
-                )
-                print("Residual-activity ratios:")
-                for idx, ratio in sorted(residual_activity_ratios.items()):
-                    print(f"  Interval #{idx}: {ratio:.4f}")
-
-            phase = "back_extrap"
-            continue
-
-        # ────────────────────────────────────────────────────────
-        # PHASE: back_extrap (opt-in, per-interval H₂O₂-injection-start)
-        # ────────────────────────────────────────────────────────
-        elif phase == "back_extrap":
-            # Only meaningful if at least one interval was fit
-            if all_fit_results:
-                back_extrap_results = offer_back_extrap_for_file(
-                    subsets,
-                    all_fit_results,
-                    time_col=time_col,
-                    filename=path.name,
-                )
-                if back_extrap_results:
-                    print("Back-extrapolation recorded for:")
-                    for idx, r in sorted(back_extrap_results.items()):
-                        print(
-                            f"  Interval #{idx}: back_extrap={r['back_extrap_uM']:.3f} µM, "
-                            f"stretch_factor={r['stretch_factor']:.4f}, "
-                            f"stretch_rate={r['stretch_initial_rate']:.4f} µM/s "
-                            f"(method={r['method']})"
-                        )
             phase = "turnover"
             continue
 
@@ -689,8 +582,6 @@ def process_file(
                 if (control_role == "sample" and control_subtracted and control_group is not None)
                 else None
             ),
-            residual_activity_ratio=residual_activity_ratios.get(subset.index),
-            back_extrap=back_extrap_results.get(subset.index),
             calibration_skipped=True if skip_calibration else None,
         )
 

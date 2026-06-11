@@ -232,52 +232,24 @@ def test_interpolate_control() -> bool:
 # 3) Residual activity (Commit 3)
 # ──────────────────────────────────────────────────────────────────────────
 
-def test_residual_activity() -> bool:
-    _section("Commit 3: compute_residual_activity")
-    from sensorfit.residual_activity import compute_residual_activity
+# ──────────────────────────────────────────────────────────────────────────
+# Residual-activity module was removed in the per-interval restructure
+# (the user can compute rate ratios in Excel from initial_rate columns).
+# ──────────────────────────────────────────────────────────────────────────
 
-    def make_fits(rates):
-        return {
-            i + 1: {
-                "Exponential": {"init_rate": r, "aic": -100.0},
-                "IB": {"init_rate": r * 0.9, "aic": -50.0},
-            }
-            for i, r in enumerate(rates)
-        }
 
-    fits = make_fits([-10.0, -7.0, -3.0])
-    ratios = compute_residual_activity(fits, [1, 2, 3])
-    assert ratios == {1: 1.0, 2: 0.7, 3: 0.3}, f"unexpected: {ratios}"
-    print(f"  ✓ 3-interval series → ratios = {{1: 1.0, 2: 0.7, 3: 0.3}}")
-
-    # Single-interval series
-    r = compute_residual_activity(fits, [1])
-    assert r == {1: 1.0}
-    print("  ✓ single-interval series returns {first: 1.0}")
-
-    # Zero first rate
-    z = compute_residual_activity(make_fits([0.0, -5.0]), [1, 2])
-    assert z[1] == 1.0 and math.isnan(z[2])
-    print("  ✓ zero first rate → all later ratios NaN")
-
-    # NaN propagation
-    n = compute_residual_activity(make_fits([-10.0, float("nan")]), [1, 2])
-    assert n[1] == 1.0 and math.isnan(n[2])
-    print("  ✓ NaN rate → NaN ratio")
-
-    # LinearInitialRate fallback (no IB/Exp)
-    linear_only = {
-        1: {"LinearInitialRate": {"init_rate": -2.0}},
-        2: {"LinearInitialRate": {"init_rate": -1.0}},
-    }
-    r2 = compute_residual_activity(linear_only, [1, 2])
-    assert r2[1] == 1.0 and math.isclose(r2[2], 0.5)
-    print("  ✓ LinearInitialRate used as fallback when no primary model present")
-    return True
+def test_residual_activity_module_gone() -> bool:
+    _section("Per-interval restructure: residual_activity module removed")
+    try:
+        import sensorfit.residual_activity  # noqa: F401
+    except ModuleNotFoundError:
+        print("  ✓ sensorfit.residual_activity no longer importable")
+        return True
+    raise AssertionError("residual_activity module is still importable but should have been deleted")
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 4) Back-extrapolation (Commit 4)
+# Back-extrapolation (math stays; the standalone UI is gone)
 # ──────────────────────────────────────────────────────────────────────────
 
 def test_back_extrap_exponential() -> bool:
@@ -358,17 +330,25 @@ def test_skip_calibration_loads_real_csv() -> bool:
     import pandas as pd
     from sensorfit.calibration import load_trace, CALIBRATED_COLUMN
 
-    folder = Path(
+    base = Path(
         "/Users/tom/Jottacloud/Tommy/01_NMBU_workspace/Supervision/Rannei_Skaali_PhD/"
         "Assays/Sensor/Peroxi-Temperature-variation/260602_Rannei_arrhenius_att3/"
         "Subtracted_Traces_for_Rannei/IBFits"
     )
-    if not folder.exists():
-        print(f"  (skipped — folder not available: {folder})")
+    if not base.exists():
+        print(f"  (skipped — folder not available: {base})")
         return True
 
-    csvs = sorted([p for p in folder.glob("*.csv") if not p.name.startswith("~$")])[:2]
-    assert csvs, "expected ≥1 CSV in real-data folder"
+    # CSVs may live in the base folder, or in Processed/ if the user has
+    # already run SensorFit against them.  Accept either.
+    candidates = []
+    for d in (base, base / "Processed"):
+        if d.exists():
+            candidates.extend(p for p in d.glob("*.csv") if not p.name.startswith("~$"))
+    if not candidates:
+        print(f"  (skipped — no CSVs available in {base} or its Processed/)")
+        return True
+    csvs = sorted(candidates)[:2]
     for path in csvs:
         # Mirror what process_file does in skip mode: load with --time-col=0, --current-col=3
         frame = load_trace(path, time_col_idx=0, current_col_idx=3)
@@ -458,7 +438,7 @@ def main() -> int:
         test_controls_manifest_roundtrip,
         test_control_template_roundtrip,
         test_interpolate_control,
-        test_residual_activity,
+        test_residual_activity_module_gone,
         test_back_extrap_exponential,
         test_back_extrap_linear_fallback,
         test_back_extrap_no_fit,
