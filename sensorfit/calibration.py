@@ -221,109 +221,243 @@ def average_window(signal_values: np.ndarray, center_idx: int, window: int) -> f
     return float(signal_values[start:end].mean())
 
 
+def _fit_baseline_polynomial(
+    t_clicks: list[float], y_clicks: list[float], time_values: np.ndarray
+) -> np.ndarray:
+    """Fit a polynomial through clicked baseline points and evaluate it on
+    the full time grid.
+
+    Degree is auto-chosen from the number of points:
+        2 points  → degree 1 (straight line; same as line mode)
+        3 points  → degree 2 (parabola)
+        4+ points → degree 3 (cubic, max)
+
+    Polynomial fitting (rather than a strict-interpolation spline) is chosen
+    so click-noise is smoothed *through* the points rather than reproduced
+    exactly, and so the baseline extrapolates naturally to the start/end of
+    the run.
+    """
+    t_arr = np.asarray(t_clicks, dtype=float)
+    y_arr = np.asarray(y_clicks, dtype=float)
+    if t_arr.size < 2:
+        raise ValueError("Need at least 2 points for a baseline fit.")
+    deg = min(t_arr.size - 1, 3)
+    coeffs = np.polyfit(t_arr, y_arr, deg=deg)
+    return np.polyval(coeffs, time_values)
+
+
 def select_baseline(
     time_values: np.ndarray,
     signal_values: np.ndarray,
     window: int = 50,
     filename: str | None = None,
-) -> tuple[np.ndarray, tuple[float, float]] | None | str:
+) -> tuple[np.ndarray, tuple[float, float] | dict] | None | str:
     """
-    Select baseline by clicking two points, show corrected data, and get confirmation.
-    
-    Returns:
-    --------
-    Tuple of (baseline_corrected_signal, (slope, intercept)) if accepted
+    Interactive baseline selection with two modes:
+
+    - **Line** (default, 2 clicks): straight-line fit, returns
+      ``(corrected_signal, (slope, intercept))``.
+    - **Curve** (≥3 clicks): polynomial fit (degree auto, 1/2/3 depending on
+      click count), returns ``(corrected_signal, {"mode": "curve",
+      "degree": int, "coeffs": [...], "click_points": [(t, y), ...],
+      "window": int})``.
+
+    The window-size used for averaging around each click can be changed
+    on-the-fly via the TextBox at the top of the window.
+
+    Returns
+    -------
+    Tuple of (baseline_corrected_signal, baseline_metadata) if accepted
     None if dataset is discarded
     "redraw" if user wants to retry baseline selection
     """
     # Step 1: Select baseline points
     while True:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.80)
+        fig, ax = plt.subplots(figsize=(11, 6.5))
+        plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.74)
         ax.plot(time_values, signal_values, "b-", lw=1, label="Raw data")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Current (A)")
-        title = "Click two points to define baseline (average of 20 points around each click)"
+        title = "Baseline selection: Line (2 clicks) or Curve (≥3 clicks)"
         if filename:
             display_name = truncate_filename(filename)
             title = f"{display_name}\n{title}"
         ax.set_title(title)
         ax.legend()
         ax.grid(True, alpha=0.3)
-        
-        # Add instructions text box
-        instructions_text = (
-            "Use the toolbar zoom/pan tools to explore the data. Deselect those tools, then click "
-            "two points to define the baseline. Each click averages 20 surrounding points."
-        )
-        add_instruction_banner(fig, instructions_text)
 
+        add_instruction_banner(
+            fig,
+            "Choose Line or Curve (top-left).  Click on the plot to add points; "
+            "each is averaged over ±window samples.  Change window via the "
+            "TextBox (top-centre, press Enter to apply).  Buttons below: "
+            "Continue, Redraw, Skip baseline, Discard.",
+        )
+
+        # Mode + window controls along the top
+        ax_mode_line = fig.add_axes([0.10, 0.85, 0.10, 0.05])
+        ax_mode_curve = fig.add_axes([0.21, 0.85, 0.10, 0.05])
+        ax_window = fig.add_axes([0.46, 0.86, 0.07, 0.04])
+        mode_state = {"mode": "line"}
+
+        btn_mode_line = create_small_button(ax_mode_line, "Line", "#90ee90", "#7cd47c")
+        btn_mode_curve = create_small_button(ax_mode_curve, "Curve", "0.85", "0.75")
+        tb_window = TextBox(ax_window, "Window ±", initial=str(current_window["value"]))
+
+        baseline_indices: list[int] = []  # click indices for re-averaging
         baseline_points: list[tuple[float, float]] = []
-        baseline_line = None
+        click_markers: list = []  # one matplotlib artist per click
+        overlay_artist = {"line": None}
         state = {"action": None}
 
-        def update_baseline_line() -> None:
-            nonlocal baseline_line
-            if len(baseline_points) == 2:
-                if baseline_line is not None:
-                    baseline_line.remove()
-                t1, y1 = baseline_points[0]
-                t2, y2 = baseline_points[1]
-                baseline_line, = ax.plot([t1, t2], [y1, y2], "r--", lw=2, label="Baseline")
-                ax.legend()
+        def _recompute_points_from_indices() -> None:
+            """Re-run windowed averaging at each stored click index using
+            the current window value.  Updates baseline_points and the marker
+            positions in place."""
+            w = current_window["value"]
+            baseline_points.clear()
+            for idx, marker in zip(baseline_indices, click_markers):
+                avg_current = average_window(signal_values, idx, w)
+                avg_time = time_values[idx]
+                baseline_points.append((float(avg_time), float(avg_current)))
+                marker.set_data([avg_time], [avg_current])
+
+        def update_baseline_overlay() -> None:
+            """Draw the line (line mode) or polynomial fit (curve mode)."""
+            if overlay_artist["line"] is not None:
+                try:
+                    overlay_artist["line"].remove()
+                except Exception:
+                    pass
+                overlay_artist["line"] = None
+
+            if not baseline_points:
                 fig.canvas.draw_idle()
+                return
+
+            if mode_state["mode"] == "line":
+                if len(baseline_points) == 2:
+                    t1, y1 = baseline_points[0]
+                    t2, y2 = baseline_points[1]
+                    artist, = ax.plot(
+                        [t1, t2], [y1, y2], "r--", lw=2, label="Baseline (line)"
+                    )
+                    overlay_artist["line"] = artist
+            else:  # curve
+                if len(baseline_points) >= 2:
+                    t_clicks = [p[0] for p in baseline_points]
+                    y_clicks = [p[1] for p in baseline_points]
+                    try:
+                        fit = _fit_baseline_polynomial(t_clicks, y_clicks, time_values)
+                        deg_used = min(len(baseline_points) - 1, 3)
+                        artist, = ax.plot(
+                            time_values, fit, "r--", lw=2,
+                            label=f"Baseline (curve, deg {deg_used})",
+                        )
+                        overlay_artist["line"] = artist
+                    except Exception as exc:
+                        print(f"Curve fit failed: {exc}")
+
+            ax.legend(loc="best")
+            fig.canvas.draw_idle()
+
+        def _toolbar_active() -> bool:
+            toolbar = fig.canvas.toolbar
+            if toolbar is None:
+                return False
+            mode = getattr(toolbar, "mode", "")
+            if mode in ("zoom rect", "pan/zoom", "zoom", "pan"):
+                return True
+            is_active = getattr(toolbar, "_active", None)
+            if is_active and is_active not in ("", None):
+                s = str(is_active).upper()
+                if "ZOOM" in s or "PAN" in s:
+                    return True
+            return False
 
         def on_click(event) -> None:
-            # Only register clicks when:
-            # 1. Left mouse button
-            # 2. Click is inside the axes
-            # 3. Navigation toolbar is not in zoom/pan mode
             if event.button != 1 or event.inaxes != ax:
                 return
-            
-            # Check if navigation toolbar is active (zoom/pan mode)
-            # When zoom/pan tools are active, clicks are consumed by those tools
-            toolbar = fig.canvas.toolbar
-            if toolbar is not None:
-                # Check various ways the toolbar might indicate an active tool
-                mode = getattr(toolbar, 'mode', '')
-                # Some backends use '_active' attribute
-                is_active = getattr(toolbar, '_active', None)
-                
-                # If toolbar mode indicates zoom/pan is active, ignore click
-                if mode in ('zoom rect', 'pan/zoom', 'zoom', 'pan'):
-                    return
-                
-                # If there's an active tool (like zoom), ignore click
-                # The toolbar's _active attribute might be a string like 'ZOOM' or 'PAN'
-                if is_active and is_active not in ('', None):
-                    # Check if it's a navigation tool (not just None/empty)
-                    active_str = str(is_active).upper()
-                    if 'ZOOM' in active_str or 'PAN' in active_str:
-                        return
-            
-            # Register the click as a baseline point
+            if _toolbar_active():
+                return
+            if mode_state["mode"] == "line" and len(baseline_indices) >= 2:
+                print("Line mode: 2 points already selected.  Redraw to start over.")
+                return
+
             idx = int(np.abs(time_values - event.xdata).argmin())
-            avg_current = average_window(signal_values, idx, window)
+            w = current_window["value"]
+            avg_current = average_window(signal_values, idx, w)
             avg_time = time_values[idx]
-            
+
+            baseline_indices.append(idx)
             baseline_points.append((float(avg_time), float(avg_current)))
-            ax.plot(avg_time, avg_current, "ro", ms=8, zorder=5)
+            marker, = ax.plot(avg_time, avg_current, "ro", ms=8, zorder=5)
+            click_markers.append(marker)
+            update_baseline_overlay()
+
+            n = len(baseline_indices)
+            print(f"Point #{n}: t={avg_time:.3f} s, I={avg_current:.6e} A (window ±{w})")
+
+        def on_mode_line(_event=None) -> None:
+            if mode_state["mode"] == "line":
+                return
+            mode_state["mode"] = "line"
+            btn_mode_line.color = "#90ee90"
+            btn_mode_curve.color = "0.85"
+            while len(baseline_indices) > 2:
+                baseline_indices.pop()
+                baseline_points.pop()
+                marker = click_markers.pop()
+                try:
+                    marker.remove()
+                except Exception:
+                    pass
+            update_baseline_overlay()
             fig.canvas.draw_idle()
-            
-            if len(baseline_points) == 2:
-                update_baseline_line()
-                print(f"\nBaseline points selected:")
-                print(f"  Point 1: t={baseline_points[0][0]:.3f} s, I={baseline_points[0][1]:.6e} A")
-                print(f"  Point 2: t={baseline_points[1][0]:.3f} s, I={baseline_points[1][1]:.6e} A")
-                print("Click 'Continue' to see baseline-corrected data, 'Redraw' to select again, or 'Discard' to skip this file.")
+            print("Mode → Line (2 clicks)")
+
+        def on_mode_curve(_event=None) -> None:
+            if mode_state["mode"] == "curve":
+                return
+            mode_state["mode"] = "curve"
+            btn_mode_line.color = "0.85"
+            btn_mode_curve.color = "#90ee90"
+            update_baseline_overlay()
+            fig.canvas.draw_idle()
+            print("Mode → Curve (click ≥3 points; polynomial fit, degree auto)")
+
+        def on_window_submit(text: str) -> None:
+            try:
+                w = int(float(text))
+            except ValueError:
+                print(f"Window must be a positive integer; got '{text}'.  Keeping {current_window['value']}.")
+                tb_window.set_val(str(current_window["value"]))
+                return
+            if w < 1:
+                print(f"Window must be ≥1; got {w}.  Keeping {current_window['value']}.")
+                tb_window.set_val(str(current_window["value"]))
+                return
+            current_window["value"] = w
+            _recompute_points_from_indices()
+            update_baseline_overlay()
+            print(f"Window updated to ±{w}; all existing points re-averaged.")
+
+        btn_mode_line.on_clicked(on_mode_line)
+        btn_mode_curve.on_clicked(on_mode_curve)
+        tb_window.on_submit(on_window_submit)
 
         def on_continue(_event) -> None:
-            if len(baseline_points) == 2:
-                state["action"] = "continue"
-                plt.close(fig)
+            n = len(baseline_indices)
+            if mode_state["mode"] == "line":
+                if n != 2:
+                    print("Line mode needs exactly 2 points.")
+                    return
             else:
-                print("Please select two points first.")
+                if n < 2:
+                    print("Curve mode needs at least 2 points (≥3 recommended).")
+                    return
+            state["action"] = "continue"
+            plt.close(fig)
 
         def on_redraw(_event) -> None:
             state["action"] = "redraw"
@@ -360,13 +494,10 @@ def select_baseline(
 
         print(
             "\nBaseline selection:\n"
-            "  • Use the toolbar zoom/pan buttons to explore the data.\n"
-            "  • When ready to select points, deselect zoom/pan tools (click the tool again to deactivate).\n"
-            "  • Then left-click on the plot to select baseline points.\n"
-            "  • Each click averages 20 surrounding points.\n"
-            "  • A red dashed line will appear connecting the two points.\n"
-            "  • Use buttons: Continue (view corrected data), Redraw (select again), "
-            "Skip baseline (use raw signal as-is), or Discard (skip this file).\n"
+            "  • Top-left: choose Line (2 clicks) or Curve (≥3 clicks; polynomial fit).\n"
+            "  • Top-centre: window-size TextBox; type a number and press Enter to update.\n"
+            "  • Click on the plot to add baseline points.\n"
+            "  • Buttons: Continue (apply baseline) | Redraw | Skip baseline | Discard.\n"
             "  • Zoom: press z to toggle zoom-rectangle mode; drag to zoom; r to reset."
         )
 
@@ -385,23 +516,45 @@ def select_baseline(
                 "Proceeding with raw signal as baseline-corrected data."
             )
             corrected_signal = signal_values.copy()
-            slope = 0.0
-            intercept = 0.0
-            return corrected_signal, (slope, intercept)
-        if action == "continue" and len(baseline_points) == 2:
-            t1, y1 = baseline_points[0]
-            t2, y2 = baseline_points[1]
-            if abs(t2 - t1) < 1e-9:
-                slope = 0.0
-                intercept = y1
-            else:
-                slope = (y2 - y1) / (t2 - t1)
-                intercept = y1 - slope * t1
-            
-            baseline_values = slope * time_values + intercept
-            corrected_signal = signal_values - baseline_values
-            
-            print(f"\nBaseline calculated: slope={slope:.6e} A/s, intercept={intercept:.6e} A")
+            baseline_meta: tuple[float, float] | dict = (0.0, 0.0)
+            break
+
+        if action == "continue":
+            if mode_state["mode"] == "line":
+                t1, y1 = baseline_points[0]
+                t2, y2 = baseline_points[1]
+                if abs(t2 - t1) < 1e-9:
+                    slope_v = 0.0
+                    intercept_v = y1
+                else:
+                    slope_v = (y2 - y1) / (t2 - t1)
+                    intercept_v = y1 - slope_v * t1
+                baseline_values = slope_v * time_values + intercept_v
+                corrected_signal = signal_values - baseline_values
+                baseline_meta = (slope_v, intercept_v)
+                print(
+                    f"\nBaseline (line): slope={slope_v:.6e} A/s, intercept={intercept_v:.6e} A"
+                )
+            else:  # curve mode
+                t_clicks = [p[0] for p in baseline_points]
+                y_clicks = [p[1] for p in baseline_points]
+                baseline_values = _fit_baseline_polynomial(
+                    t_clicks, y_clicks, time_values
+                )
+                corrected_signal = signal_values - baseline_values
+                deg_used = min(len(baseline_points) - 1, 3)
+                coeffs = np.polyfit(np.asarray(t_clicks), np.asarray(y_clicks), deg=deg_used)
+                baseline_meta = {
+                    "mode": "curve",
+                    "degree": int(deg_used),
+                    "coeffs": coeffs.tolist(),
+                    "click_points": [(float(t), float(y)) for t, y in baseline_points],
+                    "window": current_window["value"],
+                }
+                print(
+                    f"\nBaseline (curve, deg {deg_used}): fit through "
+                    f"{len(baseline_points)} click(s)"
+                )
             print("Baseline correction applied (drift removed).")
             break
     
@@ -470,7 +623,7 @@ def select_baseline(
             return "redraw"
         if confirm_action == "accept":
             print(f"Baseline correction accepted. Proceeding with corrected data.")
-            return corrected_signal, (slope, intercept)
+            return corrected_signal, baseline_meta
         
         return None
 

@@ -264,7 +264,11 @@ def process_file(
                     return None, path, False, control_info, None
                 if baseline_result == "redraw":
                     continue
-                signal_values, (_slope, _intercept) = baseline_result
+                # baseline_result is (corrected_signal, meta) where meta is
+                # either (slope, intercept) for line mode or a dict for curve.
+                # We only need the corrected signal here; the metadata isn't
+                # persisted anywhere downstream yet.
+                signal_values, _baseline_meta = baseline_result
                 frame[current_col] = signal_values
                 break
             phase = "calibration"

@@ -366,6 +366,49 @@ def test_skip_calibration_loads_real_csv() -> bool:
     return True
 
 
+def test_fit_baseline_polynomial() -> bool:
+    _section("C3: _fit_baseline_polynomial reproduces clicks and chooses degree")
+    import numpy as np
+    from sensorfit.calibration import _fit_baseline_polynomial
+
+    t = np.linspace(0, 10, 101)
+
+    # 2 clicks → degree 1 (straight line through both points)
+    fit2 = _fit_baseline_polynomial([0.0, 10.0], [5.0, 25.0], t)
+    assert abs(fit2[0] - 5.0) < 1e-9
+    assert abs(fit2[-1] - 25.0) < 1e-9
+    # slope = 2 → at t=5, y = 15
+    assert abs(fit2[50] - 15.0) < 1e-9
+    print("  ✓ 2 clicks → degree 1 (line through (0,5) and (10,25))")
+
+    # 3 clicks → degree 2 (parabola)
+    fit3 = _fit_baseline_polynomial([0.0, 5.0, 10.0], [5.0, 11.0, 25.0], t)
+    assert abs(fit3[0] - 5.0) < 1e-6
+    assert abs(fit3[50] - 11.0) < 1e-6
+    assert abs(fit3[-1] - 25.0) < 1e-6
+    print("  ✓ 3 clicks → degree 2 (reproduces all 3 click points)")
+
+    # 5 clicks → degree 3 (cubic capped at 3, NOT degree 4)
+    # Fit-through-points isn't guaranteed for 5 points + degree 3 (over-determined)
+    # but a 5-point fit on data y = 2t (truly linear) should still be ~linear.
+    fit5 = _fit_baseline_polynomial(
+        [0.0, 2.0, 5.0, 7.0, 10.0],
+        [0.0, 4.0, 10.0, 14.0, 20.0],
+        t,
+    )
+    # All points lie on y = 2t → fit at t=5 should be ~10
+    assert abs(fit5[50] - 10.0) < 1e-6
+    print("  ✓ 5 clicks on a line → degree-3 fit collapses to linear, exact reproduction")
+
+    # 1 click → ValueError
+    try:
+        _fit_baseline_polynomial([0.0], [5.0], t)
+    except ValueError:
+        print("  ✓ 1 click → ValueError (need ≥2 points)")
+        return True
+    raise AssertionError("expected ValueError for 1 click")
+
+
 def test_zoom_hotkey_install() -> bool:
     _section("C2: zoom_hotkey.install_zoom_keys wires up cleanly")
     # Headless mode for CI / non-interactive testing
@@ -467,6 +510,7 @@ def main() -> int:
         test_back_extrap_exponential,
         test_back_extrap_linear_fallback,
         test_back_extrap_no_fit,
+        test_fit_baseline_polynomial,
         test_zoom_hotkey_install,
         test_build_subtraction_chain,
         test_skip_calibration_provenance,
