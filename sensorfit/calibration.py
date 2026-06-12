@@ -277,12 +277,21 @@ def select_baseline(
 
     # Step 1: Select baseline points
     while True:
-        fig, ax = plt.subplots(figsize=(11, 6.5))
-        plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.74)
+        fig, ax = plt.subplots(figsize=(11, 6.8))
+        try:
+            fig.canvas.manager.set_window_title(
+                "SensorFit — Baseline selection"
+                + (f": {truncate_filename(filename)}" if filename else "")
+            )
+        except Exception:
+            pass
+        # Leave room above the plot for two rows of controls without
+        # overlapping the instruction banner.
+        plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.66)
         ax.plot(time_values, signal_values, "b-", lw=1, label="Raw data")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Current (A)")
-        title = "Baseline selection: Line (2 clicks) or Curve (≥3 clicks)"
+        title = "Baseline selection — Line (2 clicks) or Curve (≥3 clicks)"
         if filename:
             display_name = truncate_filename(filename)
             title = f"{display_name}\n{title}"
@@ -290,18 +299,18 @@ def select_baseline(
         ax.legend()
         ax.grid(True, alpha=0.3)
 
+        # Compact, single-line banner so it never overlaps the mode buttons.
         add_instruction_banner(
             fig,
-            "Choose Line or Curve (top-left).  Click on the plot to add points; "
-            "each is averaged over ±window samples.  Change window via the "
-            "TextBox (top-centre, press Enter to apply).  Buttons below: "
-            "Continue, Redraw, Skip baseline, Discard.",
+            "Pick Line / Curve below; click on the plot to add points; "
+            "type a new Window then Enter.",
+            y=0.985, width=130,
         )
 
-        # Mode + window controls along the top
-        ax_mode_line = fig.add_axes([0.10, 0.85, 0.10, 0.05])
-        ax_mode_curve = fig.add_axes([0.21, 0.85, 0.10, 0.05])
-        ax_window = fig.add_axes([0.46, 0.86, 0.07, 0.04])
+        # Mode + window controls along the top, well below the banner.
+        ax_mode_line = fig.add_axes([0.10, 0.74, 0.10, 0.05])
+        ax_mode_curve = fig.add_axes([0.21, 0.74, 0.10, 0.05])
+        ax_window = fig.add_axes([0.46, 0.745, 0.07, 0.04])
         mode_state = {"mode": "line"}
 
         btn_mode_line = create_small_button(ax_mode_line, "Line", "#90ee90", "#7cd47c")
@@ -735,6 +744,13 @@ def select_points(
     averaging window on the fly (default = the ``window`` kwarg).
     """
     fig, ax = plt.subplots(figsize=(14, 7))
+    try:
+        fig.canvas.manager.set_window_title(
+            "SensorFit — Calibration points"
+            + (f": {truncate_filename(filename)}" if filename else "")
+        )
+    except Exception:
+        pass
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.95, top=0.74)
     line, = ax.plot(time_values, signal_values, lw=1)
     ax.set_xlabel("Time (s)")
@@ -865,6 +881,15 @@ def select_points(
         back_extrap_state["fit_artists"] = [line_fit, line_extrap, circle]
         back_extrap_state["extrap_value"] = float(extrap_value)
         back_extrap_state["fit_succeeded"] = True
+        # Expand the y-axis so the back-extrap circle is always visible,
+        # even when the extrapolation lands well above the original data.
+        ymin, ymax = ax.get_ylim()
+        margin = (ymax - ymin) * 0.10 if ymax > ymin else abs(extrap_value) * 0.10 or 1.0
+        new_ymin = min(ymin, extrap_value - margin)
+        new_ymax = max(ymax, extrap_value + margin)
+        if (new_ymin, new_ymax) != (ymin, ymax):
+            ax.set_ylim(new_ymin, new_ymax)
+        fig.canvas.draw_idle()
         print(
             f"  ✓ Back-extrap fit succeeded; extrapolated I at t={t_b:.3f}s = "
             f"{extrap_value:.4e} A."

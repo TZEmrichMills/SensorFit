@@ -201,6 +201,13 @@ def select_one_interval(
                  distinguish).
     """
     fig, ax = plt.subplots(figsize=(11, 6.5))
+    try:
+        fig.canvas.manager.set_window_title(
+            "SensorFit — Pick an interval"
+            + (f": {truncate_filename(filename)}" if filename else "")
+        )
+    except Exception:
+        pass
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.78)
     ax.plot(time_values, h2o2_values, color="tab:green", lw=1.2, label="Calibrated trace")
     for (s_existing, e_existing) in already_defined:
@@ -350,6 +357,10 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     ``"back"``.
     """
     fig, ax = plt.subplots(figsize=(8, 3.4))
+    try:
+        fig.canvas.manager.set_window_title("SensorFit — Subtraction choice")
+    except Exception:
+        pass
     ax.axis("off")
     ax.text(
         0.5, 0.62,
@@ -546,6 +557,13 @@ def preview_per_interval_subtraction(
     anchor = {"t0": float(sample_t[0])}
 
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(11, 7.4), sharex=True)
+    try:
+        fig.canvas.manager.set_window_title(
+            "SensorFit — Subtraction preview"
+            + (f": {truncate_filename(filename)}" if filename else "")
+        )
+    except Exception:
+        pass
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.78, hspace=0.25)
 
     ax_top.plot(sample_t, sample_y, color="tab:green", lw=1.3, label="Sample interval")
@@ -615,10 +633,14 @@ def preview_per_interval_subtraction(
     ax_reset = fig.add_axes([0.30, 0.03, 0.14, 0.06])
     ax_skip = fig.add_axes([0.46, 0.03, 0.18, 0.06])
     ax_back = fig.add_axes([0.66, 0.03, 0.14, 0.06])
-    create_small_button(ax_accept, "Accept & subtract", "#90ee90", "#7cd47c").on_clicked(on_accept)
-    create_small_button(ax_reset, "Reset anchor", "0.9", "0.8").on_clicked(on_reset)
-    create_small_button(ax_skip, "Skip subtraction", "#ffcc99", "#ffaa66").on_clicked(on_skip)
-    create_small_button(ax_back, "Back", "#ddddff", "#bbbbff").on_clicked(on_back)
+    _btn_accept_1 = create_small_button(ax_accept, "Accept & subtract", "#90ee90", "#7cd47c")
+    _btn_accept_1.on_clicked(on_accept)
+    _btn_reset_2 = create_small_button(ax_reset, "Reset anchor", "0.9", "0.8")
+    _btn_reset_2.on_clicked(on_reset)
+    _btn_skip_3 = create_small_button(ax_skip, "Skip subtraction", "#ffcc99", "#ffaa66")
+    _btn_skip_3.on_clicked(on_skip)
+    _btn_back_4 = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
+    _btn_back_4.on_clicked(on_back)
 
     redraw()
     install_zoom_keys(fig, [ax_top, ax_bot])
@@ -642,6 +664,10 @@ def preview_per_interval_subtraction(
 def _pick_model() -> str | None:
     """Small dialog to choose one of the three offered models."""
     fig, ax = plt.subplots(figsize=(8, 3.4))
+    try:
+        fig.canvas.manager.set_window_title("SensorFit — Pick a fit model")
+    except Exception:
+        pass
     ax.axis("off")
     ax.text(
         0.5, 0.62,
@@ -664,10 +690,14 @@ def _pick_model() -> str | None:
     ax_exp = fig.add_axes([0.32, 0.10, 0.22, 0.16])
     ax_ib = fig.add_axes([0.56, 0.10, 0.22, 0.16])
     ax_back = fig.add_axes([0.80, 0.10, 0.14, 0.16])
-    create_small_button(ax_lin, "Manual linear", "#90ee90", "#7cd47c").on_clicked(_set("ManualLinear"))
-    create_small_button(ax_exp, "Single exp", "#ffe680", "#ffcd55").on_clicked(_set("Exponential"))
-    create_small_button(ax_ib, "Inactivation", "#ffcc99", "#ffaa66").on_clicked(_set("IB"))
-    create_small_button(ax_back, "Back", "#ddddff", "#bbbbff").on_clicked(_set("back"))
+    btn_lin = create_small_button(ax_lin, "Manual linear", "#90ee90", "#7cd47c")
+    btn_exp = create_small_button(ax_exp, "Single exp", "#ffe680", "#ffcd55")
+    btn_ib = create_small_button(ax_ib, "Inactivation", "#ffcc99", "#ffaa66")
+    btn_back = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
+    btn_lin.on_clicked(_set("ManualLinear"))
+    btn_exp.on_clicked(_set("Exponential"))
+    btn_ib.on_clicked(_set("IB"))
+    btn_back.on_clicked(_set("back"))
 
     plt.show()
     plt.close(fig)
@@ -785,6 +815,13 @@ def prompt_one_fit(
 
     # Step 2: pick fit start + end inside the interval
     fig, ax = plt.subplots(figsize=(11, 6.5))
+    try:
+        fig.canvas.manager.set_window_title(
+            "SensorFit — Pick fit range"
+            + (f": {truncate_filename(filename)}" if filename else "")
+        )
+    except Exception:
+        pass
     plt.subplots_adjust(left=0.1, bottom=0.20, right=0.98, top=0.78)
     ax.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
     title = f"Fit #{fit_index} ({model}): click START then END of the fit range"
@@ -867,10 +904,14 @@ def prompt_one_fit(
     ax_retry = fig.add_axes([0.28, 0.04, 0.12, 0.05])
     ax_skip = fig.add_axes([0.42, 0.04, 0.16, 0.05])
     ax_back = fig.add_axes([0.60, 0.04, 0.12, 0.05])
-    create_small_button(ax_accept, "Accept fit-range", "#90ee90", "#7cd47c").on_clicked(on_accept)
-    create_small_button(ax_retry, "Retry", "0.9", "0.8").on_clicked(on_retry)
-    create_small_button(ax_skip, "Skip fit", "#ffcc99", "#ffaa66").on_clicked(on_skip)
-    create_small_button(ax_back, "Back", "#ddddff", "#bbbbff").on_clicked(on_back)
+    _btn_accept_5 = create_small_button(ax_accept, "Accept fit-range", "#90ee90", "#7cd47c")
+    _btn_accept_5.on_clicked(on_accept)
+    _btn_retry_6 = create_small_button(ax_retry, "Retry", "0.9", "0.8")
+    _btn_retry_6.on_clicked(on_retry)
+    _btn_skip_7 = create_small_button(ax_skip, "Skip fit", "#ffcc99", "#ffaa66")
+    _btn_skip_7.on_clicked(on_skip)
+    _btn_back_8 = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
+    _btn_back_8.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
     plt.show()
@@ -898,6 +939,13 @@ def _preview_fit_with_back_extrap(
     defaulting to 1.5 s).  Accept finalises; Skip drops; Back returns.
     """
     fig, ax = plt.subplots(figsize=(11, 6.6))
+    try:
+        fig.canvas.manager.set_window_title(
+            "SensorFit — Fit preview / back-extrap"
+            + (f": {truncate_filename(filename)}" if filename else "")
+        )
+    except Exception:
+        pass
     plt.subplots_adjust(left=0.1, bottom=0.22, right=0.98, top=0.78)
     ax.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
 
@@ -1016,11 +1064,16 @@ def _preview_fit_with_back_extrap(
     ax_retry = fig.add_axes([0.64, 0.08, 0.10, 0.05])
     ax_skip = fig.add_axes([0.76, 0.08, 0.10, 0.05])
     ax_back = fig.add_axes([0.88, 0.08, 0.10, 0.05])
-    create_small_button(ax_extrapolate, "Extrapolate", "#ffe680", "#ffcd55").on_clicked(on_extrapolate)
-    create_small_button(ax_accept, "Accept fit", "#90ee90", "#7cd47c").on_clicked(on_accept)
-    create_small_button(ax_retry, "Retry", "0.9", "0.8").on_clicked(on_retry)
-    create_small_button(ax_skip, "Skip", "#ffcc99", "#ffaa66").on_clicked(on_skip)
-    create_small_button(ax_back, "Back", "#ddddff", "#bbbbff").on_clicked(on_back)
+    _btn_extrapolate_9 = create_small_button(ax_extrapolate, "Extrapolate", "#ffe680", "#ffcd55")
+    _btn_extrapolate_9.on_clicked(on_extrapolate)
+    _btn_accept_10 = create_small_button(ax_accept, "Accept fit", "#90ee90", "#7cd47c")
+    _btn_accept_10.on_clicked(on_accept)
+    _btn_retry_11 = create_small_button(ax_retry, "Retry", "0.9", "0.8")
+    _btn_retry_11.on_clicked(on_retry)
+    _btn_skip_12 = create_small_button(ax_skip, "Skip", "#ffcc99", "#ffaa66")
+    _btn_skip_12.on_clicked(on_skip)
+    _btn_back_13 = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
+    _btn_back_13.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
     plt.show()
@@ -1065,6 +1118,13 @@ def prompt_delta_max(
         default_mode = "from-fit"
 
     fig, ax = plt.subplots(figsize=(11, 6.8))
+    try:
+        fig.canvas.manager.set_window_title(
+            "SensorFit — Δ[H₂O₂]max"
+            + (f": {truncate_filename(filename)}" if filename else "")
+        )
+    except Exception:
+        pass
     plt.subplots_adjust(left=0.1, bottom=0.22, right=0.98, top=0.74)
     ax.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
     if fits:
@@ -1266,10 +1326,14 @@ def prompt_delta_max(
     ax_retry = fig.add_axes([0.30, 0.04, 0.12, 0.05])
     ax_skip = fig.add_axes([0.44, 0.04, 0.16, 0.05])
     ax_back = fig.add_axes([0.62, 0.04, 0.12, 0.05])
-    create_small_button(ax_accept, "Accept Δmax", "#90ee90", "#7cd47c").on_clicked(on_accept)
-    create_small_button(ax_retry, "Retry", "0.9", "0.8").on_clicked(on_retry)
-    create_small_button(ax_skip, "Skip Δmax", "#ffcc99", "#ffaa66").on_clicked(on_skip)
-    create_small_button(ax_back, "Back", "#ddddff", "#bbbbff").on_clicked(on_back)
+    _btn_accept_14 = create_small_button(ax_accept, "Accept Δmax", "#90ee90", "#7cd47c")
+    _btn_accept_14.on_clicked(on_accept)
+    _btn_retry_15 = create_small_button(ax_retry, "Retry", "0.9", "0.8")
+    _btn_retry_15.on_clicked(on_retry)
+    _btn_skip_16 = create_small_button(ax_skip, "Skip Δmax", "#ffcc99", "#ffaa66")
+    _btn_skip_16.on_clicked(on_skip)
+    _btn_back_17 = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
+    _btn_back_17.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
     plt.show()
@@ -1493,6 +1557,10 @@ def run_per_interval_flow(
 def _ask_another(question: str) -> bool:
     """Small yes/no popup; returns True if user clicks Yes."""
     fig, ax = plt.subplots(figsize=(7, 2.5))
+    try:
+        fig.canvas.manager.set_window_title("SensorFit — Continue?")
+    except Exception:
+        pass
     ax.axis("off")
     ax.text(0.5, 0.55, question, ha="center", va="center", fontsize=11)
     state = {"choice": False}
@@ -1507,8 +1575,10 @@ def _ask_another(question: str) -> bool:
 
     ax_yes = fig.add_axes([0.22, 0.10, 0.22, 0.18])
     ax_no = fig.add_axes([0.56, 0.10, 0.22, 0.18])
-    create_small_button(ax_yes, "Yes", "#90ee90", "#7cd47c").on_clicked(_yes)
-    create_small_button(ax_no, "No", "0.9", "0.8").on_clicked(_no)
+    _btn_yes_18 = create_small_button(ax_yes, "Yes", "#90ee90", "#7cd47c")
+    _btn_yes_18.on_clicked(_yes)
+    _btn_no_19 = create_small_button(ax_no, "No", "0.9", "0.8")
+    _btn_no_19.on_clicked(_no)
     plt.show()
     plt.close(fig)
     return state["choice"]
