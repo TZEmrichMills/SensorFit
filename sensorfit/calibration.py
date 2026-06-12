@@ -271,6 +271,10 @@ def select_baseline(
     None if dataset is discarded
     "redraw" if user wants to retry baseline selection
     """
+    # Mutable container for the window size so closures inside the while-loop
+    # can update it via the TextBox.  Persists across Redraws.
+    current_window = {"value": int(window)}
+
     # Step 1: Select baseline points
     while True:
         fig, ax = plt.subplots(figsize=(11, 6.5))
