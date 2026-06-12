@@ -1477,6 +1477,9 @@ def append_fit_summary(
     variant: str = "original",
     correction_meta: dict | None = None,
     calibration_skipped: bool | None = None,
+    fit_number: int = 0,
+    fit_record: object | None = None,
+    delta_max_record: object | None = None,
 ) -> None:
     """
     Append fit parameters to summary Excel file (creates if doesn't exist).
@@ -1500,16 +1503,52 @@ def append_fit_summary(
     import numpy as np
     from datetime import datetime
     
-    # Prepare row data
+    # Prepare row data.  Hierarchy is (source_file, interval_index,
+    # fit_number, variant): fit_number = 0 means "interval-only" (no fit
+    # data attached), fit_number = 1, 2, … is the per-fit row.
     row_data = {
         "source_file": source_file,
         "interval_index": interval_index,
+        "fit_number": int(fit_number),
         "variant": variant,
         "start_time_s": start_time,
         "end_time_s": end_time,
         "duration_s": end_time - start_time,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+    # New per-fit columns (when fit_record is supplied from the
+    # interval_processor flow).  These coexist with the legacy
+    # fit_results dict-style columns below.
+    if fit_record is not None:
+        row_data["fit_model"] = str(getattr(fit_record, "model", ""))
+        row_data["fit_start_s"] = float(getattr(fit_record, "fit_start_s", float("nan")))
+        row_data["fit_end_s"] = float(getattr(fit_record, "fit_end_s", float("nan")))
+        row_data["fit_init_rate_uM_per_s"] = float(getattr(fit_record, "init_rate_uM_per_s", float("nan")))
+        row_data["fit_init_rate_at_t_s"] = float(getattr(fit_record, "init_rate_at_t_s", float("nan")))
+        row_data["fit_r2"] = float(getattr(fit_record, "r2", float("nan")))
+        row_data["fit_rss"] = float(getattr(fit_record, "rss", float("nan")))
+        # Per-fit back-extrap columns
+        if getattr(fit_record, "back_extrap_applied", False):
+            row_data["fit_back_extrap_applied"] = True
+            row_data["fit_back_extrap_deadtime_s"] = float(fit_record.back_extrap_deadtime_s or float("nan"))
+            row_data["fit_back_extrap_t0_s"] = float(fit_record.back_extrap_t0_s or float("nan"))
+            row_data["fit_back_extrap_rate_uM_per_s"] = float(fit_record.back_extrap_rate_uM_per_s or float("nan"))
+        # Flatten params (e.g. fit_param_a, fit_param_b, ...)
+        names = list(getattr(fit_record, "param_names", []) or [])
+        params = list(getattr(fit_record, "params", []) or [])
+        for n, v in zip(names, params):
+            row_data[f"fit_param_{n}"] = float(v)
+
+    # Δmax (one per interval; written on each fit row for ease of analysis).
+    if delta_max_record is not None:
+        row_data["delta_max_method"] = str(getattr(delta_max_record, "method", ""))
+        row_data["delta_max_t_zero_s"] = float(getattr(delta_max_record, "t_zero_s", float("nan")))
+        row_data["delta_max_uM"] = float(getattr(delta_max_record, "value_uM", float("nan")))
+        if getattr(delta_max_record, "linear_slope", None) is not None:
+            row_data["delta_max_linear_slope"] = float(delta_max_record.linear_slope)
+        if getattr(delta_max_record, "linear_intercept", None) is not None:
+            row_data["delta_max_linear_intercept"] = float(delta_max_record.linear_intercept)
 
     # Control-subtraction provenance
     if control_subtracted is not None:
@@ -1624,17 +1663,18 @@ def append_fit_summary(
         df = pd.DataFrame()
 
     # Idempotent upsert: if a row for the same
-    # (source_file, interval_index, variant) already exists, drop it so the
-    # new row replaces it cleanly when a user redoes a file.  Variant lets
-    # us record an "original" (pre-subtraction) row AND a "corrected"
-    # (post-subtraction) row for the same interval without colliding.
+    # (source_file, interval_index, fit_number, variant) already exists,
+    # drop it so the new row replaces it cleanly when a user redoes a file.
+    # fit_number = 0 is the interval-only row; > 0 is per-fit.
     if not df.empty and "source_file" in df.columns and "interval_index" in df.columns:
-        # Default variant on legacy rows = "original"
         if "variant" not in df.columns:
             df["variant"] = "original"
+        if "fit_number" not in df.columns:
+            df["fit_number"] = 0
         same_key = (
             (df["source_file"] == source_file)
             & (df["interval_index"] == interval_index)
+            & (df["fit_number"].fillna(0).astype(int) == int(fit_number))
             & (df["variant"].fillna("original") == variant)
         )
         if same_key.any():
@@ -1646,8 +1686,30 @@ def append_fit_summary(
     
     # Reorder columns to put important columns first (best_model, initial_rate, turnover)
     # Get the desired order: basic info, then best_model columns, then model-specific columns
-    basic_cols = ["source_file", "interval_index", "variant", "start_time_s", "end_time_s", "duration_s", "timestamp"]
+    basic_cols = [
+        "source_file", "interval_index", "fit_number", "variant",
+        "start_time_s", "end_time_s", "duration_s", "timestamp",
+    ]
     important_cols = [
+        # Per-fit columns (new, from interval_processor)
+        "fit_model",
+        "fit_start_s",
+        "fit_end_s",
+        "fit_init_rate_uM_per_s",
+        "fit_init_rate_at_t_s",
+        "fit_back_extrap_applied",
+        "fit_back_extrap_deadtime_s",
+        "fit_back_extrap_t0_s",
+        "fit_back_extrap_rate_uM_per_s",
+        "fit_r2",
+        "fit_rss",
+        # Δmax columns (one per interval; denormalised onto each fit row)
+        "delta_max_method",
+        "delta_max_t_zero_s",
+        "delta_max_uM",
+        "delta_max_linear_slope",
+        "delta_max_linear_intercept",
+        # Legacy best-fit columns (still emitted when fit_results is supplied)
         "best_model",
         "best_model_initial_rate_uM_per_s",
         "turnover_before_inactivation_uM",

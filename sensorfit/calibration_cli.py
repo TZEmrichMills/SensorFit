@@ -244,6 +244,9 @@ def process_file(
     turnover_results: dict[int, float | None] = {}
     control_subtracted = False
     control_info: dict | None = None
+    # When the new per-interval flow runs we keep the full ProcessedInterval
+    # list around so the save phase can emit one fit_summary row per fit.
+    processed_intervals: list = []
 
     # In skip-calibration mode the baseline and calibration phases are bypassed
     # entirely.  The CALIBRATED_COLUMN is populated directly from the input
@@ -399,7 +402,7 @@ def process_file(
                 calibrated_dir_for_flow = (
                     calibrated_dir if calibrated_dir is not None else output_dir / "Calibrated"
                 )
-                processed_intervals = run_per_interval_flow(
+                _pi = run_per_interval_flow(
                     time_values=time_values,
                     h2o2_values=frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
                     time_col=time_col,
@@ -407,14 +410,19 @@ def process_file(
                     filename=path.name,
                     calibrated_dir=calibrated_dir_for_flow,
                 )
-                if processed_intervals == "go_back_to_calibration":
+                if isinstance(_pi, list):
+                    processed_intervals = _pi
+                processed_intervals_result = _pi
+                # alias for legacy logic below
+                processed_intervals_local = _pi
+                if processed_intervals_result == "go_back_to_calibration":
                     if skip_calibration:
                         print("\nNothing to go back to in skip-calibration mode; reopening intervals.")
                         continue
                     print("\nReturning to calibration point selection...")
                     phase = "calibration"
                     continue
-                if not processed_intervals:
+                if not processed_intervals_local:
                     print("No intervals saved.")
                     calibrated_dir_local = output_dir / "Calibrated"
                     calibrated_dir_local.mkdir(parents=True, exist_ok=True)
@@ -429,7 +437,7 @@ def process_file(
                 subsets = []
                 all_fit_results = {}
                 turnover_results = {}
-                for pi in processed_intervals:
+                for pi in processed_intervals_local:
                     subsets.append(IntervalSubset(
                         index=pi.index,
                         start_time=pi.start_time,
@@ -455,7 +463,7 @@ def process_file(
                         turnover_results[pi.index] = None
 
                 if control_role == "sample" and control_group is not None:
-                    if any(pi.control_subtracted for pi in processed_intervals):
+                    if any(pi.control_subtracted for pi in processed_intervals_local):
                         control_subtracted = True
 
                 # Skip the old fitting + turnover phases — already done.
@@ -650,6 +658,9 @@ def process_file(
     interval_dir = calibrated_dir / f"{path.stem}_intervals"
     has_fits = len(all_fit_results) > 0
 
+    # Build a quick map: pi_by_index → ProcessedInterval (for per-fit rows)
+    pi_by_index = {pi.index: pi for pi in processed_intervals}
+
     print(f"\nSaving interval data and fits...")
     for subset in subsets:
         interval_fits = all_fit_results.get(subset.index, None)
@@ -658,14 +669,13 @@ def process_file(
             subset, time_col, CALIBRATED_COLUMN, interval_fits, interval_dir
         )
         print(f"  Saved: {excel_path.name}")
-        append_fit_summary(
+
+        common_kwargs = dict(
             summary_path=summary_path,
             source_file=path.name,
             interval_index=subset.index,
             start_time=subset.start_time,
             end_time=subset.end_time,
-            fit_results=interval_fits,
-            turnover_uM=turnover_uM,
             control_subtracted=(
                 control_subtracted if control_role == "sample" else None
             ),
@@ -676,6 +686,31 @@ def process_file(
             ),
             calibration_skipped=True if skip_calibration else None,
         )
+
+        pi = pi_by_index.get(subset.index)
+        if pi is not None and pi.fits:
+            # New flow: one row per fit (fit_number = 1, 2, …), each
+            # carrying the FitRecord columns + the (denormalised) Δmax.
+            for fnum, frec in enumerate(pi.fits, start=1):
+                append_fit_summary(
+                    fit_results=interval_fits if fnum == 1 else None,
+                    turnover_uM=turnover_uM,
+                    fit_number=fnum,
+                    fit_record=frec,
+                    delta_max_record=pi.delta_max,
+                    **common_kwargs,
+                )
+        else:
+            # No fits applied OR legacy / control path: one row with
+            # fit_number = 0 carrying interval-level + Δmax info only.
+            append_fit_summary(
+                fit_results=interval_fits,
+                turnover_uM=turnover_uM,
+                fit_number=0,
+                fit_record=None,
+                delta_max_record=(pi.delta_max if pi is not None else None),
+                **common_kwargs,
+            )
 
     persist_interval_subsets(subsets, interval_dir)
 

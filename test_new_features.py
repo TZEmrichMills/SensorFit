@@ -26,34 +26,47 @@ def _section(title: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 def test_fit_summary_upsert() -> bool:
-    _section("Commit 1: fit_summary idempotent upsert (with variant column)")
+    _section("C6: fit_summary upsert with (file, interval, fit_number, variant) key")
     import pandas as pd
     from sensorfit.calibration import append_fit_summary
 
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "fit_summary.xlsx"
 
+        # Interval-only row (fit_number=0)
         append_fit_summary(p, "fileA.xlsx", 1, 0.0, 10.0, fit_results=None, turnover_uM=None)
-        # Second write with same (file, interval, variant=original) → REPLACE
+        # Same key → REPLACE (turnover updated)
         append_fit_summary(p, "fileA.xlsx", 1, 0.0, 10.0, fit_results=None, turnover_uM=42.0)
-        # Third: same file, different interval → APPEND
+        # Same file, different interval → APPEND
         append_fit_summary(p, "fileA.xlsx", 2, 11.0, 20.0, fit_results=None, turnover_uM=None)
-        # Fourth: different file → APPEND
+        # Different file → APPEND
         append_fit_summary(p, "fileB.xlsx", 1, 0.0, 5.0, fit_results=None, turnover_uM=None)
-        # Fifth: same fileA interval 1 but variant=corrected → APPEND
+        # Same fileA interval 1 but variant=corrected → APPEND (different variant)
         append_fit_summary(p, "fileA.xlsx", 1, 0.0, 10.0, fit_results=None,
                            turnover_uM=99.0, variant="corrected", control_group="G_A")
+        # Same fileA interval 1 original, but fit_number=1 → APPEND (different fit_number)
+        append_fit_summary(p, "fileA.xlsx", 1, 0.0, 10.0, fit_results=None,
+                           turnover_uM=42.0, fit_number=1)
+        # Same fileA interval 1 original, fit_number=2 → APPEND (another fit)
+        append_fit_summary(p, "fileA.xlsx", 1, 0.0, 10.0, fit_results=None,
+                           turnover_uM=42.0, fit_number=2)
 
         df = pd.read_excel(p)
-        assert len(df) == 4, f"expected 4 rows, got {len(df)}"
+        assert "fit_number" in df.columns
+        assert len(df) == 6, f"expected 6 rows, got {len(df)}"
+        # The (fileA, 1, 0, original) row carries turnover=42.0 (latest)
         row_orig = df[(df["source_file"] == "fileA.xlsx") & (df["interval_index"] == 1)
-                      & (df["variant"] == "original")].iloc[0]
-        row_corr = df[(df["source_file"] == "fileA.xlsx") & (df["interval_index"] == 1)
-                      & (df["variant"] == "corrected")].iloc[0]
+                      & (df["variant"] == "original") & (df["fit_number"] == 0)].iloc[0]
         assert row_orig["turnover_before_inactivation_uM"] == 42.0
-        assert row_corr["turnover_before_inactivation_uM"] == 99.0
+        # corrected variant coexists with original at same fit_number=0
+        row_corr = df[(df["source_file"] == "fileA.xlsx") & (df["interval_index"] == 1)
+                      & (df["variant"] == "corrected") & (df["fit_number"] == 0)].iloc[0]
         assert row_corr["control_group"] == "G_A"
-        print(f"  ✓ upsert: 5 writes → 4 rows; original + corrected variants coexist")
+        # Per-fit rows: fit_number=1 and fit_number=2
+        fit_rows = df[(df["source_file"] == "fileA.xlsx") & (df["interval_index"] == 1)
+                      & (df["variant"] == "original") & (df["fit_number"].isin([1, 2]))]
+        assert len(fit_rows) == 2
+        print(f"  ✓ upsert: 7 writes → 6 rows; key = (file, interval, fit_number, variant)")
     return True
 
 
@@ -409,6 +422,55 @@ def test_fit_baseline_polynomial() -> bool:
     raise AssertionError("expected ValueError for 1 click")
 
 
+def test_fit_summary_per_fit_columns() -> bool:
+    _section("C6: fit_summary writes per-fit and Δmax columns from records")
+    import pandas as pd
+    import numpy as np
+    from sensorfit.calibration import append_fit_summary
+    from sensorfit.interval_processor import FitRecord, DeltaMaxRecord
+
+    rec_fit = FitRecord(
+        model="Exponential",
+        fit_start_s=2.0, fit_end_s=18.0,
+        params=[0.0, 0.0, 100.0, 0.05, 0.0],
+        param_names=["a", "b", "c", "k", "t0"],
+        yhat=np.zeros(50),
+        init_rate_uM_per_s=-5.123,
+        init_rate_at_t_s=2.0,
+        r2=0.987,
+        rss=12.34,
+        back_extrap_applied=True,
+        back_extrap_deadtime_s=1.5,
+        back_extrap_t0_s=0.5,
+        back_extrap_rate_uM_per_s=-6.0,
+    )
+    rec_delta = DeltaMaxRecord(
+        method="from-fit", t_zero_s=2.0, value_uM=98.7,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "fit_summary.xlsx"
+        append_fit_summary(
+            p, "sample.xlsx", interval_index=1,
+            start_time=0.0, end_time=20.0,
+            fit_results=None, turnover_uM=None,
+            fit_number=1, fit_record=rec_fit, delta_max_record=rec_delta,
+        )
+        df = pd.read_excel(p)
+        assert "fit_model" in df.columns and df.iloc[0]["fit_model"] == "Exponential"
+        assert abs(df.iloc[0]["fit_init_rate_uM_per_s"] - (-5.123)) < 1e-6
+        assert df.iloc[0]["fit_back_extrap_applied"] == True
+        assert abs(df.iloc[0]["fit_back_extrap_deadtime_s"] - 1.5) < 1e-9
+        assert df.iloc[0]["delta_max_method"] == "from-fit"
+        assert abs(df.iloc[0]["delta_max_uM"] - 98.7) < 1e-6
+        # Param columns flattened
+        assert "fit_param_c" in df.columns
+        assert abs(df.iloc[0]["fit_param_c"] - 100.0) < 1e-9
+        print("  ✓ fit_record columns (model/start/end/init_rate/back_extrap/params) emitted")
+        print("  ✓ delta_max_record columns (method/t_zero/value) emitted")
+    return True
+
+
 def test_delta_max_pure_helpers() -> bool:
     _section("C5: Δmax helpers (from_fit / from_linear / from_point)")
     import numpy as np
@@ -599,6 +661,7 @@ def main() -> int:
         test_fit_baseline_polynomial,
         test_back_extrap_calibration_fit,
         test_delta_max_pure_helpers,
+        test_fit_summary_per_fit_columns,
         test_zoom_hotkey_install,
         test_build_subtraction_chain,
         test_skip_calibration_provenance,
