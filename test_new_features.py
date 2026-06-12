@@ -409,6 +409,60 @@ def test_fit_baseline_polynomial() -> bool:
     raise AssertionError("expected ValueError for 1 click")
 
 
+def test_delta_max_pure_helpers() -> bool:
+    _section("C5: Δmax helpers (from_fit / from_linear / from_point)")
+    import numpy as np
+    from sensorfit.interval_processor import (
+        FitRecord, delta_max_from_fit, delta_max_from_linear, delta_max_from_point,
+    )
+
+    # ── from_fit on an Exponential ────────────────────────────────────
+    # y(t) = a*t + b + c*exp(-k*(t-t0))
+    # Asymptote = a*t + b; Δ at t_zero = c*exp(-k*(t_zero - t0))
+    # With a=0, b=0, c=100, k=0.05, t0=0 → y(t) = 100*exp(-0.05*t)
+    # Δ at t_zero=0 = c*exp(0) = 100; at t_zero=10 = 100*exp(-0.5) ≈ 60.65
+    rec_exp = FitRecord(
+        model="Exponential",
+        fit_start_s=0.0, fit_end_s=30.0,
+        params=[0.0, 0.0, 100.0, 0.05, 0.0],
+        param_names=["a", "b", "c", "k", "t0"],
+        yhat=np.zeros(10), init_rate_uM_per_s=0.0, init_rate_at_t_s=0.0,
+    )
+    assert abs(delta_max_from_fit(rec_exp, 0.0) - 100.0) < 1e-6
+    assert abs(delta_max_from_fit(rec_exp, 10.0) - 60.6531) < 1e-3
+    print("  ✓ from_fit (Exponential) recovers c*exp(-k*Δt)")
+
+    # ── from_linear ──────────────────────────────────────────────────
+    # y = 100 - 2*t on [0, 50] (one-sample-per-second).
+    # Line through indices 5..15 (t=5..15) → slope=-2, intercept=100.
+    # At t_zero=0 → line value = 100; y_end (t=50) = 0; Δmax = 100 - 0 = 100.
+    t_arr = np.linspace(0, 50, 51)
+    y_arr = 100.0 - 2.0 * t_arr
+    delta, slope, intercept = delta_max_from_linear(t_arr, y_arr, 5, 15, t_zero=0.0)
+    assert abs(slope - (-2.0)) < 1e-6
+    assert abs(intercept - 100.0) < 1e-6
+    assert abs(delta - 100.0) < 1e-6
+    print("  ✓ from_linear (y=100-2t) → Δmax at t_zero=0 = 100")
+
+    # ── from_point ───────────────────────────────────────────────────
+    # Δmax = y(t_zero) - y_end.  Simple subtraction.
+    assert abs(delta_max_from_point(100.0, 0.0) - 100.0) < 1e-12
+    assert abs(delta_max_from_point(50.0, 10.0) - 40.0) < 1e-12
+    print("  ✓ from_point trivially subtracts y_end from y_at_tzero")
+
+    # ── from_fit returns NaN for ManualLinear ────────────────────────
+    rec_lin = FitRecord(
+        model="ManualLinear",
+        fit_start_s=0.0, fit_end_s=10.0,
+        params=[-2.0, 100.0], param_names=["slope", "intercept"],
+        yhat=np.zeros(5), init_rate_uM_per_s=-2.0, init_rate_at_t_s=0.0,
+    )
+    import math
+    assert math.isnan(delta_max_from_fit(rec_lin, 0.0))
+    print("  ✓ from_fit returns NaN for ManualLinear (caller falls back to Point/Linear mode)")
+    return True
+
+
 def test_back_extrap_calibration_fit() -> bool:
     _section("C4: 4-point back-extrap calibration exponential fit")
     import matplotlib
@@ -544,6 +598,7 @@ def main() -> int:
         test_back_extrap_no_fit,
         test_fit_baseline_polynomial,
         test_back_extrap_calibration_fit,
+        test_delta_max_pure_helpers,
         test_zoom_hotkey_install,
         test_build_subtraction_chain,
         test_skip_calibration_provenance,

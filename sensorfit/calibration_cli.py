@@ -18,6 +18,7 @@ from .calibration import (
     calculate_turnover_before_inactivation,
     get_model_display_name,
     interactive_interval_fitting,
+    IntervalSubset,
     load_trace,
     persist_interval_subsets,
     review_results,
@@ -40,6 +41,10 @@ from .group_planning import (
     SampleState,
     offer_refit_for_corrected_intervals,
     run_group_planning,
+)
+from .interval_processor import (
+    ProcessedInterval,
+    run_per_interval_flow,
 )
 
 
@@ -385,6 +390,79 @@ def process_file(
         # PHASE: intervals
         # ────────────────────────────────────────────────────────
         elif phase == "intervals":
+            # New per-interval flow for SAMPLE and UNGROUPED files: interval
+            # selection, optional subtraction, fits, and Δmax all happen
+            # inside run_per_interval_flow.  Control files still use the
+            # legacy select_intervals path so they can supply a reference
+            # template to the group.
+            if control_role != "control":
+                calibrated_dir_for_flow = (
+                    calibrated_dir if calibrated_dir is not None else output_dir / "Calibrated"
+                )
+                processed_intervals = run_per_interval_flow(
+                    time_values=time_values,
+                    h2o2_values=frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
+                    time_col=time_col,
+                    full_frame=frame,
+                    filename=path.name,
+                    calibrated_dir=calibrated_dir_for_flow,
+                )
+                if processed_intervals == "go_back_to_calibration":
+                    if skip_calibration:
+                        print("\nNothing to go back to in skip-calibration mode; reopening intervals.")
+                        continue
+                    print("\nReturning to calibration point selection...")
+                    phase = "calibration"
+                    continue
+                if not processed_intervals:
+                    print("No intervals saved.")
+                    calibrated_dir_local = output_dir / "Calibrated"
+                    calibrated_dir_local.mkdir(parents=True, exist_ok=True)
+                    out_path = calibrated_dir_local / f"{path.stem}_calibrated.xlsx"
+                    frame.to_excel(out_path, index=False)
+                    return out_path, path, False, control_info, None
+
+                # Build legacy-shaped containers so the existing save phase
+                # can persist outputs.  Multi-fit per interval is collapsed
+                # to the first fit here; C6 will switch fit_summary to one
+                # row per (file, interval, fit_number) and use the full list.
+                subsets = []
+                all_fit_results = {}
+                turnover_results = {}
+                for pi in processed_intervals:
+                    subsets.append(IntervalSubset(
+                        index=pi.index,
+                        start_time=pi.start_time,
+                        end_time=pi.end_time,
+                        data=pi.data,
+                    ))
+                    if pi.fits:
+                        f0 = pi.fits[0]
+                        all_fit_results[pi.index] = {
+                            f0.model: {
+                                "model": f0.model,
+                                "params": np.array(f0.params, dtype=float),
+                                "names": f0.param_names,
+                                "yhat": f0.yhat,
+                                "r2": f0.r2,
+                                "rss": f0.rss,
+                                "init_rate": f0.init_rate_uM_per_s,
+                            },
+                        }
+                    if pi.delta_max is not None:
+                        turnover_results[pi.index] = pi.delta_max.value_uM
+                    else:
+                        turnover_results[pi.index] = None
+
+                if control_role == "sample" and control_group is not None:
+                    if any(pi.control_subtracted for pi in processed_intervals):
+                        control_subtracted = True
+
+                # Skip the old fitting + turnover phases — already done.
+                phase = "review"
+                continue
+
+            # ── legacy path for control files ────────────────────────
             intervals = select_intervals(
                 time_values,
                 frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
@@ -463,7 +541,9 @@ def process_file(
                             f"(interval #{ref.index}) → {tpl_path}"
                         )
 
-            phase = "fitting"
+            # Control files skip fitting / turnover (no fits needed) and
+            # go directly to save.
+            phase = "save"
             continue
 
         # ────────────────────────────────────────────────────────

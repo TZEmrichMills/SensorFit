@@ -30,6 +30,15 @@ from .controls import (
     select_control_reference_interval,
 )
 from .back_extrap import compute_back_extrap
+from .interval_processor import (
+    ProcessedInterval,
+    FitRecord,
+    DeltaMaxRecord,
+    run_per_interval_flow,
+    delta_max_from_fit,
+    delta_max_from_linear,
+    delta_max_from_point,
+)
 from .group_planning import (
     SampleState,
     build_subtraction_chain,
@@ -72,6 +81,14 @@ __all__ = [
     "select_control_reference_interval",
     # Back-extrapolation (math only; standalone UI removed)
     "compute_back_extrap",
+    # Per-interval processor (replaces standalone fitting + turnover phases)
+    "ProcessedInterval",
+    "FitRecord",
+    "DeltaMaxRecord",
+    "run_per_interval_flow",
+    "delta_max_from_fit",
+    "delta_max_from_linear",
+    "delta_max_from_point",
     # Group-planning exports
     "SampleState",
     "build_subtraction_chain",
