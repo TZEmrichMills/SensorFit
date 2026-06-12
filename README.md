@@ -7,7 +7,7 @@ Interactive tool for calibrating amperometric sensor traces to H₂O₂ concentr
 - [Quick Start](#quick-start)
 - [What to Expect When You Run SensorFit](#what-to-expect-when-you-run-sensorfit)
 - [Command Line Arguments](#command-line-arguments)
-- [Advanced features](#advanced-features) — control subtraction, residual activity, back-extrapolation, skip calibration, resilient summary
+- [Advanced features](#advanced-features) — control subtraction (multi-control groups), skip calibration, resilient summary
 - [Post-processing: Collecting Intervals](#post-processing-collecting-intervals)
 - [Detailed Installation Guide](#detailed-installation-guide)
 - [Troubleshooting](#troubleshooting)
@@ -63,49 +63,72 @@ sensorfit_env\Scripts\activate
 
 ## What to Expect When You Run SensorFit
 
-SensorFit processes every data file in your input directory one at a time. For each file you will step through the following interactive screens. Every screen has navigation buttons (continue, go back, redraw, discard, skip, etc.), so you can always correct mistakes or skip steps.
+SensorFit processes every data file in your input directory one at a time. For each file you will step through these screens. Every step is skippable, retryable, and has a "Back" option, so you can always correct mistakes.
 
 ### 1. Baseline Selection
 
-A plot of the raw current trace opens. You have three choices:
+Two modes via the toggle at top-left:
 
-- **Define a baseline** — click two points on the plot to draw a baseline line, then click *Continue* to preview the corrected trace. You can *Accept*, *Retry*, or *Discard* the file.
-- **Skip baseline** — if the trace already looks flat, click *Skip baseline* to proceed with the raw signal as-is.
-- **Discard this file** — skip the file entirely and move on to the next.
+- **Line (default, 2 clicks)** — straight-line baseline, same as previous versions.
+- **Curve (≥3 clicks)** — polynomial fit through your points (degree auto: 2 → 1, 3 → 2, 4+ → 3). Smooths through click-noise and extrapolates naturally to the start/end of the run — pick this when the drift is curved rather than linear.
+
+A window-size **TextBox at top-centre** lets you change the click averaging window on the fly (type a new value and press Enter; existing points are re-averaged in place).
+
+Buttons: Continue | Redraw | Skip baseline | Discard this file.
 
 ### 2. Calibration Point Selection
 
-The (baseline-corrected) current trace is shown. Click on the plateau of each calibration step (e.g. 0, 20, 40, 60, 80, 100 µM H₂O₂) to select calibration points. The number and values of calibration points can be edited via a pop-up table editor. You can go back to baseline selection from here if needed.
+Two modes via the toggle at top-left:
 
-### 3. Interval Selection
+- **Standard (default)** — pick N points across a [H₂O₂] ladder (e.g. 0, 20, 40, 60, 80, 100 µM). Linear calibration is built from your points.
+- **Back-extrap (4-pt)** — for reactions started by H₂O₂ injection where the deadtime keeps you from a clean max-current point. Pick four points in order: ① baseline / [H₂O₂]=0, ② timepoint of true max-[H₂O₂] (y-value doesn't matter), ③ start of an exponential-fit region (after deadtime), ④ end of the fit region. SensorFit fits a single exponential between ③ and ④ and back-extrapolates to the timepoint of ② — that extrapolated current becomes the calibration's max anchor (drawn as a red ring). Accept builds a 2-point linear calibration from (zero_avg, 0 µM) and (extrap_value, max_µM).
 
-A calibrated H₂O₂ concentration trace is shown. Click pairs of points to define time intervals you want to analyse (e.g. each enzyme injection). Intervals are highlighted on the plot. You can add multiple intervals, undo, or go back to calibration.
+The same window-size TextBox is available here.
 
-### 4. Curve Fitting (per interval)
+A pop-up table editor lets you edit the calibration µM values or change the number of points (Standard mode).
 
-For each interval, a fitting interface opens. You can select one or more models to fit:
+### 3. Per-interval flow
 
-- **Inactivation (IB)** — enzyme inactivation kinetics
-- **Exponential** — single exponential decay with linear background
-- **Gompertz-like (GFI)** — Gompertz-gated inactivation with a fast phase
-- **Linear Initial Rate** — straight-line fit to a user-selected region (auto or manual)
+This is the heart of SensorFit. Instead of picking all intervals up-front then fitting them all, each interval flows through subtraction → fits → Δmax before you move on:
 
-Fitted curves and residuals are overlaid on the data. Model statistics (R², AIC) are reported. You can go back, discard, or continue to the next step.
+For each interval (repeat until you click **Done with intervals**):
 
-### 5. Maximum H₂O₂ Turnover Before Inactivation (per interval)
+1. **Pick the interval** — click START then END. Existing intervals are shown faintly in grey.
+2. **Optional control subtraction** — small dialog with four choices:
+   - **None** — use the interval as-is.
+   - **Subtract existing** — pick any control interval already in this session OR saved in `Calibrated/*_intervals/interval_*.xlsx` from a prior session.
+   - **Subtract new alongside** — a Qt file dialog opens; pick a control file; a modal mini-flow runs baseline → calibration → interval-selection on that file (no fitting), saves it as if processed independently, then returns you to a preview where you can re-anchor the control's t = 0 by clicking the upper plot.
+   - **Back** — return to the interval picker.
+3. **Optional fit(s) — multi-fit supported.** For each fit:
+   1. **Pick a model**: Manual linear / Single exponential / Inactivation (IB).
+   2. **Click fit start + fit end** inside the interval (these can be inside the interval; they don't have to use its whole range).
+   3. **Preview** shows the fit + the **initial rate at your chosen start point**.
+   4. **Optional back-extrapolation**: type a deadtime (default 1.5 s) in the TextBox, click **Extrapolate**; you see a red dashed line back to a red circle at the new, earlier t = 0, and the new initial rate at that point. Accept records both the fit and the back-extrap onto the same row.
+   5. **"Another fit on this interval?"** — Yes loops back to model-pick; No goes to Δmax.
+4. **Optional Δ[H₂O₂]max** (one per interval). Three modes via top-of-window buttons:
+   - **From fit** — uses the last fit; Δmax at your chosen t=0 is the height of the y-axis intercept of the asymptote (analytically: `c·exp(-k·(t_zero−t0))` for Exponential; `H0·exp(-α(1-exp(-k·t_zero)))` for IB).
+   - **Linear** — click t = 0, then two more points to define a straight line; Δmax = line's y at t = 0 minus y at end of run.
+   - **Point** — click ONE point; Δmax = its y-value minus y at end of run.
 
-For each interval, you can calculate the maximum amount of H₂O₂ consumed (or produced) before the enzyme became fully inactivated. Two methods are available:
+   For all three modes, you click your **t = 0 anchor first**. This dynamic anchor lets you play with the "effective start" of the interval; the recorded value will reflect that choice. Accept records it.
+5. **"Another interval?"** — Yes loops back to step 1; No → review.
 
-- **Automatic** — fits a straight line to the tail of the best fitted model and extrapolates back to the interval start.
-- **Manual** — click two points to define the tail region yourself.
+### 4. Review and Save
 
-The turnover value is displayed on the plot and recorded in the summary.
+A short text summary of every accepted interval and fit. Accept saves outputs; Discard skips the file.
 
-### 6. Next File
+### 5. Next file
 
-Results (calibrated data, interval Excel files, fit parameters) are saved under a `Calibrated/` folder. The original file is moved to a `Processed/` folder. A running `fit_summary.xlsx` is updated with all fit results across files **inside `Calibrated/`** (it used to live at the root of the input directory; see the [Advanced features](#advanced-features) section for the resilience fix). SensorFit then opens the next file and repeats from step 1.
+Results — the calibrated trace, per-interval Excel files (one for each interval), and a `fit_summary.xlsx` row per fit — are saved under `Calibrated/`. The original file is moved to `Processed/`. SensorFit then opens the next file.
 
-If a session is interrupted (Ctrl-C, crash, lost power), just re-run the same command — SensorFit detects the existing `Calibrated/fit_summary.xlsx` and resumes appending to it. Files already in `Processed/` are skipped automatically.
+`fit_summary.xlsx` rows are keyed on `(source_file, interval_index, fit_number, variant)`. `fit_number = 0` is the "interval only" row (no fit applied); `fit_number = 1, 2, …` is one row per fit. Each fit row carries its own initial rate, fit-range, back-extrap (if accepted), and the interval's Δmax — so a single row is a complete record of one fit.
+
+If a session is interrupted, re-run the same command — SensorFit resumes from `Calibrated/fit_summary.xlsx` and skips files already in `Processed/`.
+
+### Zoom shortcuts (every interactive screen)
+
+- Press `z` to enter zoom mode (cursor changes to crosshair); next click-drag zooms into that rectangle. Press `z` again to leave.
+- Press `r` to reset the view to the full data extent.
 
 ---
 
@@ -131,19 +154,26 @@ If a session is interrupted (Ctrl-C, crash, lost power), just re-run the same co
 
 These features are all **opt-in** — if you don't use them, SensorFit behaves exactly as before. Each feature adds extra columns to `fit_summary.xlsx` only when used.
 
-### Control subtraction (multi-control groups, group-as-unit flow)
+### Control subtraction
 
-Many experimental designs involve measuring one or more **control runs** (no-enzyme, no-substrate, buffer-only, etc.) and subtracting them from related sample runs. SensorFit groups controls with samples and handles subtraction at the **interval level**, after all files in the group have been calibrated and intervals delineated.
+Control subtraction now lives **inside the per-interval flow** (see "What to Expect" above) — when you define an interval you immediately get a dialog asking whether to subtract a control. Two routes:
 
-**Run:**
+- **Subtract existing** — pick any interval already in this session OR saved on disk in `Calibrated/*_intervals/`. Useful for re-using a previously-processed control without re-running it.
+- **Subtract new alongside** — a Qt file dialog opens; pick a control file; SensorFit runs a modal mini-flow (baseline → calibration → interval-selection only) on that file, saves it under `Calibrated/` as if processed independently, and then drops you into a preview where you can re-anchor the control's t = 0 by clicking the upper plot.
+
+The original (un-subtracted) interval is still saved alongside the corrected one in the same `_intervals/` folder, so you have both for comparison.
+
+`fit_summary.xlsx` rows for control-subtracted intervals carry:
+- `control_subtracted = True`
+- `control_group` (or the source filename for the new-alongside flow)
+
+**Optional `--control-mode` for upfront grouping.** If you'd rather declare your controls and samples upfront (instead of picking them per-interval as you go), pass `--control-mode`:
 
 ```bash
 python -m sensorfit.calibration_cli --input-dir /path/to/folder --num-points 6 --calibration-values "0,20,40,60,80,100" --control-mode --force
 ```
 
-**Grouping window (session start).**
-
-A Qt window opens listing every unprocessed file. Each *group* is built as a tree:
+A Qt window opens letting you build groups with multiple controls per group:
 
 ```
 Group_A
@@ -157,62 +187,9 @@ Group_A
     └── treatment_2.xlsx
 ```
 
-- Controls inside the **same sub-group** are **averaged** before subtraction.
-- Different sub-groups are **subtracted sequentially** (top → bottom).
-- For each sample interval the user later chooses to correct, the effective subtraction is:
-  `sample(t) − mean(Sub-group 1)(t) − mean(Sub-group 2)(t) − …`
+Files inside the same sub-group are averaged before subtraction; different sub-groups subtract sequentially (top → bottom). Controls are processed first; once their reference intervals are saved, samples can subtract them through the per-interval picker above (the saved control intervals show up in the **Subtract existing** list).
 
-Buttons: **New group**, **New sub-group in selected group**, **Add selected files → sub-group (controls)**, **Add selected files → samples**, **↑ / ↓ Move sub-group up/down**, **Remove selected**, **Done**. The grouping is saved to `Calibrated/controls.json` so an interrupted session can resume.
-
-Files left ungrouped are processed normally, with no subtraction step.
-
-**Group-as-unit processing.** Each group is fully processed end-to-end before the next group begins:
-
-1. **Controls** in the group are processed first, one by one, through the normal baseline → calibration → intervals → fits → turnover flow. After interval selection on each control, you pick which interval is the **subtraction reference**; that interval is saved as a CSV in `Calibrated/_control_templates/`.
-2. **Samples** in the group are processed next, also through the full pipeline. Their state (calibrated frame, intervals, fits, turnover) is kept in memory for the next step.
-3. **Subtraction planning UI** opens once all samples are done: a check-list of every sample interval. Tick the ones you want corrected. Defaults to all-unticked so calibration ladders / blank phases are left alone — you opt in per interval.
-4. **Preview & subtract.** For each ticked interval, a preview screen shows the sample (green), each sub-group's averaged contribution (orange dashed), their combined sum (red), the anchor as a **purple dashed vertical line**, and the corrected result below in blue. Click on the upper plot to **re-anchor** the controls' t = 0. **Accept & subtract**, **Skip this interval**, or **Back**.
-5. **Optional re-fit.** After subtraction, for each sample with corrected intervals you're asked **"Re-fit corrected intervals?"** Yes runs the existing fitting + turnover GUIs on the subtracted data; No keeps the pre-subtraction fits.
-
-**Outputs.** Each corrected interval is saved alongside the original as `interval_NN_corrected.xlsx` in the sample's `_intervals/` folder. `fit_summary.xlsx` carries **two rows per corrected interval** distinguished by a new `variant` column:
-- `variant = "original"` — pre-subtraction fit results (always written).
-- `variant = "corrected"` — post-subtraction fit results, with `control_subtracted = True`, `control_group = <name>`, `correction_n_subgroups`, `correction_anchor_t0_s`, and `correction_chain` (a human-readable summary of which controls were applied).
-
-You can filter / pivot by `variant` in Excel to compare before vs. after subtraction directly.
-
-**Legacy single-control groups** (one sub-group with exactly one control file — what PR #1 supported) still work via the original inline `control_subtract` phase during sample processing, with the same UX as before.
-
-### Multi-addition residual activity
-
-If a single run contained **multiple successive H₂O₂ additions** (addition 1 → consume → addition 2 → consume → …), each addition typically becomes its own interval. The ratio of the second interval's initial rate to the first interval's initial rate gives the **residual activity** — how much of the enzyme's original activity remains after the first addition's consumption.
-
-**How to use it:**
-
-1. Define ≥2 intervals during the normal interval-selection step.
-2. After confirming intervals, a small dialog asks **"Multi-addition residual-activity series?"** Click Yes.
-3. A checkbox dialog lists every interval — tick the ones that belong to the series (usually all of them) and click **Save selection**.
-4. After fitting, ratios are written to a new `residual_activity_ratio` column in `fit_summary.xlsx`:
-   - The first interval in the series gets `1.0`.
-   - Each later interval gets `best_initial_rate / first_interval_initial_rate`.
-   - Intervals outside the series get NaN.
-
-This replaces the by-hand computation in the `Rate ratio` table of the older analysis Excels.
-
-### H₂O₂-injection-start back-extrapolation
-
-When a reaction begins with an H₂O₂ injection and you used a **two-point calibration** (pre-addition = 0 µM, just-after-addition = e.g. 100 µM), the calibrated concentrations are systematically under-estimated: the enzyme has already consumed some H₂O₂ during the instrument deadtime (~1–2 s before the first reliable reading). The correction is:
-
-1. **Back-extrapolate** the fitted Exponential model to `t_start − deadtime` to recover the true [H₂O₂] at the moment of addition.
-2. Compute the **stretch factor** `back_extrap_uM / nominal_uM` — by how much the calibration under-estimated.
-3. Compute the **stretched initial rate** = `rate_at_back × stretch_factor`. This combines the steeper slope at the (earlier) true t₀ with the calibration rescale.
-
-**How to use it:**
-
-1. Fit at least an Exponential model to the relevant interval (the back-extrap also works with a `LinearInitialRate` fit but is less accurate).
-2. After the fitting phase, a dialog asks **"H₂O₂-injection-start back-extrapolation?"** Click Yes.
-3. For each interval, a preview screen lets you enter the **deadtime** (default 1.5 s) and the **nominal H₂O₂ added** (default = the observed initial value). Click **Compute** to preview the back-extrapolated curve (red, dashed) and the computed values. Click **Accept & record** to save, **Skip** to pass on this interval, or **Back** to abort the back-extrap phase.
-
-Six new columns are added to `fit_summary.xlsx` for accepted intervals: `back_extrap_applied`, `back_extrap_deadtime_s`, `back_extrap_nominal_uM`, `back_extrap_H2O2_at_true_t0_uM`, `back_extrap_stretch_factor`, `back_extrap_stretch_initial_rate_uM_per_s`. These mirror the columns in older hand-computed analyses (`Back extrap`, `Stretch factor`, `Stretch initial rate`).
+The grouping is saved to `Calibrated/controls.json` so an interrupted session can resume.
 
 ### Skip calibration (fitting-only mode)
 
