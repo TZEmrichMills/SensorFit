@@ -152,11 +152,15 @@ def delta_max_from_linear(
     t: np.ndarray, y: np.ndarray,
     line_start_idx: int, line_end_idx: int,
     t_zero: float,
+    max_uM: float = 100.0,
 ) -> tuple[float, float, float]:
-    """Δmax from a straight line fitted between two indices.
+    """Δmax from a straight line fitted between two user-picked points.
 
-    Returns ``(delta_max_uM, slope, intercept)`` where intercept is the
-    y-value of the line at ``t_zero``.
+    The straight line is a baseline / asymptote estimate (typically picked
+    from the tail of the trace).  Evaluating it at ``t_zero`` gives the
+    "remaining H₂O₂ at t₀"; Δmax is then ``max_uM − y_line(t_zero)``.
+
+    Returns ``(delta_max_uM, slope, intercept_at_0)``.
     """
     if line_end_idx <= line_start_idx + 1:
         raise ValueError("Linear Δmax needs ≥2 points on the fit segment.")
@@ -164,15 +168,17 @@ def delta_max_from_linear(
     y_seg = y[line_start_idx : line_end_idx + 1].astype(float)
     slope, intercept_at_0 = np.polyfit(t_seg, y_seg, 1)
     y_at_tzero = float(slope * t_zero + intercept_at_0)
-    # Δmax = y_at_tzero − y at end-of-run (we use the last point of t/y here
-    # as a sensible "asymptote")
-    y_end = float(y[-1])
-    return y_at_tzero - y_end, float(slope), float(intercept_at_0)
+    return float(max_uM) - y_at_tzero, float(slope), float(intercept_at_0)
 
 
-def delta_max_from_point(y_at_tzero: float, y_end: float) -> float:
-    """Single-point Δmax: y(t_zero) − y(end)."""
-    return float(y_at_tzero) - float(y_end)
+def delta_max_from_point(y_at_tzero: float, max_uM: float = 100.0) -> float:
+    """Single-point Δmax: ``max_uM − y(t_zero)``.
+
+    The picked point represents the "remaining H₂O₂" level.  Δmax is the
+    distance from there up to the user-set maximum (largest calibration
+    value, defaulting to 100 µM).
+    """
+    return float(max_uM) - float(y_at_tzero)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -980,7 +986,13 @@ def prompt_one_fit(
         fit_state["fit_artists"].extend([line_fit, line_tan])
         ax_data.legend(loc="best", fontsize=8)
 
-        ax_resid.plot(t_fit, y_fit - rec.yhat, color="tab:blue", lw=1.0)
+        resid_vals = y_fit - rec.yhat
+        ax_resid.plot(t_fit, resid_vals, color="tab:blue", lw=1.0)
+        # Force a symmetric y-axis around 0 so positive and negative
+        # residuals are both visible.
+        r_max = float(np.max(np.abs(resid_vals))) if resid_vals.size else 1.0
+        r_max = max(r_max, 1e-9)
+        ax_resid.set_ylim(-r_max * 1.15, r_max * 1.15)
 
         fit_state["record"] = rec
         r2_str = f"{rec.r2:.4f}" if np.isfinite(rec.r2) else "n/a"
@@ -1034,6 +1046,21 @@ def prompt_one_fit(
         extrap_state["target_t"] = float(target_t)
         extrap_state["new_rate"] = float(new_rate)
         ax_data.legend(loc="best", fontsize=8)
+
+        # Auto-expand axes to include the extrap target so the red ring
+        # is always visible — even if it lands well above/below or
+        # outside the original interval window.
+        xmin, xmax = ax_data.get_xlim()
+        ymin, ymax = ax_data.get_ylim()
+        x_margin = (xmax - xmin) * 0.05 or 1.0
+        y_margin = (ymax - ymin) * 0.08 or 1.0
+        new_xmin = min(xmin, target_t - x_margin)
+        new_xmax = max(xmax, target_t + x_margin)
+        new_ymin = min(ymin, y_at_target - y_margin)
+        new_ymax = max(ymax, y_at_target + y_margin)
+        if (new_xmin, new_xmax, new_ymin, new_ymax) != (xmin, xmax, ymin, ymax):
+            ax_data.set_xlim(new_xmin, new_xmax)
+            ax_data.set_ylim(new_ymin, new_ymax)
 
         direction = "back" if target_t < t_fit_start else "forward"
         r2_str = f"{rec.r2:.4f}" if np.isfinite(rec.r2) else "n/a"
@@ -1157,16 +1184,36 @@ def prompt_one_fit(
 # ────────────────────────────────────────────────────────────────────────
 
 
-def _initial_hint(mode: str, has_usable_fit: bool) -> str:
+def _model_asymptote(rec: FitRecord, t: np.ndarray) -> np.ndarray:
+    """Return the model's asymptote evaluated at ``t``.
+
+    For Exponential ``y = a*t + b + c*exp(-k*(t-t0))`` the asymptote is the
+    linear background ``a*t + b``.  For IB ``y = C + H0*exp(...) - kslow*t``
+    it's ``C - kslow*t``.  For ManualLinear, the fit itself.
+    """
+    t = np.asarray(t, dtype=float)
+    if rec.model == "Exponential" and len(rec.params) == 5:
+        a, b, _c, _k, _t0 = rec.params
+        return a * t + b
+    if rec.model == "IB" and len(rec.params) == 5:
+        C, _H0, _alpha, _kinact, kslow = rec.params
+        return C - kslow * t
+    if rec.model == "ManualLinear" and len(rec.params) == 2:
+        slope, intercept = rec.params
+        return slope * t + intercept
+    return np.zeros_like(t)
+
+
+def _initial_hint(mode: str, has_usable_fit: bool, max_uM: float = 100.0) -> str:
     """Return a short status hint shown above the Δmax plot."""
     if mode == "from-fit":
         if not has_usable_fit:
             return "No usable fit; pick Linear or Point."
-        return "From fit: click ONE point to set t₀."
+        return "From fit: click ONE point to set t₀ (Δmax = y_fit − asymptote at t₀)."
     if mode == "linear":
-        return "Linear: click t₀, then TWO points to define the line."
+        return f"Linear: click t₀, then TWO baseline points.  Δmax = {max_uM:.0f} − line@t₀."
     if mode == "point":
-        return "Point: click ONCE — sets both t₀ and the y-value."
+        return f"Point: click t₀, then ONE baseline point.  Δmax = {max_uM:.0f} − y_point."
     return ""
 
 
@@ -1175,32 +1222,26 @@ def prompt_delta_max(
     interval_y: np.ndarray,
     fits: list[FitRecord],
     filename: str | None = None,
+    cal_max_uM: float = 100.0,
 ):
     """Drive one Δmax estimation for the interval.
 
-    Three modes, chosen at the top of the screen:
-      - From fit  — uses the last fit (if any).  Pick one t=0 anchor.
-                    Δ = y(t_zero) − asymptote(t_zero) for Exponential / IB.
-                    Disabled if there's no fit, or if the only fit is
-                    ManualLinear (asymptote ≡ fit so Δ would be 0).
-      - Linear    — pick t=0 anchor, then two points to define a line.
-                    Δ = line's y at t_zero − y at end of run.
-      - Point     — pick one point.  Δ = its y − y at end of run.
+    All three modes interpret Δmax as ``high − low``:
 
-    Visual feedback:
-      - The t=0 anchor is a purple cross + a purple dashed vertical line
-        (the line is tracked so Retry / mode switch removes it cleanly).
-      - In Linear mode, the fitted line is drawn red dashed across the
-        segment, then extended dotted back to the t=0 anchor.
-      - When Δmax is computed successfully, the value is annotated on
-        the plot (top-right) and a vertical span shows the height
-        between y_at_tzero and y_end.
+    - **From fit**: click ONE point to set t₀.  Δmax = ``y_fit(t₀) − asymptote(t₀)``.
+      The fit is redrawn boldly in red and its asymptote as a dashed line
+      so it's obvious where the measurement comes from.
+    - **Linear**: click t₀, then TWO points that estimate the baseline.
+      Δmax = ``cal_max_uM − y_line(t₀)``.
+    - **Point**: click t₀, then ONE point representing the baseline.
+      Δmax = ``cal_max_uM − y_at_point``.
+
+    ``cal_max_uM`` can be changed on-the-fly via the TextBox at top right.
     """
-    # Pick a sensible default mode based on what fits are available.
     has_usable_fit = any(f.model in ("Exponential", "IB") for f in fits)
     default_mode = "from-fit" if has_usable_fit else "linear"
 
-    fig, ax = plt.subplots(figsize=(11, 7.0))
+    fig, ax = plt.subplots(figsize=(11, 7.2))
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Δ[H₂O₂]max"
@@ -1208,77 +1249,78 @@ def prompt_delta_max(
         )
     except Exception:
         pass
-    # Plenty of room above for the banner + mode buttons; below for actions.
-    plt.subplots_adjust(left=0.1, bottom=0.20, right=0.98, top=0.66)
+    plt.subplots_adjust(left=0.10, bottom=0.20, right=0.98, top=0.66)
     ax.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
-    if fits:
-        for i, f in enumerate(fits):
-            t_seg = np.linspace(f.fit_start_s, f.fit_end_s, f.yhat.size)
-            ax.plot(t_seg, f.yhat, "-", lw=1.0, alpha=0.7, label=f"fit#{i+1}:{f.model}")
+    for i, f in enumerate(fits):
+        t_seg = np.linspace(f.fit_start_s, f.fit_end_s, f.yhat.size)
+        ax.plot(t_seg, f.yhat, "-", lw=1.0, alpha=0.6, label=f"fit#{i+1}:{f.model}")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("H2O2 (µM)")
     ax.legend(loc="best", fontsize=8)
 
-    # Single short banner — no separate suptitle (avoids overlap).
     add_instruction_banner(
         fig,
-        "Pick mode below; click t=0; Linear needs 2 extra clicks for the line; "
-        "Point: just one click. Δmax shows on the plot.",
+        "Pick mode; click t₀; Linear/Point also click on the baseline; "
+        "Δmax = max_uM − baseline_at_t₀.  Edit max_uM if needed.",
         y=0.985, width=130,
     )
 
     mode_state = {"mode": default_mode}
+    max_uM_state = {"value": float(cal_max_uM)}
     state = {
         "t_zero_idx": None,
         "linear_clicks": [],
         "point_idx": None,
         "computed": None,
         "action": None,
-        # All ephemeral overlay artists (markers, lines, spans, anchors).
         "preview_artists": [],
-        # The on-plot Δmax annotation text (single artist, replaced not added).
         "annotation": None,
     }
 
-    # Mode buttons.  From-fit is greyed out (and click is a no-op) when no
-    # usable fit is available.
+    # Top controls: mode buttons + cal-max TextBox
     btn_axes = {
         "from-fit": fig.add_axes([0.10, 0.74, 0.13, 0.05]),
         "linear":   fig.add_axes([0.24, 0.74, 0.13, 0.05]),
         "point":    fig.add_axes([0.38, 0.74, 0.13, 0.05]),
     }
-    if has_usable_fit:
-        from_fit_color_active = "#90ee90"
-        from_fit_color_idle = "0.85"
-        from_fit_hover = "#7cd47c"
-    else:
-        from_fit_color_active = "0.92"
-        from_fit_color_idle = "0.92"
-        from_fit_hover = "0.92"
+    from_fit_active = "#90ee90" if has_usable_fit else "0.92"
+    from_fit_idle = "0.85" if has_usable_fit else "0.92"
 
     btns = {
         "from-fit": create_small_button(
             btn_axes["from-fit"], "From fit",
-            from_fit_color_active if default_mode == "from-fit" else from_fit_color_idle,
-            from_fit_hover,
+            from_fit_active if default_mode == "from-fit" else from_fit_idle,
+            "#7cd47c",
         ),
         "linear": create_small_button(
             btn_axes["linear"], "Linear",
-            "#90ee90" if default_mode == "linear" else "0.85",
-            "#7cd47c",
+            "#90ee90" if default_mode == "linear" else "0.85", "#7cd47c",
         ),
         "point": create_small_button(
             btn_axes["point"], "Point",
-            "#90ee90" if default_mode == "point" else "0.85",
-            "#7cd47c",
+            "#90ee90" if default_mode == "point" else "0.85", "#7cd47c",
         ),
     }
-    # Indicate disabled state textually so the user sees WHY it's grey.
+
+    ax_max = fig.add_axes([0.62, 0.745, 0.08, 0.04])
+    tb_max = TextBox(ax_max, "max [H₂O₂] (µM)  ", initial=f"{cal_max_uM:.2f}")
+
     if not has_usable_fit:
-        ax.text(
-            0.165, 0.795, "(no fit available)", transform=fig.transFigure,
-            ha="center", va="center", fontsize=8, color="dimgrey",
+        fig.text(
+            0.165, 0.715, "(no fit available)",
+            ha="center", va="top", fontsize=8, color="dimgrey",
         )
+
+    status_text = fig.text(
+        0.10, 0.685,
+        _initial_hint(default_mode, has_usable_fit, max_uM_state["value"]),
+        fontsize=9, color="dimgrey", style="italic",
+    )
+
+    def _update_status(msg, colour="dimgrey"):
+        status_text.set_text(msg)
+        status_text.set_color(colour)
+        fig.canvas.draw_idle()
 
     def _clear_preview():
         for art in state["preview_artists"]:
@@ -1302,43 +1344,42 @@ def prompt_delta_max(
     def _set_mode(m):
         def _f(_e=None):
             if m == "from-fit" and not has_usable_fit:
-                print("  From-fit Δmax needs a non-linear fit (Exponential or IB).")
+                _update_status("From-fit needs an Exponential or IB fit; pick Linear or Point.",
+                              "darkred")
                 return
             if mode_state["mode"] == m:
                 return
             mode_state["mode"] = m
-            btns["from-fit"].color = (
-                from_fit_color_active if m == "from-fit" else from_fit_color_idle
-            )
+            btns["from-fit"].color = from_fit_active if m == "from-fit" else from_fit_idle
             btns["linear"].color = "#90ee90" if m == "linear" else "0.85"
             btns["point"].color = "#90ee90" if m == "point" else "0.85"
             _clear_preview()
-            mode_help = {
-                "from-fit": "From fit: click ONE point to set t=0.",
-                "linear":   "Linear: click t=0, then click TWO points to define the line.",
-                "point":    "Point: click ONCE — the click sets both t=0 and the y-value.",
-            }
-            print(f"Δmax mode → {m}.  {mode_help[m]}")
+            _update_status(_initial_hint(m, has_usable_fit, max_uM_state["value"]))
+            print(f"Δmax mode → {m}")
         return _f
 
     for m in btns:
         btns[m].on_clicked(_set_mode(m))
 
-    # Mode-specific status hint above the plot
-    status_text = fig.text(
-        0.55, 0.755, _initial_hint(default_mode, has_usable_fit),
-        fontsize=9, color="dimgrey", style="italic", va="center",
-    )
+    def _on_max_submit(text):
+        try:
+            v = float(text)
+            if not np.isfinite(v) or v <= 0:
+                raise ValueError
+        except ValueError:
+            _update_status(f"max_uM must be a positive number; got '{text}'.", "darkred")
+            tb_max.set_val(f"{max_uM_state['value']:.2f}")
+            return
+        max_uM_state["value"] = v
+        if state["t_zero_idx"] is not None:
+            # Recompute with the new max — easiest: re-run on existing clicks.
+            _replay_after_max_change()
+        else:
+            _update_status(_initial_hint(mode_state["mode"], has_usable_fit, v))
 
-    def _update_status(msg, colour="dimgrey"):
-        status_text.set_text(msg)
-        status_text.set_color(colour)
-        fig.canvas.draw_idle()
+    tb_max.on_submit(_on_max_submit)
 
-    def _draw_anchor(idx):
-        """Drop a purple cross + a tracked dashed vertical line at the t=0
-        anchor.  Both go into preview_artists so Retry / mode-switch wipes
-        them cleanly."""
+    def _draw_t_zero_marker(idx):
         m, = ax.plot(
             interval_t[idx], interval_y[idx], "P",
             ms=14, color="#8B008B", mec="white", mew=1.0, zorder=6,
@@ -1349,93 +1390,93 @@ def prompt_delta_max(
         state["preview_artists"].extend([m, ln])
         fig.canvas.draw_idle()
 
-    def _draw_linear_point(idx):
+    def _draw_baseline_point(idx):
         m, = ax.plot(
             interval_t[idx], interval_y[idx], "o",
-            ms=11, mfc="red", mec="white", mew=1.0, zorder=6,
+            ms=11, mfc="#8B008B", mec="white", mew=1.0, zorder=6,
         )
         state["preview_artists"].append(m)
-        fig.canvas.draw_idle()
 
-    def _show_value_annotation(rec: DeltaMaxRecord):
-        """Annotate the Δmax value on the plot as a top-right text box and
-        draw a vertical double-headed arrow showing the height being
-        measured."""
-        t_zero = rec.t_zero_s
-        y_end = float(interval_y[-1])
-
-        # The y-value at t_zero depends on mode.
-        if rec.method == "from-fit":
-            # Use the asymptote definition: y_at_tzero - asymptote_at_tzero
-            # is exactly rec.value_uM.  We need the observed y(t_zero) for
-            # the arrow; nearest sample is fine.
-            tz_idx = int(np.abs(interval_t - t_zero).argmin())
-            y_top = float(interval_y[tz_idx])
-            y_bot = y_top - rec.value_uM
-        elif rec.method == "linear":
-            y_top = float(rec.linear_slope * t_zero + rec.linear_intercept)
-            y_bot = y_end
-        else:  # point
-            tz_idx = int(np.abs(interval_t - t_zero).argmin())
-            y_top = float(interval_y[tz_idx])
-            y_bot = y_end
-
+    def _draw_span(t_zero, y_top, y_bot, label_text):
         arrow = ax.annotate(
             "", xy=(t_zero, y_bot), xytext=(t_zero, y_top),
-            arrowprops=dict(arrowstyle="<->", color="#005700", lw=2.0),
-            zorder=7,
+            xycoords="data", textcoords="data",
+            arrowprops=dict(
+                arrowstyle="<->", color="#8B008B", lw=2.4,
+                shrinkA=0, shrinkB=0,
+            ),
+            annotation_clip=True, zorder=7,
         )
         state["preview_artists"].append(arrow)
 
-        # Replace any prior annotation with the new value.
         if state["annotation"] is not None:
             try:
                 state["annotation"].remove()
             except Exception:
                 pass
         state["annotation"] = ax.text(
-            0.985, 0.965,
-            f"Δ[H₂O₂]max = {rec.value_uM:.3f} µM\n"
-            f"method: {rec.method}    t₀ = {t_zero:.2f} s",
+            0.985, 0.965, label_text,
             transform=ax.transAxes, ha="right", va="top",
             fontsize=10, fontweight="bold",
-            bbox=dict(boxstyle="round", facecolor="#f0fff0", edgecolor="#005700", alpha=0.95),
+            bbox=dict(boxstyle="round", facecolor="#f7e8ff", edgecolor="#8B008B", alpha=0.95),
             zorder=8,
         )
+
+        # Make sure both endpoints + max_uM are visible so the arrow + box
+        # can never end up clipped.
+        ymin, ymax = ax.get_ylim()
+        y_lo = min(y_top, y_bot)
+        y_hi = max(y_top, y_bot)
+        margin = (ymax - ymin) * 0.05 or 1.0
+        new_ymin = min(ymin, y_lo - margin)
+        new_ymax = max(ymax, y_hi + margin)
+        if (new_ymin, new_ymax) != (ymin, ymax):
+            ax.set_ylim(new_ymin, new_ymax)
+
+    def _highlight_fit(rec: FitRecord):
+        t_fit = np.linspace(rec.fit_start_s, rec.fit_end_s, rec.yhat.size)
+        ln_fit, = ax.plot(t_fit, rec.yhat, "r-", lw=2.2, zorder=6)
+        state["preview_artists"].append(ln_fit)
+        xmin, xmax = float(interval_t[0]), float(interval_t[-1])
+        asym_t = np.linspace(xmin, xmax, 60)
+        asym_y = _model_asymptote(rec, asym_t)
+        ln_asym, = ax.plot(asym_t, asym_y, color="red", lw=1.0, ls="--", alpha=0.7, zorder=5)
+        state["preview_artists"].append(ln_asym)
         fig.canvas.draw_idle()
 
     def _compute_and_preview():
-        # Need t_zero in all modes.
         tz_idx = state["t_zero_idx"]
         if tz_idx is None:
             return
         t_zero = float(interval_t[tz_idx])
-        y_end = float(interval_y[-1])
+        max_uM = float(max_uM_state["value"])
 
         if mode_state["mode"] == "from-fit":
             if not has_usable_fit:
                 return
-            # Use the LATEST non-linear fit (the user usually wants the
-            # most recently applied one).
             rec_fit = next(
-                (f for f in reversed(fits) if f.model in ("Exponential", "IB")),
-                None,
+                (f for f in reversed(fits) if f.model in ("Exponential", "IB")), None,
             )
             if rec_fit is None:
                 return
             delta = delta_max_from_fit(rec_fit, t_zero)
             if not np.isfinite(delta):
-                _update_status(
-                    f"Cannot compute Δmax from {rec_fit.model} fit at this t₀.",
-                    colour="darkred",
-                )
+                _update_status(f"Cannot compute Δmax from {rec_fit.model} at this t₀.", "darkred")
                 return
+            if rec_fit.model == "Exponential":
+                y_fit_at_t = float(model_Exponential(np.array([t_zero]), *rec_fit.params)[0])
+            else:
+                y_fit_at_t = float(model_IB(np.array([t_zero]), *rec_fit.params)[0])
+            asym_at_t = float(_model_asymptote(rec_fit, np.array([t_zero]))[0])
             state["computed"] = DeltaMaxRecord(
                 method="from-fit", t_zero_s=t_zero, value_uM=float(delta),
             )
-            _show_value_annotation(state["computed"])
+            _draw_span(
+                t_zero, y_fit_at_t, asym_at_t,
+                f"Δ[H₂O₂]max = {delta:.3f} µM\nmethod: from-fit ({rec_fit.model})    t₀ = {t_zero:.2f} s",
+            )
             _update_status(
-                f"Δmax (from {rec_fit.model}) = {delta:.3f} µM.  Accept or pick a different t₀.",
+                f"Δmax (from-fit) = {delta:.3f} µM.  Accept or pick a different t₀.",
                 colour="#005700",
             )
 
@@ -1445,51 +1486,83 @@ def prompt_delta_max(
             i0, i1 = sorted(state["linear_clicks"])
             try:
                 delta, slope, intercept = delta_max_from_linear(
-                    interval_t, interval_y, i0, i1, t_zero
+                    interval_t, interval_y, i0, i1, t_zero, max_uM=max_uM,
                 )
             except ValueError as exc:
-                _update_status(f"Linear Δmax: {exc}", colour="darkred")
+                _update_status(f"Linear Δmax: {exc}", "darkred")
                 return
-            # Draw the fit line across the segment, plus a dotted extension
-            # back to t_zero.
             t_seg = np.linspace(interval_t[i0], interval_t[i1], 80)
             y_seg = slope * t_seg + intercept
-            ln_main, = ax.plot(t_seg, y_seg, "r--", lw=1.6, label="Linear fit")
-            state["preview_artists"].append(ln_main)
-            if (t_zero < interval_t[i0]) or (t_zero > interval_t[i1]):
-                t_ext = np.linspace(min(t_zero, interval_t[i0]), max(t_zero, interval_t[i1]), 80)
-                y_ext = slope * t_ext + intercept
-                ln_ext, = ax.plot(t_ext, y_ext, "r:", lw=1.4)
-                state["preview_artists"].append(ln_ext)
+            ln, = ax.plot(t_seg, y_seg, "r--", lw=1.6, zorder=5)
+            state["preview_artists"].append(ln)
+            t_low = min(t_zero, float(interval_t[i0]))
+            t_high = max(t_zero, float(interval_t[i1]))
+            t_ext = np.linspace(t_low, t_high, 80)
+            y_ext = slope * t_ext + intercept
+            ln2, = ax.plot(t_ext, y_ext, "r:", lw=1.4, zorder=5)
+            state["preview_artists"].append(ln2)
+
+            y_line_at_t = float(slope * t_zero + intercept)
             state["computed"] = DeltaMaxRecord(
                 method="linear", t_zero_s=t_zero, value_uM=float(delta),
                 linear_slope=slope, linear_intercept=intercept,
             )
-            _show_value_annotation(state["computed"])
+            _draw_span(
+                t_zero, max_uM, y_line_at_t,
+                f"Δ[H₂O₂]max = {delta:.3f} µM\nmethod: linear    t₀ = {t_zero:.2f} s    max = {max_uM:.1f} µM",
+            )
             _update_status(
-                f"Δmax (linear) = {delta:.3f} µM.  Accept or Retry to redo.",
+                f"Δmax (linear) = {delta:.3f} µM = max ({max_uM:.1f}) − line@t₀ ({y_line_at_t:.3f}).",
                 colour="#005700",
             )
 
         elif mode_state["mode"] == "point":
             if state["point_idx"] is None:
                 return
-            y_at_tzero = float(interval_y[state["point_idx"]])
-            delta = delta_max_from_point(y_at_tzero, y_end)
+            y_at_point = float(interval_y[state["point_idx"]])
+            delta = delta_max_from_point(y_at_point, max_uM=max_uM)
             state["computed"] = DeltaMaxRecord(
                 method="point", t_zero_s=t_zero, value_uM=float(delta),
             )
-            _show_value_annotation(state["computed"])
+            _draw_span(
+                t_zero, max_uM, y_at_point,
+                f"Δ[H₂O₂]max = {delta:.3f} µM\nmethod: point    t₀ = {t_zero:.2f} s    max = {max_uM:.1f} µM",
+            )
             _update_status(
-                f"Δmax (point) = {delta:.3f} µM.  Accept or click elsewhere to revise.",
+                f"Δmax (point) = {delta:.3f} µM = max ({max_uM:.1f}) − point ({y_at_point:.3f}).",
                 colour="#005700",
             )
 
-        else:
-            return
-
+        fig.canvas.draw_idle()
         rec = state["computed"]
-        print(f"Δmax preview: method={rec.method}, t_zero={t_zero:.3f}s → {rec.value_uM:.4f} µM")
+        if rec is not None:
+            print(f"Δmax preview: method={rec.method}, t_zero={t_zero:.3f}s → {rec.value_uM:.4f} µM")
+
+    def _replay_after_max_change():
+        """When the user changes max_uM, redo the active mode's preview with
+        the current set of clicks (keeping the t₀ and any baseline picks)."""
+        # Save the indices, clear the visuals, redraw markers, recompute.
+        saved_tz = state["t_zero_idx"]
+        saved_lin = list(state["linear_clicks"])
+        saved_pt = state["point_idx"]
+        _clear_preview()
+        state["t_zero_idx"] = saved_tz
+        state["linear_clicks"] = saved_lin
+        state["point_idx"] = saved_pt
+        if saved_tz is None:
+            return
+        if mode_state["mode"] == "from-fit":
+            rec_fit = next(
+                (f for f in reversed(fits) if f.model in ("Exponential", "IB")), None,
+            )
+            if rec_fit is not None:
+                _highlight_fit(rec_fit)
+        _draw_t_zero_marker(saved_tz)
+        for idx in saved_lin:
+            _draw_baseline_point(idx)
+        if mode_state["mode"] == "point" and saved_pt is not None:
+            _draw_baseline_point(saved_pt)
+        _compute_and_preview()
 
     def on_click(event):
         if event.button != 1 or event.inaxes is not ax or event.xdata is None:
@@ -1499,53 +1572,60 @@ def prompt_delta_max(
         idx = int(np.abs(interval_t - float(event.xdata)).argmin())
 
         if mode_state["mode"] == "from-fit":
-            # Replace any prior anchor (one anchor at a time).
             _clear_preview()
             state["t_zero_idx"] = idx
-            _draw_anchor(idx)
+            rec_fit = next(
+                (f for f in reversed(fits) if f.model in ("Exponential", "IB")), None,
+            )
+            if rec_fit is not None:
+                _highlight_fit(rec_fit)
+            _draw_t_zero_marker(idx)
             _compute_and_preview()
 
         elif mode_state["mode"] == "linear":
             if state["t_zero_idx"] is None:
-                # First click sets t=0.
                 state["t_zero_idx"] = idx
-                _draw_anchor(idx)
+                _draw_t_zero_marker(idx)
                 _update_status(
-                    "Linear: now click TWO points along the data to define the line.",
-                    colour="dimgrey",
+                    "Linear: now click TWO points along the baseline / asymptote.",
+                    "dimgrey",
                 )
             elif len(state["linear_clicks"]) < 2:
                 state["linear_clicks"].append(idx)
-                _draw_linear_point(idx)
+                _draw_baseline_point(idx)
+                fig.canvas.draw_idle()
                 remaining = 2 - len(state["linear_clicks"])
                 if remaining > 0:
-                    _update_status(
-                        f"Linear: click {remaining} more point.",
-                        colour="dimgrey",
-                    )
+                    _update_status(f"Linear: click {remaining} more point.", "dimgrey")
                 else:
                     _compute_and_preview()
 
         elif mode_state["mode"] == "point":
-            # Each click replaces the previous one.
-            _clear_preview()
-            state["t_zero_idx"] = idx
-            state["point_idx"] = idx
-            _draw_anchor(idx)
-            _compute_and_preview()
+            if state["t_zero_idx"] is None:
+                state["t_zero_idx"] = idx
+                _draw_t_zero_marker(idx)
+                _update_status(
+                    "Point: now click ONE point on the curve representing the baseline.",
+                    "dimgrey",
+                )
+            elif state["point_idx"] is None:
+                state["point_idx"] = idx
+                _draw_baseline_point(idx)
+                fig.canvas.draw_idle()
+                _compute_and_preview()
 
     fig.canvas.mpl_connect("button_press_event", on_click)
 
     def on_accept(_e=None):
         if state["computed"] is None:
-            print("No Δmax computed yet.")
+            _update_status("No Δmax computed yet.", "darkred")
             return
         state["action"] = "accept"
         plt.close(fig)
 
     def on_retry(_e=None):
         _clear_preview()
-        _update_status(_initial_hint(mode_state["mode"], has_usable_fit), colour="dimgrey")
+        _update_status(_initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]))
         print("Δmax cleared.")
 
     def on_skip(_e=None):
@@ -1560,14 +1640,14 @@ def prompt_delta_max(
     ax_retry = fig.add_axes([0.30, 0.04, 0.12, 0.05])
     ax_skip = fig.add_axes([0.44, 0.04, 0.16, 0.05])
     ax_back = fig.add_axes([0.62, 0.04, 0.18, 0.05])
-    _btn_accept = create_small_button(ax_accept, "Accept Δmax", "#90ee90", "#7cd47c")
-    _btn_accept.on_clicked(on_accept)
-    _btn_retry = create_small_button(ax_retry, "Retry", "0.9", "0.8")
-    _btn_retry.on_clicked(on_retry)
-    _btn_skip = create_small_button(ax_skip, "Skip Δmax", "#ffcc99", "#ffaa66")
-    _btn_skip.on_clicked(on_skip)
-    _btn_back = create_small_button(ax_back, "Back → fits", "#ddddff", "#bbbbff")
-    _btn_back.on_clicked(on_back)
+    btn_accept = create_small_button(ax_accept, "Accept Δmax", "#90ee90", "#7cd47c")
+    btn_accept.on_clicked(on_accept)
+    btn_retry = create_small_button(ax_retry, "Retry", "0.9", "0.8")
+    btn_retry.on_clicked(on_retry)
+    btn_skip = create_small_button(ax_skip, "Skip Δmax", "#ffcc99", "#ffaa66")
+    btn_skip.on_clicked(on_skip)
+    btn_back = create_small_button(ax_back, "Back → fits", "#ddddff", "#bbbbff")
+    btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
     plt.show()
@@ -1624,6 +1704,7 @@ def run_per_interval_flow(
     calibrated_dir: Path | None = None,
     session_intervals: list[ProcessedInterval] | None = None,
     new_control_callback=None,
+    cal_max_uM: float = 100.0,
 ) -> list[ProcessedInterval] | str:
     """Drive the per-interval state machine until the user says "Done".
 
@@ -1802,6 +1883,7 @@ def run_per_interval_flow(
                 dres = prompt_delta_max(
                     interval_t, interval_y, fits,
                     filename=filename,
+                    cal_max_uM=cal_max_uM,
                 )
                 if isinstance(dres, DeltaMaxRecord):
                     delta = dres

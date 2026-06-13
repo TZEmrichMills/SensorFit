@@ -402,6 +402,16 @@ def process_file(
                 calibrated_dir_for_flow = (
                     calibrated_dir if calibrated_dir is not None else output_dir / "Calibrated"
                 )
+                # Default Δmax max-µM = largest calibration value (or 100
+                # if we skipped calibration or only have one value).
+                try:
+                    cal_max_uM = max(
+                        float(v) for v in (current_calibration_values or [])
+                    )
+                except (TypeError, ValueError):
+                    cal_max_uM = 100.0
+                if not (cal_max_uM and cal_max_uM > 0):
+                    cal_max_uM = 100.0
                 _pi = run_per_interval_flow(
                     time_values=time_values,
                     h2o2_values=frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
@@ -409,6 +419,7 @@ def process_file(
                     full_frame=frame,
                     filename=path.name,
                     calibrated_dir=calibrated_dir_for_flow,
+                    cal_max_uM=cal_max_uM,
                 )
                 if isinstance(_pi, list):
                     processed_intervals = _pi

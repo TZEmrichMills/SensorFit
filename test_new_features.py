@@ -495,22 +495,27 @@ def test_delta_max_pure_helpers() -> bool:
     print("  ✓ from_fit (Exponential) recovers c*exp(-k*Δt)")
 
     # ── from_linear ──────────────────────────────────────────────────
-    # y = 100 - 2*t on [0, 50] (one-sample-per-second).
-    # Line through indices 5..15 (t=5..15) → slope=-2, intercept=100.
-    # At t_zero=0 → line value = 100; y_end (t=50) = 0; Δmax = 100 - 0 = 100.
+    # y = 100 - 2*t on [0, 50].  Line through indices 5..15 (t=5..15) →
+    # slope=-2, intercept=100.  At t_zero=0 the line is at 100, so with
+    # max_uM=100 → Δmax = max_uM − y_line(t_zero) = 100 − 100 = 0.
+    # With max_uM=150 and y_line(t_zero=5) = 100 − 10 = 90, Δmax = 60.
     t_arr = np.linspace(0, 50, 51)
     y_arr = 100.0 - 2.0 * t_arr
-    delta, slope, intercept = delta_max_from_linear(t_arr, y_arr, 5, 15, t_zero=0.0)
+    delta, slope, intercept = delta_max_from_linear(t_arr, y_arr, 5, 15, t_zero=0.0, max_uM=100.0)
     assert abs(slope - (-2.0)) < 1e-6
     assert abs(intercept - 100.0) < 1e-6
-    assert abs(delta - 100.0) < 1e-6
-    print("  ✓ from_linear (y=100-2t) → Δmax at t_zero=0 = 100")
+    assert abs(delta - 0.0) < 1e-6
+    print("  ✓ from_linear (y=100-2t, t_zero=0, max_uM=100) → Δmax = 0")
+    delta2, _, _ = delta_max_from_linear(t_arr, y_arr, 5, 15, t_zero=5.0, max_uM=150.0)
+    assert abs(delta2 - 60.0) < 1e-6
+    print("  ✓ from_linear (y=100-2t, t_zero=5, max_uM=150) → Δmax = 60")
 
     # ── from_point ───────────────────────────────────────────────────
-    # Δmax = y(t_zero) - y_end.  Simple subtraction.
-    assert abs(delta_max_from_point(100.0, 0.0) - 100.0) < 1e-12
-    assert abs(delta_max_from_point(50.0, 10.0) - 40.0) < 1e-12
-    print("  ✓ from_point trivially subtracts y_end from y_at_tzero")
+    # Δmax = max_uM − y_at_tzero.  Default max_uM=100.
+    assert abs(delta_max_from_point(0.0) - 100.0) < 1e-12        # max=100, y=0
+    assert abs(delta_max_from_point(40.0, max_uM=100.0) - 60.0) < 1e-12
+    assert abs(delta_max_from_point(50.0, max_uM=150.0) - 100.0) < 1e-12
+    print("  ✓ from_point computes max_uM − y_at_tzero")
 
     # ── from_fit returns NaN for ManualLinear ────────────────────────
     rec_lin = FitRecord(
