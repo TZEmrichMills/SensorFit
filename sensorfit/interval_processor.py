@@ -321,20 +321,36 @@ def select_one_interval(
         fig.canvas.draw_idle()
         print("Selection cleared.")
 
-    ax_accept = fig.add_axes([0.10, 0.03, 0.14, 0.05])
-    ax_retry = fig.add_axes([0.26, 0.03, 0.10, 0.05])
-    ax_done = fig.add_axes([0.38, 0.03, 0.18, 0.05])
-    ax_skip = fig.add_axes([0.58, 0.03, 0.14, 0.05])
-    ax_back = fig.add_axes([0.74, 0.03, 0.14, 0.05])
+    def on_remove_last(_e=None):
+        if not already_defined:
+            print("No previously-defined intervals to remove.")
+            return
+        state["action"] = "remove_last"
+        plt.close(fig)
+
+    # Buttons across the bottom in two columns:
+    # row 1: Accept | Retry | Done with intervals | Skip this one
+    # row 2: Remove last (enabled only if intervals exist) | Back to calibration
+    ax_accept = fig.add_axes([0.08, 0.03, 0.13, 0.05])
+    ax_retry = fig.add_axes([0.22, 0.03, 0.10, 0.05])
+    ax_done = fig.add_axes([0.34, 0.03, 0.18, 0.05])
+    ax_skip = fig.add_axes([0.54, 0.03, 0.13, 0.05])
+    ax_remove = fig.add_axes([0.70, 0.03, 0.13, 0.05])
+    ax_back = fig.add_axes([0.84, 0.03, 0.13, 0.05])
     btn_accept = create_small_button(ax_accept, "Accept", "#90ee90", "#7cd47c")
     btn_retry = create_small_button(ax_retry, "Retry", "0.9", "0.8")
     btn_done = create_small_button(ax_done, "Done with intervals", "#ddddff", "#bbbbff")
     btn_skip = create_small_button(ax_skip, "Skip this one", "#ffcc99", "#ffaa66")
-    btn_back = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
+    # Remove last is greyed out (slightly) when there are no accepted intervals.
+    remove_colour = "#ffaaaa" if already_defined else "0.85"
+    remove_hover = "#ff8888" if already_defined else "0.85"
+    btn_remove = create_small_button(ax_remove, "Remove last", remove_colour, remove_hover)
+    btn_back = create_small_button(ax_back, "Back → calibration", "#ddddff", "#bbbbff")
     btn_accept.on_clicked(on_accept)
     btn_retry.on_clicked(on_retry)
     btn_done.on_clicked(on_done)
     btn_skip.on_clicked(on_skip)
+    btn_remove.on_clicked(on_remove_last)
     btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
@@ -795,6 +811,7 @@ def prompt_one_fit(
     interval_y: np.ndarray,
     filename: str | None = None,
     fit_index: int = 1,
+    existing_fits: "list[FitRecord] | None" = None,
 ):
     """Drive a single fit on an interval.
 
@@ -1094,6 +1111,19 @@ def _preview_fit_with_back_extrap(
 # ────────────────────────────────────────────────────────────────────────
 
 
+def _initial_hint(mode: str, has_usable_fit: bool) -> str:
+    """Return a short status hint shown above the Δmax plot."""
+    if mode == "from-fit":
+        if not has_usable_fit:
+            return "No usable fit; pick Linear or Point."
+        return "From fit: click ONE point to set t₀."
+    if mode == "linear":
+        return "Linear: click t₀, then TWO points to define the line."
+    if mode == "point":
+        return "Point: click ONCE — sets both t₀ and the y-value."
+    return ""
+
+
 def prompt_delta_max(
     interval_t: np.ndarray,
     interval_y: np.ndarray,
@@ -1103,21 +1133,28 @@ def prompt_delta_max(
     """Drive one Δmax estimation for the interval.
 
     Three modes, chosen at the top of the screen:
-      - From fit  — uses the last fit (if any); Δ at t_zero = c*exp(-k*(t_zero-t0))
-                    for Exponential; H0*exp(...) for IB.
-      - Linear    — user clicks two points to draw a line; line's y at t_zero
-                    minus y at the end of the interval = Δmax.
-      - Point     — user clicks ONE point; its y minus y at the end = Δmax.
+      - From fit  — uses the last fit (if any).  Pick one t=0 anchor.
+                    Δ = y(t_zero) − asymptote(t_zero) for Exponential / IB.
+                    Disabled if there's no fit, or if the only fit is
+                    ManualLinear (asymptote ≡ fit so Δ would be 0).
+      - Linear    — pick t=0 anchor, then two points to define a line.
+                    Δ = line's y at t_zero − y at end of run.
+      - Point     — pick one point.  Δ = its y − y at end of run.
 
-    In all three modes the user FIRST clicks the t_zero anchor (single click).
+    Visual feedback:
+      - The t=0 anchor is a purple cross + a purple dashed vertical line
+        (the line is tracked so Retry / mode switch removes it cleanly).
+      - In Linear mode, the fitted line is drawn red dashed across the
+        segment, then extended dotted back to the t=0 anchor.
+      - When Δmax is computed successfully, the value is annotated on
+        the plot (top-right) and a vertical span shows the height
+        between y_at_tzero and y_end.
     """
-    if not fits:
-        # Can't do "from-fit" without any fit
-        default_mode = "linear"
-    else:
-        default_mode = "from-fit"
+    # Pick a sensible default mode based on what fits are available.
+    has_usable_fit = any(f.model in ("Exponential", "IB") for f in fits)
+    default_mode = "from-fit" if has_usable_fit else "linear"
 
-    fig, ax = plt.subplots(figsize=(11, 6.8))
+    fig, ax = plt.subplots(figsize=(11, 7.0))
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Δ[H₂O₂]max"
@@ -1125,67 +1162,91 @@ def prompt_delta_max(
         )
     except Exception:
         pass
-    plt.subplots_adjust(left=0.1, bottom=0.22, right=0.98, top=0.74)
+    # Plenty of room above for the banner + mode buttons; below for actions.
+    plt.subplots_adjust(left=0.1, bottom=0.20, right=0.98, top=0.66)
     ax.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
     if fits:
         for i, f in enumerate(fits):
             t_seg = np.linspace(f.fit_start_s, f.fit_end_s, f.yhat.size)
             ax.plot(t_seg, f.yhat, "-", lw=1.0, alpha=0.7, label=f"fit#{i+1}:{f.model}")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("H2O2 (µM)")
     ax.legend(loc="best", fontsize=8)
 
-    title = "Δ[H₂O₂]max selection"
-    if filename:
-        title = f"{truncate_filename(filename)}\n{title}"
-    fig.suptitle(title, fontsize=11)
-
+    # Single short banner — no separate suptitle (avoids overlap).
     add_instruction_banner(
         fig,
-        "Top: choose mode (From fit | Linear | Point).  Then click t=0 once.  "
-        "For Linear, additionally click 2 points to define the line.  For Point, "
-        "the t=0 click also picks the y-value.  Accept records Δmax.",
-        y=0.985,
-        width=110,
+        "Pick mode below; click t=0; Linear needs 2 extra clicks for the line; "
+        "Point: just one click. Δmax shows on the plot.",
+        y=0.985, width=130,
     )
 
     mode_state = {"mode": default_mode}
     state = {
         "t_zero_idx": None,
-        "linear_clicks": [],  # for Linear mode
-        "point_idx": None,    # for Point mode
-        "computed": None,     # DeltaMaxRecord on success
+        "linear_clicks": [],
+        "point_idx": None,
+        "computed": None,
         "action": None,
-        "markers": [],
-        "preview": [],
+        # All ephemeral overlay artists (markers, lines, spans, anchors).
+        "preview_artists": [],
+        # The on-plot Δmax annotation text (single artist, replaced not added).
+        "annotation": None,
     }
 
+    # Mode buttons.  From-fit is greyed out (and click is a no-op) when no
+    # usable fit is available.
     btn_axes = {
-        "from-fit": fig.add_axes([0.10, 0.86, 0.13, 0.05]),
-        "linear":   fig.add_axes([0.24, 0.86, 0.13, 0.05]),
-        "point":    fig.add_axes([0.38, 0.86, 0.13, 0.05]),
+        "from-fit": fig.add_axes([0.10, 0.74, 0.13, 0.05]),
+        "linear":   fig.add_axes([0.24, 0.74, 0.13, 0.05]),
+        "point":    fig.add_axes([0.38, 0.74, 0.13, 0.05]),
     }
-    btns = {
-        m: create_small_button(
-            btn_axes[m],
-            {"from-fit": "From fit", "linear": "Linear", "point": "Point"}[m],
-            "#90ee90" if m == default_mode else "0.85",
-            "#7cd47c",
-        )
-        for m in ("from-fit", "linear", "point")
-    }
+    if has_usable_fit:
+        from_fit_color_active = "#90ee90"
+        from_fit_color_idle = "0.85"
+        from_fit_hover = "#7cd47c"
+    else:
+        from_fit_color_active = "0.92"
+        from_fit_color_idle = "0.92"
+        from_fit_hover = "0.92"
 
-    def _clear():
-        for marker in state["markers"]:
-            try:
-                marker.remove()
-            except Exception:
-                pass
-        for art in state["preview"]:
+    btns = {
+        "from-fit": create_small_button(
+            btn_axes["from-fit"], "From fit",
+            from_fit_color_active if default_mode == "from-fit" else from_fit_color_idle,
+            from_fit_hover,
+        ),
+        "linear": create_small_button(
+            btn_axes["linear"], "Linear",
+            "#90ee90" if default_mode == "linear" else "0.85",
+            "#7cd47c",
+        ),
+        "point": create_small_button(
+            btn_axes["point"], "Point",
+            "#90ee90" if default_mode == "point" else "0.85",
+            "#7cd47c",
+        ),
+    }
+    # Indicate disabled state textually so the user sees WHY it's grey.
+    if not has_usable_fit:
+        ax.text(
+            0.165, 0.795, "(no fit available)", transform=fig.transFigure,
+            ha="center", va="center", fontsize=8, color="dimgrey",
+        )
+
+    def _clear_preview():
+        for art in state["preview_artists"]:
             try:
                 art.remove()
             except Exception:
                 pass
-        state["markers"].clear()
-        state["preview"].clear()
+        state["preview_artists"].clear()
+        if state["annotation"] is not None:
+            try:
+                state["annotation"].remove()
+            except Exception:
+                pass
+            state["annotation"] = None
         state["t_zero_idx"] = None
         state["linear_clicks"].clear()
         state["point_idx"] = None
@@ -1194,18 +1255,111 @@ def prompt_delta_max(
 
     def _set_mode(m):
         def _f(_e=None):
+            if m == "from-fit" and not has_usable_fit:
+                print("  From-fit Δmax needs a non-linear fit (Exponential or IB).")
+                return
+            if mode_state["mode"] == m:
+                return
             mode_state["mode"] = m
-            for k in btns:
-                btns[k].color = "#90ee90" if k == m else "0.85"
-            _clear()
-            print(f"Δmax mode → {m}")
+            btns["from-fit"].color = (
+                from_fit_color_active if m == "from-fit" else from_fit_color_idle
+            )
+            btns["linear"].color = "#90ee90" if m == "linear" else "0.85"
+            btns["point"].color = "#90ee90" if m == "point" else "0.85"
+            _clear_preview()
+            mode_help = {
+                "from-fit": "From fit: click ONE point to set t=0.",
+                "linear":   "Linear: click t=0, then click TWO points to define the line.",
+                "point":    "Point: click ONCE — the click sets both t=0 and the y-value.",
+            }
+            print(f"Δmax mode → {m}.  {mode_help[m]}")
         return _f
 
     for m in btns:
         btns[m].on_clicked(_set_mode(m))
 
+    # Mode-specific status hint above the plot
+    status_text = fig.text(
+        0.55, 0.755, _initial_hint(default_mode, has_usable_fit),
+        fontsize=9, color="dimgrey", style="italic", va="center",
+    )
+
+    def _update_status(msg, colour="dimgrey"):
+        status_text.set_text(msg)
+        status_text.set_color(colour)
+        fig.canvas.draw_idle()
+
+    def _draw_anchor(idx):
+        """Drop a purple cross + a tracked dashed vertical line at the t=0
+        anchor.  Both go into preview_artists so Retry / mode-switch wipes
+        them cleanly."""
+        m, = ax.plot(
+            interval_t[idx], interval_y[idx], "P",
+            ms=14, color="#8B008B", mec="white", mew=1.0, zorder=6,
+        )
+        ln = ax.axvline(
+            interval_t[idx], color="#8B008B", lw=1.4, ls="--", alpha=0.85, zorder=4,
+        )
+        state["preview_artists"].extend([m, ln])
+        fig.canvas.draw_idle()
+
+    def _draw_linear_point(idx):
+        m, = ax.plot(
+            interval_t[idx], interval_y[idx], "o",
+            ms=11, mfc="red", mec="white", mew=1.0, zorder=6,
+        )
+        state["preview_artists"].append(m)
+        fig.canvas.draw_idle()
+
+    def _show_value_annotation(rec: DeltaMaxRecord):
+        """Annotate the Δmax value on the plot as a top-right text box and
+        draw a vertical double-headed arrow showing the height being
+        measured."""
+        t_zero = rec.t_zero_s
+        y_end = float(interval_y[-1])
+
+        # The y-value at t_zero depends on mode.
+        if rec.method == "from-fit":
+            # Use the asymptote definition: y_at_tzero - asymptote_at_tzero
+            # is exactly rec.value_uM.  We need the observed y(t_zero) for
+            # the arrow; nearest sample is fine.
+            tz_idx = int(np.abs(interval_t - t_zero).argmin())
+            y_top = float(interval_y[tz_idx])
+            y_bot = y_top - rec.value_uM
+        elif rec.method == "linear":
+            y_top = float(rec.linear_slope * t_zero + rec.linear_intercept)
+            y_bot = y_end
+        else:  # point
+            tz_idx = int(np.abs(interval_t - t_zero).argmin())
+            y_top = float(interval_y[tz_idx])
+            y_bot = y_end
+
+        arrow = ax.annotate(
+            "", xy=(t_zero, y_bot), xytext=(t_zero, y_top),
+            arrowprops=dict(arrowstyle="<->", color="#005700", lw=2.0),
+            zorder=7,
+        )
+        state["preview_artists"].append(arrow)
+
+        # Replace any prior annotation with the new value.
+        if state["annotation"] is not None:
+            try:
+                state["annotation"].remove()
+            except Exception:
+                pass
+        state["annotation"] = ax.text(
+            0.985, 0.965,
+            f"Δ[H₂O₂]max = {rec.value_uM:.3f} µM\n"
+            f"method: {rec.method}    t₀ = {t_zero:.2f} s",
+            transform=ax.transAxes, ha="right", va="top",
+            fontsize=10, fontweight="bold",
+            bbox=dict(boxstyle="round", facecolor="#f0fff0", edgecolor="#005700", alpha=0.95),
+            zorder=8,
+        )
+        fig.canvas.draw_idle()
+
     def _compute_and_preview():
-        # Need a t_zero in all modes
+        # Need t_zero in all modes.
         tz_idx = state["t_zero_idx"]
         if tz_idx is None:
             return
@@ -1213,37 +1367,62 @@ def prompt_delta_max(
         y_end = float(interval_y[-1])
 
         if mode_state["mode"] == "from-fit":
-            if not fits:
-                print("No fit available; pick Linear or Point mode.")
+            if not has_usable_fit:
                 return
-            rec_fit = fits[-1]
+            # Use the LATEST non-linear fit (the user usually wants the
+            # most recently applied one).
+            rec_fit = next(
+                (f for f in reversed(fits) if f.model in ("Exponential", "IB")),
+                None,
+            )
+            if rec_fit is None:
+                return
             delta = delta_max_from_fit(rec_fit, t_zero)
             if not np.isfinite(delta):
-                print(f"Cannot compute Δmax from {rec_fit.model} fit.")
+                _update_status(
+                    f"Cannot compute Δmax from {rec_fit.model} fit at this t₀.",
+                    colour="darkred",
+                )
                 return
             state["computed"] = DeltaMaxRecord(
                 method="from-fit", t_zero_s=t_zero, value_uM=float(delta),
             )
+            _show_value_annotation(state["computed"])
+            _update_status(
+                f"Δmax (from {rec_fit.model}) = {delta:.3f} µM.  Accept or pick a different t₀.",
+                colour="#005700",
+            )
 
         elif mode_state["mode"] == "linear":
             if len(state["linear_clicks"]) != 2:
-                return  # waiting for both line clicks
+                return
             i0, i1 = sorted(state["linear_clicks"])
             try:
                 delta, slope, intercept = delta_max_from_linear(
                     interval_t, interval_y, i0, i1, t_zero
                 )
             except ValueError as exc:
-                print(f"Linear Δmax: {exc}")
+                _update_status(f"Linear Δmax: {exc}", colour="darkred")
                 return
-            # Draw the fit line + extension to t_zero
-            t_line = np.linspace(min(t_zero, interval_t[i0]), interval_t[i1], 100)
-            y_line = slope * t_line + intercept
-            ln, = ax.plot(t_line, y_line, "r--", lw=1.4, label="Linear")
-            state["preview"].append(ln)
+            # Draw the fit line across the segment, plus a dotted extension
+            # back to t_zero.
+            t_seg = np.linspace(interval_t[i0], interval_t[i1], 80)
+            y_seg = slope * t_seg + intercept
+            ln_main, = ax.plot(t_seg, y_seg, "r--", lw=1.6, label="Linear fit")
+            state["preview_artists"].append(ln_main)
+            if (t_zero < interval_t[i0]) or (t_zero > interval_t[i1]):
+                t_ext = np.linspace(min(t_zero, interval_t[i0]), max(t_zero, interval_t[i1]), 80)
+                y_ext = slope * t_ext + intercept
+                ln_ext, = ax.plot(t_ext, y_ext, "r:", lw=1.4)
+                state["preview_artists"].append(ln_ext)
             state["computed"] = DeltaMaxRecord(
                 method="linear", t_zero_s=t_zero, value_uM=float(delta),
                 linear_slope=slope, linear_intercept=intercept,
+            )
+            _show_value_annotation(state["computed"])
+            _update_status(
+                f"Δmax (linear) = {delta:.3f} µM.  Accept or Retry to redo.",
+                colour="#005700",
             )
 
         elif mode_state["mode"] == "point":
@@ -1254,15 +1433,15 @@ def prompt_delta_max(
             state["computed"] = DeltaMaxRecord(
                 method="point", t_zero_s=t_zero, value_uM=float(delta),
             )
+            _show_value_annotation(state["computed"])
+            _update_status(
+                f"Δmax (point) = {delta:.3f} µM.  Accept or click elsewhere to revise.",
+                colour="#005700",
+            )
 
         else:
             return
 
-        # Preview text on the figure
-        for art in state["preview"]:
-            pass  # already drawn
-        ax.axvline(t_zero, color="#8B008B", lw=1.4, ls="--", alpha=0.85)
-        fig.canvas.draw_idle()
         rec = state["computed"]
         print(f"Δmax preview: method={rec.method}, t_zero={t_zero:.3f}s → {rec.value_uM:.4f} µM")
 
@@ -1274,32 +1453,39 @@ def prompt_delta_max(
         idx = int(np.abs(interval_t - float(event.xdata)).argmin())
 
         if mode_state["mode"] == "from-fit":
-            # Only need t_zero click
+            # Replace any prior anchor (one anchor at a time).
+            _clear_preview()
             state["t_zero_idx"] = idx
-            m, = ax.plot(interval_t[idx], interval_y[idx], "P", ms=12, color="#8B008B", zorder=5)
-            state["markers"].append(m)
+            _draw_anchor(idx)
             _compute_and_preview()
 
         elif mode_state["mode"] == "linear":
-            # First click = t_zero; next two = line endpoints
             if state["t_zero_idx"] is None:
+                # First click sets t=0.
                 state["t_zero_idx"] = idx
-                m, = ax.plot(interval_t[idx], interval_y[idx], "P", ms=12, color="#8B008B", zorder=5)
-                state["markers"].append(m)
-                print("Linear Δmax: now click two points to define the line.")
+                _draw_anchor(idx)
+                _update_status(
+                    "Linear: now click TWO points along the data to define the line.",
+                    colour="dimgrey",
+                )
             elif len(state["linear_clicks"]) < 2:
                 state["linear_clicks"].append(idx)
-                m, = ax.plot(interval_t[idx], interval_y[idx], "ro", ms=10, zorder=5)
-                state["markers"].append(m)
-                if len(state["linear_clicks"]) == 2:
+                _draw_linear_point(idx)
+                remaining = 2 - len(state["linear_clicks"])
+                if remaining > 0:
+                    _update_status(
+                        f"Linear: click {remaining} more point.",
+                        colour="dimgrey",
+                    )
+                else:
                     _compute_and_preview()
 
         elif mode_state["mode"] == "point":
-            # Click serves as BOTH t_zero AND the y-value
+            # Each click replaces the previous one.
+            _clear_preview()
             state["t_zero_idx"] = idx
             state["point_idx"] = idx
-            m, = ax.plot(interval_t[idx], interval_y[idx], "P", ms=12, color="#8B008B", zorder=5)
-            state["markers"].append(m)
+            _draw_anchor(idx)
             _compute_and_preview()
 
     fig.canvas.mpl_connect("button_press_event", on_click)
@@ -1312,7 +1498,9 @@ def prompt_delta_max(
         plt.close(fig)
 
     def on_retry(_e=None):
-        _clear()
+        _clear_preview()
+        _update_status(_initial_hint(mode_state["mode"], has_usable_fit), colour="dimgrey")
+        print("Δmax cleared.")
 
     def on_skip(_e=None):
         state["action"] = "skip"
@@ -1325,15 +1513,15 @@ def prompt_delta_max(
     ax_accept = fig.add_axes([0.12, 0.04, 0.16, 0.05])
     ax_retry = fig.add_axes([0.30, 0.04, 0.12, 0.05])
     ax_skip = fig.add_axes([0.44, 0.04, 0.16, 0.05])
-    ax_back = fig.add_axes([0.62, 0.04, 0.12, 0.05])
-    _btn_accept_14 = create_small_button(ax_accept, "Accept Δmax", "#90ee90", "#7cd47c")
-    _btn_accept_14.on_clicked(on_accept)
-    _btn_retry_15 = create_small_button(ax_retry, "Retry", "0.9", "0.8")
-    _btn_retry_15.on_clicked(on_retry)
-    _btn_skip_16 = create_small_button(ax_skip, "Skip Δmax", "#ffcc99", "#ffaa66")
-    _btn_skip_16.on_clicked(on_skip)
-    _btn_back_17 = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
-    _btn_back_17.on_clicked(on_back)
+    ax_back = fig.add_axes([0.62, 0.04, 0.18, 0.05])
+    _btn_accept = create_small_button(ax_accept, "Accept Δmax", "#90ee90", "#7cd47c")
+    _btn_accept.on_clicked(on_accept)
+    _btn_retry = create_small_button(ax_retry, "Retry", "0.9", "0.8")
+    _btn_retry.on_clicked(on_retry)
+    _btn_skip = create_small_button(ax_skip, "Skip Δmax", "#ffcc99", "#ffaa66")
+    _btn_skip.on_clicked(on_skip)
+    _btn_back = create_small_button(ax_back, "Back → fits", "#ddddff", "#bbbbff")
+    _btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
     plt.show()
@@ -1410,6 +1598,7 @@ def run_per_interval_flow(
     interval_counter = 1
     self_stem = Path(filename).stem if filename else None
 
+    # ── Outer loop: one iteration per interval the user accepts ────────
     while True:
         # ── 1) Pick the interval ─────────────────────────────────────
         already = [(p.start_time, p.end_time) for p in accepted]
@@ -1419,13 +1608,25 @@ def run_per_interval_flow(
         )
         if sel == "done" or sel == "skip":
             if not accepted:
-                # User clicked Done before adding anything; that's "no intervals"
                 return []
             break
         if sel == "back":
+            # The user wants to back out to calibration regardless of whether
+            # they have any accepted intervals — the "Remove last" button
+            # handles the case where they just want to drop a few.
             if not accepted:
                 return "go_back_to_calibration"
-            # If there are accepted intervals, "Back" just re-opens this step
+            # If there ARE accepted intervals already, treat Back as "stop
+            # adding new intervals" — same outcome as Done from the caller's
+            # perspective.
+            return accepted if accepted else "go_back_to_calibration"
+        if sel == "remove_last":
+            if accepted:
+                dropped = accepted.pop()
+                interval_counter = max(1, interval_counter - 1)
+                print(f"Removed interval #{dropped.index}.")
+            else:
+                print("No accepted intervals to remove.")
             continue
         if not isinstance(sel, tuple):
             continue
@@ -1436,104 +1637,145 @@ def run_per_interval_flow(
             print("Empty interval; pick again.")
             continue
 
-        # Build a working DataFrame for the interval
+        # Build the per-interval state.  These are mutable across step
+        # transitions inside the inner state machine below.
         interval_df = full_frame.loc[mask, [time_col, CALIBRATED_COLUMN]].copy().reset_index(drop=True)
         interval_t = interval_df[time_col].to_numpy(dtype=float)
-        interval_y = interval_df[CALIBRATED_COLUMN].to_numpy(dtype=float)
-
-        # ── 2) Subtraction prompt ────────────────────────────────────
-        sub_choice = prompt_subtraction_choice(
-            f"Interval #{interval_counter}: [{s_t:.1f}–{e_t:.1f} s]"
-        )
+        original_y = interval_df[CALIBRATED_COLUMN].to_numpy(dtype=float)
+        interval_y = original_y.copy()
         control_subtracted = False
         control_source = None
+        fits: list[FitRecord] = []
+        delta: DeltaMaxRecord | None = None
 
-        if sub_choice == "back":
-            # Re-open the interval-selection step
-            continue
+        # ── Inner state machine: subtract → fit → delta_max → done ──
+        # Each step's "back" decrements step; each "skip" or "accept and
+        # done with step" increments step.  This is the fix for the
+        # reported bug where Back from Δmax was bouncing forward.
+        step = "subtract"
+        abort_to_pick = False  # True if user wants to bail back to interval pick
 
-        if sub_choice == "existing":
-            candidates = _discover_existing_control_intervals(
-                calibrated_dir, session_intervals, self_stem
-            )
-            picked = pick_existing_interval(candidates, filename=filename)
-            if picked is not None:
-                ct, cy = picked["load"]()
-                # zero-base the control so its first time aligns with sample's first time
-                ct_zero = ct - ct[0]
-                result = preview_per_interval_subtraction(
-                    interval_t, interval_y, ct_zero, cy,
-                    filename=filename, label=picked["label"],
+        while step != "done":
+            if step == "subtract":
+                sub_choice = prompt_subtraction_choice(
+                    f"Interval #{interval_counter}: [{s_t:.1f}–{e_t:.1f} s]"
                 )
-                if isinstance(result, np.ndarray):
-                    interval_y = result
-                    interval_df[CALIBRATED_COLUMN] = result
-                    control_subtracted = True
-                    control_source = picked["label"]
-                elif result == "back":
-                    # Re-open subtraction-choice
-                    continue
+                if sub_choice == "back":
+                    abort_to_pick = True
+                    break
 
-        elif sub_choice == "new":
-            if new_control_callback is None:
-                print(
-                    "No callback for new-control processing was provided.  "
-                    "Falling back to Skip — process the control as a normal "
-                    "file and then choose 'Subtract existing'."
-                )
-            else:
-                picked_path = _qt_pick_control_file(
-                    calibrated_dir.parent if calibrated_dir is not None else None
-                )
-                if picked_path is not None:
-                    template = new_control_callback(picked_path)
-                    if template is not None:
-                        ct, cy = template
+                # Reset subtraction state on each entry so re-visiting via
+                # Back from fits gets a clean slate.
+                control_subtracted = False
+                control_source = None
+                interval_y = original_y.copy()
+                interval_df[CALIBRATED_COLUMN] = interval_y
+
+                if sub_choice == "existing":
+                    candidates = _discover_existing_control_intervals(
+                        calibrated_dir, session_intervals, self_stem
+                    )
+                    picked = pick_existing_interval(candidates, filename=filename)
+                    if picked is not None:
+                        ct, cy = picked["load"]()
                         ct_zero = ct - ct[0]
                         result = preview_per_interval_subtraction(
                             interval_t, interval_y, ct_zero, cy,
-                            filename=filename, label=f"new: {picked_path.name}",
+                            filename=filename, label=picked["label"],
                         )
                         if isinstance(result, np.ndarray):
                             interval_y = result
                             interval_df[CALIBRATED_COLUMN] = result
                             control_subtracted = True
-                            control_source = f"new: {picked_path.name}"
+                            control_source = picked["label"]
                         elif result == "back":
+                            # stay on subtract step; re-open the choice
                             continue
 
-        # ── 3) Multi-fit loop ────────────────────────────────────────
-        fits: list[FitRecord] = []
-        fit_index = 1
-        while True:
-            print(f"\nFitting interval #{interval_counter} — fit #{fit_index}")
-            res = prompt_one_fit(
-                interval_t, interval_y,
-                filename=filename, fit_index=fit_index,
-            )
-            if isinstance(res, FitRecord):
-                fits.append(res)
-                print(f"  ✓ Fit #{fit_index} ({res.model}) accepted.")
-                if not _ask_another("Apply another fit to this interval?"):
-                    break
-                fit_index += 1
-                continue
-            if res == "skip":
-                print("  → fit skipped.")
-                break
-            if res == "retry":
-                continue
-            if res == "back":
-                # Back from fitting → revisit subtraction (re-open whole prompt)
-                fits.clear()
-                break
+                elif sub_choice == "new":
+                    if new_control_callback is None:
+                        print(
+                            "No callback for new-control processing was provided.  "
+                            "Falling back to Skip — process the control as a normal "
+                            "file and then choose 'Subtract existing'."
+                        )
+                    else:
+                        picked_path = _qt_pick_control_file(
+                            calibrated_dir.parent if calibrated_dir is not None else None
+                        )
+                        if picked_path is not None:
+                            template = new_control_callback(picked_path)
+                            if template is not None:
+                                ct, cy = template
+                                ct_zero = ct - ct[0]
+                                result = preview_per_interval_subtraction(
+                                    interval_t, interval_y, ct_zero, cy,
+                                    filename=filename, label=f"new: {picked_path.name}",
+                                )
+                                if isinstance(result, np.ndarray):
+                                    interval_y = result
+                                    interval_df[CALIBRATED_COLUMN] = result
+                                    control_subtracted = True
+                                    control_source = f"new: {picked_path.name}"
+                                elif result == "back":
+                                    continue
 
-        # ── 4) Δmax (one per interval, optional) ─────────────────────
-        delta = None
-        dres = prompt_delta_max(interval_t, interval_y, fits, filename=filename)
-        if isinstance(dres, DeltaMaxRecord):
-            delta = dres
-            print(f"  ✓ Δmax recorded ({delta.method}: {delta.value_uM:.4f} µM)")
+                step = "fit"
+                continue
+
+            elif step == "fit":
+                fit_index = len(fits) + 1
+                print(f"\nFitting interval #{interval_counter} — fit #{fit_index}")
+                res = prompt_one_fit(
+                    interval_t, interval_y,
+                    filename=filename, fit_index=fit_index,
+                    existing_fits=fits,
+                )
+                if isinstance(res, FitRecord):
+                    fits.append(res)
+                    print(f"  ✓ Fit #{fit_index} ({res.model}) accepted.")
+                    if not _ask_another("Apply another fit to this interval?"):
+                        step = "delta_max"
+                    # else: stay on "fit" for the next fit
+                    continue
+                if res == "skip":
+                    print("  → fit skipped.")
+                    step = "delta_max"
+                    continue
+                if res == "retry":
+                    continue
+                if res == "back":
+                    # Back from fitting → revisit subtraction (preserves
+                    # any fits the user already added so they're not lost)
+                    step = "subtract"
+                    continue
+                # Fallback
+                step = "delta_max"
+
+            elif step == "delta_max":
+                dres = prompt_delta_max(
+                    interval_t, interval_y, fits,
+                    filename=filename,
+                )
+                if isinstance(dres, DeltaMaxRecord):
+                    delta = dres
+                    print(f"  ✓ Δmax recorded ({delta.method}: {delta.value_uM:.4f} µM)")
+                    step = "done"
+                    continue
+                if dres == "skip":
+                    delta = None
+                    step = "done"
+                    continue
+                if dres == "back":
+                    # Back from Δmax → revisit fitting (don't clear existing
+                    # fits; user can add another or accept what's there).
+                    step = "fit"
+                    continue
+                # Fallback
+                step = "done"
+
+        if abort_to_pick:
+            continue
 
         accepted.append(ProcessedInterval(
             index=interval_counter,
@@ -1547,9 +1789,8 @@ def run_per_interval_flow(
             delta_max=delta,
         ))
         interval_counter += 1
-
-        if not _ask_another("Define another interval?"):
-            break
+        # No "Define another interval?" yes/no popup — the picker has its own
+        # "Done with intervals" button, which is more direct.
 
     return accepted
 
