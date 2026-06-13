@@ -673,51 +673,8 @@ def preview_per_interval_subtraction(
 
 
 # ────────────────────────────────────────────────────────────────────────
-# UI: one fit (model picker → fit-range → preview → back-extrap)
+# UI: one fit — single-pane (model + range + fit + back-extrap all together)
 # ────────────────────────────────────────────────────────────────────────
-
-
-def _pick_model() -> str | None:
-    """Small dialog to choose one of the three offered models."""
-    fig, ax = plt.subplots(figsize=(8, 3.4))
-    try:
-        fig.canvas.manager.set_window_title("SensorFit — Pick a fit model")
-    except Exception:
-        pass
-    ax.axis("off")
-    ax.text(
-        0.5, 0.62,
-        "Choose a model to fit to this interval:\n\n"
-        "• Manual linear — a straight-line fit on a user-picked range.\n"
-        "• Single exponential — robust exp + linear background (Exponential).\n"
-        "• Inactivation (IB) — full inactivation kinetic model.",
-        ha="center", va="center", fontsize=10,
-    )
-    fig.suptitle("Pick a fit model", fontsize=11, fontweight="bold")
-    pick = {"value": None}
-
-    def _set(v):
-        def _f(_e=None):
-            pick["value"] = v
-            plt.close(fig)
-        return _f
-
-    ax_lin = fig.add_axes([0.08, 0.10, 0.22, 0.16])
-    ax_exp = fig.add_axes([0.32, 0.10, 0.22, 0.16])
-    ax_ib = fig.add_axes([0.56, 0.10, 0.22, 0.16])
-    ax_back = fig.add_axes([0.80, 0.10, 0.14, 0.16])
-    btn_lin = create_small_button(ax_lin, "Manual linear", "#90ee90", "#7cd47c")
-    btn_exp = create_small_button(ax_exp, "Single exp", "#ffe680", "#ffcd55")
-    btn_ib = create_small_button(ax_ib, "Inactivation", "#ffcc99", "#ffaa66")
-    btn_back = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
-    btn_lin.on_clicked(_set("ManualLinear"))
-    btn_exp.on_clicked(_set("Exponential"))
-    btn_ib.on_clicked(_set("IB"))
-    btn_back.on_clicked(_set("back"))
-
-    plt.show()
-    plt.close(fig)
-    return pick["value"]
 
 
 def _run_fit(
@@ -813,297 +770,386 @@ def prompt_one_fit(
     fit_index: int = 1,
     existing_fits: "list[FitRecord] | None" = None,
 ):
-    """Drive a single fit on an interval.
+    """Drive a single fit on an interval in ONE pane.
 
-    Steps:
-      1. Pick model (ManualLinear / Exponential / IB / Back).
-      2. Click fit start + end inside the interval.
-      3. Show fit + initial rate at start.  Accept / Retry / Back.
-      4. Optional back-extrap: deadtime TextBox, click Extrapolate, accept.
+    Replaces the previous 3-pane flow (model picker → fit-range picker →
+    preview + back-extrap) with a single screen that contains:
+
+    - the data plot (top, large) with the fitted curve overlaid in red
+    - a residuals strip below
+    - mode buttons (Manual linear | Single exp | Inactivation) at the top
+    - a "Fit" button + a stats line showing init_rate and R²
+    - actions along the bottom: Extrapolate to… | Accept fit | Retry |
+      Skip | Back
+
+    Flow:
+      1. Click twice on the data to define the fit range.  The two clicks
+         are marked green (start) and red (end).
+      2. Click a model button at the top.
+      3. Click "Fit" — the curve is drawn over the data, residuals appear
+         in the lower strip, and the init-rate + R² appear at the top.
+      4. Optionally click "Extrapolate to…" — your next click on the plot
+         picks the t-value to extrapolate to (it can be EARLIER than the
+         fit start = back-extrap, or LATER than the fit end = forward
+         extrap).  A red dotted line connects the fit to the new
+         extrapolation target, with an open red circle marking it.
+      5. Accept records the fit (with any back-extrap info).
 
     Returns:
       FitRecord — accepted (possibly with back_extrap_applied=True).
       "skip"    — user skipped this fit.
       "back"    — user wants to revisit the subtraction step.
     """
-    model = _pick_model()
-    if model is None or model == "back":
-        return "back"
-
-    # Step 2: pick fit start + end inside the interval
-    fig, ax = plt.subplots(figsize=(11, 6.5))
+    # ── Figure layout: 2-row gridspec (data : residuals = 3 : 1) ──────
+    fig = plt.figure(figsize=(11.5, 8.6))
     try:
         fig.canvas.manager.set_window_title(
-            "SensorFit — Pick fit range"
+            f"SensorFit — Fit #{fit_index}"
             + (f": {truncate_filename(filename)}" if filename else "")
         )
     except Exception:
         pass
-    plt.subplots_adjust(left=0.1, bottom=0.20, right=0.98, top=0.78)
-    ax.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
-    title = f"Fit #{fit_index} ({model}): click START then END of the fit range"
-    if filename:
-        title = f"{truncate_filename(filename)}\n{title}"
-    fig.suptitle(title, fontsize=11)
+    gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.10,
+                          left=0.10, right=0.97, top=0.66, bottom=0.16)
+    ax_data = fig.add_subplot(gs[0])
+    ax_resid = fig.add_subplot(gs[1], sharex=ax_data)
+    ax_data.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
+    ax_data.set_ylabel("H2O2 (µM)")
+    ax_resid.axhline(0.0, color="grey", lw=0.6, ls=":")
+    ax_resid.set_ylabel("residual")
+    ax_resid.set_xlabel("Time (s)")
 
     add_instruction_banner(
         fig,
-        f"Click two points inside the interval to bound the {model} fit.  "
-        "On Accept the initial rate at your start point is reported and you "
-        "may optionally back-extrapolate to find an earlier t=0.",
-        y=0.985,
-        width=110,
+        "Click twice on the plot to set the fit range; pick a model below; click Fit.  "
+        "Extrapolate then prompts a click on the plot for the target t.",
+        y=0.985, width=130,
     )
 
-    pending = {"start": None, "end": None}
-    markers: list = []
-    state = {"action": None, "fit": None}
+    # ── Controls along the top (between banner and plot) ─────────────
+    n_existing = len(existing_fits or [])
+    fig.text(
+        0.10, 0.755,
+        f"Fit #{fit_index}" + (f"  (previous fits on this interval: {n_existing})" if n_existing else ""),
+        fontsize=10, fontweight="bold",
+    )
 
-    def on_click(event):
-        if event.button != 1 or event.inaxes is not ax or event.xdata is None:
-            return
-        if getattr(fig.canvas.toolbar, "mode", "") in ("zoom rect", "pan/zoom", "zoom", "pan"):
-            return
-        t_click = float(event.xdata)
-        if pending["start"] is None:
-            pending["start"] = t_click
-            m, = ax.plot(t_click, interval_y[int(np.abs(interval_t - t_click).argmin())], "go", ms=10, zorder=5)
-            markers.append(m)
-            print(f"Fit start: t={t_click:.3f} s")
-        elif pending["end"] is None:
-            pending["end"] = t_click
-            m, = ax.plot(t_click, interval_y[int(np.abs(interval_t - t_click).argmin())], "ro", ms=10, zorder=5)
-            markers.append(m)
-            print(f"Fit end: t={t_click:.3f} s")
+    # Model picker buttons
+    ax_mlin = fig.add_axes([0.10, 0.71, 0.12, 0.04])
+    ax_mexp = fig.add_axes([0.23, 0.71, 0.12, 0.04])
+    ax_mib = fig.add_axes([0.36, 0.71, 0.12, 0.04])
+    btn_mlin = create_small_button(ax_mlin, "Manual linear", "0.85", "0.75")
+    btn_mexp = create_small_button(ax_mexp, "Single exp", "0.85", "0.75")
+    btn_mib = create_small_button(ax_mib, "Inactivation", "0.85", "0.75")
+
+    # Action buttons in the same row
+    ax_fit = fig.add_axes([0.52, 0.71, 0.08, 0.04])
+    ax_clear = fig.add_axes([0.61, 0.71, 0.10, 0.04])
+    btn_fit = create_small_button(ax_fit, "Fit", "#90ee90", "#7cd47c")
+    btn_clear = create_small_button(ax_clear, "Clear range", "0.9", "0.8")
+
+    # Stats line + status hint
+    stats_text = fig.text(
+        0.10, 0.685,
+        "Pick the fit range by clicking on the plot, then a model.",
+        fontsize=9, color="dimgrey", style="italic",
+    )
+
+    # ── State ─────────────────────────────────────────────────────────
+    mode_state = {"model": None}
+    range_state = {"clicks": [], "markers": []}
+    fit_state = {"record": None, "fit_artists": []}
+    extrap_state = {
+        "pending": False,
+        "target_t": None,
+        "new_rate": None,
+        "artists": [],
+    }
+    final = {"action": None}
+
+    # ── Helpers ───────────────────────────────────────────────────────
+    def _set_stats(msg, colour="dimgrey"):
+        stats_text.set_text(msg)
+        stats_text.set_color(colour)
         fig.canvas.draw_idle()
 
-    fig.canvas.mpl_connect("button_press_event", on_click)
+    def _update_model_buttons():
+        for m, btn in (("ManualLinear", btn_mlin), ("Exponential", btn_mexp), ("IB", btn_mib)):
+            btn.color = "#ffe680" if mode_state["model"] == m else "0.85"
+        fig.canvas.draw_idle()
 
-    def on_accept(_e=None):
-        if pending["start"] is None or pending["end"] is None:
-            print("Pick both start and end first.")
-            return
-        s, e = sorted((pending["start"], pending["end"]))
-        start_idx = int(np.abs(interval_t - s).argmin())
-        end_idx = int(np.abs(interval_t - e).argmin())
-        if end_idx <= start_idx + 1:
-            print("Fit range too narrow.")
-            return
-        try:
-            rec = _run_fit(model, interval_t, interval_y, start_idx, end_idx, init_rate_at_t=s)
-        except Exception as exc:
-            print(f"Fit failed: {exc}")
-            return
-        state["fit"] = rec
-        state["action"] = "accept"
-        plt.close(fig)
-
-    def on_retry(_e=None):
-        pending["start"] = None
-        pending["end"] = None
-        while markers:
+    def _clear_fit_artists():
+        for art in fit_state["fit_artists"]:
             try:
-                markers.pop().remove()
+                art.remove()
             except Exception:
                 pass
+        fit_state["fit_artists"].clear()
+        fit_state["record"] = None
+        ax_resid.clear()
+        ax_resid.axhline(0.0, color="grey", lw=0.6, ls=":")
+        ax_resid.set_ylabel("residual")
+        ax_resid.set_xlabel("Time (s)")
+
+    def _clear_extrap_artists():
+        for art in extrap_state["artists"]:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        extrap_state["artists"].clear()
+        extrap_state["target_t"] = None
+        extrap_state["new_rate"] = None
+        extrap_state["pending"] = False
+
+    def _clear_range():
+        for m in range_state["markers"]:
+            try:
+                m.remove()
+            except Exception:
+                pass
+        range_state["markers"].clear()
+        range_state["clicks"].clear()
+        _clear_fit_artists()
+        _clear_extrap_artists()
+        _set_stats("Pick the fit range by clicking on the plot, then a model.")
         fig.canvas.draw_idle()
-        print("Fit range cleared.")
 
-    def on_skip(_e=None):
-        state["action"] = "skip"
-        plt.close(fig)
+    def _draw_range_markers():
+        for m in range_state["markers"]:
+            try:
+                m.remove()
+            except Exception:
+                pass
+        range_state["markers"].clear()
+        clicks_sorted = sorted(range_state["clicks"])
+        if clicks_sorted:
+            idx0 = clicks_sorted[0]
+            m0, = ax_data.plot(
+                interval_t[idx0], interval_y[idx0], "o",
+                ms=12, mfc="#76d275", mec="darkgreen", mew=1.5, zorder=6,
+            )
+            range_state["markers"].append(m0)
+        if len(clicks_sorted) >= 2:
+            idx1 = clicks_sorted[-1]
+            m1, = ax_data.plot(
+                interval_t[idx1], interval_y[idx1], "o",
+                ms=12, mfc="#ff6e6e", mec="darkred", mew=1.5, zorder=6,
+            )
+            range_state["markers"].append(m1)
+        fig.canvas.draw_idle()
 
-    def on_back(_e=None):
-        state["action"] = "back"
-        plt.close(fig)
-
-    ax_accept = fig.add_axes([0.10, 0.04, 0.16, 0.05])
-    ax_retry = fig.add_axes([0.28, 0.04, 0.12, 0.05])
-    ax_skip = fig.add_axes([0.42, 0.04, 0.16, 0.05])
-    ax_back = fig.add_axes([0.60, 0.04, 0.12, 0.05])
-    _btn_accept_5 = create_small_button(ax_accept, "Accept fit-range", "#90ee90", "#7cd47c")
-    _btn_accept_5.on_clicked(on_accept)
-    _btn_retry_6 = create_small_button(ax_retry, "Retry", "0.9", "0.8")
-    _btn_retry_6.on_clicked(on_retry)
-    _btn_skip_7 = create_small_button(ax_skip, "Skip fit", "#ffcc99", "#ffaa66")
-    _btn_skip_7.on_clicked(on_skip)
-    _btn_back_8 = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
-    _btn_back_8.on_clicked(on_back)
-
-    install_zoom_keys(fig, ax)
-    plt.show()
-    plt.close(fig)
-
-    if state["action"] != "accept" or state["fit"] is None:
-        return state["action"] or "back"
-
-    fit_rec: FitRecord = state["fit"]
-
-    # Step 3: preview + offer back-extrapolation
-    return _preview_fit_with_back_extrap(
-        interval_t, interval_y, fit_rec, filename=filename, fit_index=fit_index
-    )
-
-
-def _preview_fit_with_back_extrap(
-    interval_t: np.ndarray,
-    interval_y: np.ndarray,
-    fit_rec: FitRecord,
-    filename: str | None = None,
-    fit_index: int = 1,
-):
-    """Show the fit + initial rate, and offer a back-extrap option (TextBox
-    defaulting to 1.5 s).  Accept finalises; Skip drops; Back returns.
-    """
-    fig, ax = plt.subplots(figsize=(11, 6.6))
-    try:
-        fig.canvas.manager.set_window_title(
-            "SensorFit — Fit preview / back-extrap"
-            + (f": {truncate_filename(filename)}" if filename else "")
-        )
-    except Exception:
-        pass
-    plt.subplots_adjust(left=0.1, bottom=0.22, right=0.98, top=0.78)
-    ax.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
-
-    fit_t_full = np.linspace(fit_rec.fit_start_s, fit_rec.fit_end_s, fit_rec.yhat.size)
-    line_fit, = ax.plot(fit_t_full, fit_rec.yhat, "r-", lw=1.6, label=f"{fit_rec.model} fit")
-    extrap_artists = {"line": None, "dot": None}
-
-    title = (
-        f"Fit #{fit_index} ({fit_rec.model})  init rate at t={fit_rec.init_rate_at_t_s:.2f}s "
-        f"= {fit_rec.init_rate_uM_per_s:.4f} µM/s"
-    )
-    if filename:
-        title = f"{truncate_filename(filename)}\n{title}"
-    fig.suptitle(title, fontsize=11)
-    ax.legend(loc="best", fontsize=9)
-
-    info_text = fig.text(
-        0.5, 0.15,
-        "Optional: type a target deadtime (s) and click Extrapolate to preview "
-        "a back-extrap to that earlier t=0.",
-        ha="center", fontsize=9, color="dimgrey",
-    )
-
-    deadtime_state = {"value": 1.5}
-    extrap_state = {"new_rate": None, "t_zero": None}
-
-    ax_dead = fig.add_axes([0.18, 0.08, 0.08, 0.05])
-    tb_dead = TextBox(ax_dead, "Deadtime (s) ", initial="1.5")
-
-    def on_dead_submit(text: str):
-        try:
-            v = float(text)
-            if v < 0:
-                raise ValueError
-        except ValueError:
-            print(f"Deadtime must be a non-negative number; got '{text}'.")
-            tb_dead.set_val(str(deadtime_state["value"]))
+    def _run_and_draw_fit():
+        if mode_state["model"] is None:
+            _set_stats("Pick a model first (Manual linear / Single exp / Inactivation).", "darkred")
             return
-        deadtime_state["value"] = v
+        if len(range_state["clicks"]) != 2:
+            _set_stats("Click two points on the plot to define the fit range.", "darkred")
+            return
+        i0, i1 = sorted(range_state["clicks"])
+        if i1 - i0 < 2:
+            _set_stats("Fit range too narrow; pick a wider span.", "darkred")
+            return
+        try:
+            rec = _run_fit(
+                mode_state["model"], interval_t, interval_y, i0, i1,
+                init_rate_at_t=float(interval_t[i0]),
+            )
+        except Exception as exc:
+            _set_stats(f"Fit failed: {exc}", "darkred")
+            return
 
-    tb_dead.on_submit(on_dead_submit)
+        _clear_fit_artists()
+        _clear_extrap_artists()
 
-    def _clear_extrap():
-        for k in ("line", "dot"):
-            if extrap_artists[k] is not None:
-                try:
-                    extrap_artists[k].remove()
-                except Exception:
-                    pass
-                extrap_artists[k] = None
+        t_fit = interval_t[i0 : i1 + 1]
+        y_fit = interval_y[i0 : i1 + 1]
+        line_fit, = ax_data.plot(
+            t_fit, rec.yhat, color="red", lw=1.8, label=f"{rec.model} fit", zorder=7,
+        )
+        # Tangent at start (the init-rate slope)
+        t_start = float(interval_t[i0])
+        y_start = float(rec.yhat[0])
+        slope_disp = rec.init_rate_uM_per_s
+        tangent_len = max(1.0, (interval_t[i1] - t_start) * 0.05)
+        tangent_t = np.array([t_start - tangent_len * 0.5, t_start + tangent_len * 1.5])
+        tangent_y = y_start + slope_disp * (tangent_t - t_start)
+        line_tan, = ax_data.plot(
+            tangent_t, tangent_y, color="#005700", lw=2.2, ls="-", alpha=0.9, zorder=6,
+        )
+        fit_state["fit_artists"].extend([line_fit, line_tan])
+        ax_data.legend(loc="best", fontsize=8)
 
-    def on_extrapolate(_e=None):
-        _clear_extrap()
-        dt = float(deadtime_state["value"])
-        t_zero = fit_rec.init_rate_at_t_s - dt
+        ax_resid.plot(t_fit, y_fit - rec.yhat, color="tab:blue", lw=1.0)
 
-        # Evaluate the fitted curve at t_zero (model-dependent)
-        if fit_rec.model == "ManualLinear":
-            slope, intercept = fit_rec.params
-            y_at_tz = slope * t_zero + intercept
-            new_rate = slope  # linear → rate is constant
-        elif fit_rec.model == "Exponential":
-            y_at_tz = float(model_Exponential(np.array([t_zero]), *fit_rec.params)[0])
-            a, _b, c, k_decay, t0 = fit_rec.params
-            new_rate = float(a - c * k_decay * np.exp(-k_decay * (t_zero - t0)))
-        elif fit_rec.model == "IB":
-            y_at_tz = float(model_IB(np.array([t_zero]), *fit_rec.params)[0])
-            _C, H0, alpha, kinact, kslow = fit_rec.params
+        fit_state["record"] = rec
+        r2_str = f"{rec.r2:.4f}" if np.isfinite(rec.r2) else "n/a"
+        _set_stats(
+            f"{rec.model}  init_rate = {rec.init_rate_uM_per_s:.4f} µM/s  R² = {r2_str}.  "
+            "Accept to record, or click Extrapolate to predict a different t₀.",
+            colour="#005700",
+        )
+        fig.canvas.draw_idle()
+
+    def _do_extrapolation(target_t: float):
+        rec = fit_state["record"]
+        if rec is None:
+            return
+        if rec.model == "ManualLinear":
+            slope, intercept = rec.params
+            y_at_target = slope * target_t + intercept
+            new_rate = slope
+        elif rec.model == "Exponential":
+            y_at_target = float(model_Exponential(np.array([target_t]), *rec.params)[0])
+            a, _b, c, k_decay, t0 = rec.params
+            new_rate = float(a - c * k_decay * np.exp(-k_decay * (target_t - t0)))
+        elif rec.model == "IB":
+            y_at_target = float(model_IB(np.array([target_t]), *rec.params)[0])
+            _C, H0, alpha, kinact, kslow = rec.params
             new_rate = float(
-                -H0 * alpha * kinact * np.exp(-kinact * t_zero)
-                * np.exp(-alpha * (1.0 - np.exp(-kinact * t_zero)))
+                -H0 * alpha * kinact * np.exp(-kinact * target_t)
+                * np.exp(-alpha * (1.0 - np.exp(-kinact * target_t)))
                 - kslow
             )
         else:
-            print(f"Don't know how to back-extrap {fit_rec.model}.")
             return
 
-        line, = ax.plot(
-            [t_zero, fit_rec.fit_start_s],
-            [y_at_tz, fit_rec.yhat[0]],
-            "r--", lw=1.6, alpha=0.85, label="Back-extrap",
+        _clear_extrap_artists()
+
+        t_fit_start, t_fit_end = rec.fit_start_s, rec.fit_end_s
+        if target_t < t_fit_start:
+            edge_t, edge_y = t_fit_start, float(rec.yhat[0])
+        else:
+            edge_t, edge_y = t_fit_end, float(rec.yhat[-1])
+        ln, = ax_data.plot(
+            [target_t, edge_t], [y_at_target, edge_y],
+            color="red", lw=1.6, ls=":", alpha=0.9, zorder=6,
         )
-        dot, = ax.plot([t_zero], [y_at_tz], "o", ms=12, mfc="none", mec="red", mew=2.5)
-        extrap_artists["line"] = line
-        extrap_artists["dot"] = dot
-        extrap_state["new_rate"] = new_rate
-        extrap_state["t_zero"] = t_zero
-        info_text.set_text(
-            f"Back-extrap to t={t_zero:.3f}s (deadtime={dt:.2f}s).  "
-            f"New rate at the earlier t=0: {new_rate:.4f} µM/s.  Accept to record."
+        circle, = ax_data.plot(
+            [target_t], [y_at_target], "o",
+            ms=14, mfc="none", mec="red", mew=2.5, zorder=7,
+            label="Extrap target",
         )
-        info_text.set_color("black")
-        ax.legend(loc="best", fontsize=9)
+        extrap_state["artists"].extend([ln, circle])
+        extrap_state["target_t"] = float(target_t)
+        extrap_state["new_rate"] = float(new_rate)
+        ax_data.legend(loc="best", fontsize=8)
+
+        direction = "back" if target_t < t_fit_start else "forward"
+        r2_str = f"{rec.r2:.4f}" if np.isfinite(rec.r2) else "n/a"
+        _set_stats(
+            f"{rec.model}: {direction}-extrap to t={target_t:.3f}s → new rate = {new_rate:.4f} µM/s "
+            f"(original rate at t_start = {rec.init_rate_uM_per_s:.4f}, R² = {r2_str}).",
+            colour="#005700",
+        )
         fig.canvas.draw_idle()
 
-    decision = {"value": None}
+    # ── Click handler ─────────────────────────────────────────────────
+    def on_click(event):
+        if event.button != 1 or event.inaxes is not ax_data or event.xdata is None:
+            return
+        if getattr(fig.canvas.toolbar, "mode", "") in ("zoom rect", "pan/zoom", "zoom", "pan"):
+            return
+        x = float(event.xdata)
+
+        if extrap_state["pending"]:
+            _do_extrapolation(x)
+            extrap_state["pending"] = False
+            return
+
+        idx = int(np.abs(interval_t - x).argmin())
+        if len(range_state["clicks"]) < 2:
+            range_state["clicks"].append(idx)
+            _draw_range_markers()
+            if len(range_state["clicks"]) == 1:
+                _set_stats("Now click the END of the fit range.", "dimgrey")
+            else:
+                if mode_state["model"] is None:
+                    _set_stats("Range set.  Now pick a model and click Fit.", "dimgrey")
+                else:
+                    _set_stats("Range set.  Click Fit to run the fit.", "dimgrey")
+        else:
+            _set_stats("Range already set.  Click Clear range to redo, or Fit.", "darkred")
+
+    fig.canvas.mpl_connect("button_press_event", on_click)
+
+    # ── Button handlers ───────────────────────────────────────────────
+    def _set_model(m):
+        def _f(_e=None):
+            mode_state["model"] = m
+            _update_model_buttons()
+            if len(range_state["clicks"]) == 2:
+                _set_stats(f"Model: {m}.  Click Fit.", "dimgrey")
+            else:
+                _set_stats(f"Model: {m}.  Click two points to set the fit range.", "dimgrey")
+        return _f
+
+    btn_mlin.on_clicked(_set_model("ManualLinear"))
+    btn_mexp.on_clicked(_set_model("Exponential"))
+    btn_mib.on_clicked(_set_model("IB"))
+    btn_fit.on_clicked(lambda _e=None: _run_and_draw_fit())
+    btn_clear.on_clicked(lambda _e=None: _clear_range())
+
+    def on_extrapolate(_e=None):
+        if fit_state["record"] is None:
+            _set_stats("Run a fit first, then Extrapolate.", "darkred")
+            return
+        extrap_state["pending"] = True
+        _set_stats(
+            "Click a point on the plot to extrapolate to "
+            "(earlier than fit start = back-extrap; later than fit end = forward).",
+            "dimgrey",
+        )
 
     def on_accept(_e=None):
-        decision["value"] = "accept"
+        rec = fit_state["record"]
+        if rec is None:
+            _set_stats("Run a fit first, then Accept.", "darkred")
+            return
+        if extrap_state["target_t"] is not None:
+            rec.back_extrap_applied = True
+            rec.back_extrap_deadtime_s = float(rec.fit_start_s - extrap_state["target_t"])
+            rec.back_extrap_t0_s = float(extrap_state["target_t"])
+            rec.back_extrap_rate_uM_per_s = float(extrap_state["new_rate"])
+        final["action"] = "accept"
         plt.close(fig)
 
     def on_retry(_e=None):
-        decision["value"] = "retry"
-        plt.close(fig)
+        _clear_range()
+        mode_state["model"] = None
+        _update_model_buttons()
 
     def on_skip(_e=None):
-        decision["value"] = "skip"
+        final["action"] = "skip"
         plt.close(fig)
 
     def on_back(_e=None):
-        decision["value"] = "back"
+        final["action"] = "back"
         plt.close(fig)
 
-    ax_extrapolate = fig.add_axes([0.30, 0.08, 0.14, 0.05])
-    ax_accept = fig.add_axes([0.48, 0.08, 0.14, 0.05])
-    ax_retry = fig.add_axes([0.64, 0.08, 0.10, 0.05])
-    ax_skip = fig.add_axes([0.76, 0.08, 0.10, 0.05])
-    ax_back = fig.add_axes([0.88, 0.08, 0.10, 0.05])
-    _btn_extrapolate_9 = create_small_button(ax_extrapolate, "Extrapolate", "#ffe680", "#ffcd55")
-    _btn_extrapolate_9.on_clicked(on_extrapolate)
-    _btn_accept_10 = create_small_button(ax_accept, "Accept fit", "#90ee90", "#7cd47c")
-    _btn_accept_10.on_clicked(on_accept)
-    _btn_retry_11 = create_small_button(ax_retry, "Retry", "0.9", "0.8")
-    _btn_retry_11.on_clicked(on_retry)
-    _btn_skip_12 = create_small_button(ax_skip, "Skip", "#ffcc99", "#ffaa66")
-    _btn_skip_12.on_clicked(on_skip)
-    _btn_back_13 = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
-    _btn_back_13.on_clicked(on_back)
+    ax_extrap = fig.add_axes([0.10, 0.04, 0.18, 0.05])
+    ax_accept = fig.add_axes([0.30, 0.04, 0.14, 0.05])
+    ax_retry = fig.add_axes([0.46, 0.04, 0.10, 0.05])
+    ax_skip = fig.add_axes([0.58, 0.04, 0.12, 0.05])
+    ax_back = fig.add_axes([0.72, 0.04, 0.20, 0.05])
+    btn_extrap = create_small_button(ax_extrap, "Extrapolate to…", "#ffe680", "#ffcd55")
+    btn_extrap.on_clicked(on_extrapolate)
+    btn_accept = create_small_button(ax_accept, "Accept fit", "#90ee90", "#7cd47c")
+    btn_accept.on_clicked(on_accept)
+    btn_retry = create_small_button(ax_retry, "Retry", "0.9", "0.8")
+    btn_retry.on_clicked(on_retry)
+    btn_skip = create_small_button(ax_skip, "Skip fit", "#ffcc99", "#ffaa66")
+    btn_skip.on_clicked(on_skip)
+    btn_back = create_small_button(ax_back, "Back → subtraction", "#ddddff", "#bbbbff")
+    btn_back.on_clicked(on_back)
 
-    install_zoom_keys(fig, ax)
+    install_zoom_keys(fig, [ax_data, ax_resid])
     plt.show()
     plt.close(fig)
 
-    if decision["value"] == "accept":
-        if extrap_state["new_rate"] is not None:
-            fit_rec.back_extrap_applied = True
-            fit_rec.back_extrap_deadtime_s = float(deadtime_state["value"])
-            fit_rec.back_extrap_t0_s = float(extrap_state["t_zero"])
-            fit_rec.back_extrap_rate_uM_per_s = float(extrap_state["new_rate"])
-        return fit_rec
-    return decision["value"] or "back"
+    if final["action"] == "accept" and fit_state["record"] is not None:
+        return fit_state["record"]
+    return final["action"] or "back"
 
 
 # ────────────────────────────────────────────────────────────────────────
