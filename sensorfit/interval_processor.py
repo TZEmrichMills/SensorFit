@@ -1267,17 +1267,31 @@ def prompt_delta_max(
 
     mode_state = {"mode": default_mode}
     max_uM_state = {"value": float(cal_max_uM)}
+    # Artists are tracked by category so the two Retry buttons can clear
+    # one without disturbing the other:
+    #   tz_artists       — t₀ purple cross + dashed vertical line + (in
+    #                      From-fit mode) the highlighted bold fit and
+    #                      asymptote line
+    #   baseline_artists — the baseline picks (purple circles) + Linear's
+    #                      red fit line + dotted extension + the
+    #                      horizontal dashed line at the baseline level
+    #                      (for Linear/Point modes)
+    #   span_artists     — the purple double-arrow + corner annotation
     state = {
         "t_zero_idx": None,
         "linear_clicks": [],
         "point_idx": None,
         "computed": None,
         "action": None,
-        "preview_artists": [],
+        "tz_artists": [],
+        "baseline_artists": [],
+        "span_artists": [],
         "annotation": None,
     }
 
-    # Top controls: mode buttons + cal-max TextBox
+    # Top controls: mode buttons + cal-max TextBox.  TextBox shifted right
+    # and its label placed ABOVE (not beside) to avoid colliding with the
+    # Point button.
     btn_axes = {
         "from-fit": fig.add_axes([0.10, 0.74, 0.13, 0.05]),
         "linear":   fig.add_axes([0.24, 0.74, 0.13, 0.05]),
@@ -1302,8 +1316,12 @@ def prompt_delta_max(
         ),
     }
 
-    ax_max = fig.add_axes([0.62, 0.745, 0.08, 0.04])
-    tb_max = TextBox(ax_max, "max [H₂O₂] (µM)  ", initial=f"{cal_max_uM:.2f}")
+    fig.text(
+        0.77, 0.795, "max [H₂O₂] (µM)",
+        ha="center", va="center", fontsize=9, color="dimgrey",
+    )
+    ax_max = fig.add_axes([0.72, 0.745, 0.10, 0.04])
+    tb_max = TextBox(ax_max, "", initial=f"{cal_max_uM:.2f}")
 
     if not has_usable_fit:
         fig.text(
@@ -1322,23 +1340,38 @@ def prompt_delta_max(
         status_text.set_color(colour)
         fig.canvas.draw_idle()
 
-    def _clear_preview():
-        for art in state["preview_artists"]:
+    def _remove_artists(category: str):
+        for art in state[category]:
             try:
                 art.remove()
             except Exception:
                 pass
-        state["preview_artists"].clear()
+        state[category].clear()
+
+    def _clear_span():
+        _remove_artists("span_artists")
         if state["annotation"] is not None:
             try:
                 state["annotation"].remove()
             except Exception:
                 pass
             state["annotation"] = None
+        state["computed"] = None
+
+    def _clear_t_zero():
+        _remove_artists("tz_artists")
         state["t_zero_idx"] = None
+        _clear_span()
+
+    def _clear_baseline():
+        _remove_artists("baseline_artists")
         state["linear_clicks"].clear()
         state["point_idx"] = None
-        state["computed"] = None
+        _clear_span()
+
+    def _clear_preview():
+        _clear_t_zero()
+        _clear_baseline()
         fig.canvas.draw_idle()
 
     def _set_mode(m):
@@ -1387,7 +1420,7 @@ def prompt_delta_max(
         ln = ax.axvline(
             interval_t[idx], color="#8B008B", lw=1.4, ls="--", alpha=0.85, zorder=4,
         )
-        state["preview_artists"].extend([m, ln])
+        state["tz_artists"].extend([m, ln])
         fig.canvas.draw_idle()
 
     def _draw_baseline_point(idx):
@@ -1395,7 +1428,15 @@ def prompt_delta_max(
             interval_t[idx], interval_y[idx], "o",
             ms=11, mfc="#8B008B", mec="white", mew=1.0, zorder=6,
         )
-        state["preview_artists"].append(m)
+        state["baseline_artists"].append(m)
+
+    def _draw_baseline_horizontal(y_value):
+        """Horizontal purple dashed line at the baseline y-value, so the
+        user can see what level is being measured against."""
+        hl = ax.axhline(
+            y_value, color="#8B008B", lw=1.0, ls=":", alpha=0.75, zorder=4,
+        )
+        state["baseline_artists"].append(hl)
 
     def _draw_span(t_zero, y_top, y_bot, label_text):
         arrow = ax.annotate(
@@ -1407,7 +1448,7 @@ def prompt_delta_max(
             ),
             annotation_clip=True, zorder=7,
         )
-        state["preview_artists"].append(arrow)
+        state["span_artists"].append(arrow)
 
         if state["annotation"] is not None:
             try:
@@ -1422,8 +1463,8 @@ def prompt_delta_max(
             zorder=8,
         )
 
-        # Make sure both endpoints + max_uM are visible so the arrow + box
-        # can never end up clipped.
+        # Make sure both endpoints are visible so the arrow + box can
+        # never end up clipped.
         ymin, ymax = ax.get_ylim()
         y_lo = min(y_top, y_bot)
         y_hi = max(y_top, y_bot)
@@ -1436,12 +1477,12 @@ def prompt_delta_max(
     def _highlight_fit(rec: FitRecord):
         t_fit = np.linspace(rec.fit_start_s, rec.fit_end_s, rec.yhat.size)
         ln_fit, = ax.plot(t_fit, rec.yhat, "r-", lw=2.2, zorder=6)
-        state["preview_artists"].append(ln_fit)
+        state["tz_artists"].append(ln_fit)
         xmin, xmax = float(interval_t[0]), float(interval_t[-1])
         asym_t = np.linspace(xmin, xmax, 60)
         asym_y = _model_asymptote(rec, asym_t)
         ln_asym, = ax.plot(asym_t, asym_y, color="red", lw=1.0, ls="--", alpha=0.7, zorder=5)
-        state["preview_artists"].append(ln_asym)
+        state["tz_artists"].append(ln_asym)
         fig.canvas.draw_idle()
 
     def _compute_and_preview():
@@ -1494,15 +1535,18 @@ def prompt_delta_max(
             t_seg = np.linspace(interval_t[i0], interval_t[i1], 80)
             y_seg = slope * t_seg + intercept
             ln, = ax.plot(t_seg, y_seg, "r--", lw=1.6, zorder=5)
-            state["preview_artists"].append(ln)
+            state["baseline_artists"].append(ln)
             t_low = min(t_zero, float(interval_t[i0]))
             t_high = max(t_zero, float(interval_t[i1]))
             t_ext = np.linspace(t_low, t_high, 80)
             y_ext = slope * t_ext + intercept
             ln2, = ax.plot(t_ext, y_ext, "r:", lw=1.4, zorder=5)
-            state["preview_artists"].append(ln2)
+            state["baseline_artists"].append(ln2)
 
             y_line_at_t = float(slope * t_zero + intercept)
+            # Horizontal purple dotted line at the baseline level so the
+            # user can see exactly where the span starts from.
+            _draw_baseline_horizontal(y_line_at_t)
             state["computed"] = DeltaMaxRecord(
                 method="linear", t_zero_s=t_zero, value_uM=float(delta),
                 linear_slope=slope, linear_intercept=intercept,
@@ -1521,6 +1565,9 @@ def prompt_delta_max(
                 return
             y_at_point = float(interval_y[state["point_idx"]])
             delta = delta_max_from_point(y_at_point, max_uM=max_uM)
+            # Horizontal purple dotted line through the picked point so the
+            # user sees the "remaining H₂O₂" level extended across.
+            _draw_baseline_horizontal(y_at_point)
             state["computed"] = DeltaMaxRecord(
                 method="point", t_zero_s=t_zero, value_uM=float(delta),
             )
@@ -1623,10 +1670,50 @@ def prompt_delta_max(
         state["action"] = "accept"
         plt.close(fig)
 
-    def on_retry(_e=None):
-        _clear_preview()
-        _update_status(_initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]))
-        print("Δmax cleared.")
+    def on_retry_t0(_e=None):
+        """Clear ONLY the t₀ marker + dashed line (and the From-fit
+        highlight + asymptote line), preserving any baseline picks.
+        The user can then re-click to set a new t₀ while keeping their
+        Linear / Point baseline selection."""
+        _clear_t_zero()
+        if state["linear_clicks"] or state["point_idx"] is not None:
+            _update_status(
+                "t₀ cleared.  Click on the plot to set a new t₀; "
+                "the existing baseline points are preserved.",
+                "dimgrey",
+            )
+        else:
+            _update_status(_initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]))
+        fig.canvas.draw_idle()
+        print("Δmax: t₀ cleared.")
+
+    def on_retry_baseline(_e=None):
+        """Clear ONLY the baseline picks (Linear's 2 points or Point's 1
+        point + the horizontal line), preserving the t₀ anchor.  Lets
+        the user keep t₀ and try different baseline points."""
+        _clear_baseline()
+        if mode_state["mode"] == "from-fit":
+            # From-fit has no "baseline picks" — fall back to a full reset
+            # behaviour for that mode.
+            on_retry_t0(None)
+            return
+        if state["t_zero_idx"] is not None:
+            if mode_state["mode"] == "linear":
+                _update_status(
+                    "Baseline cleared.  Click TWO new points to redefine the line "
+                    "(t₀ preserved).",
+                    "dimgrey",
+                )
+            else:  # point
+                _update_status(
+                    "Baseline cleared.  Click ONE new point representing the "
+                    "remaining-H₂O₂ level (t₀ preserved).",
+                    "dimgrey",
+                )
+        else:
+            _update_status(_initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]))
+        fig.canvas.draw_idle()
+        print("Δmax: baseline cleared.")
 
     def on_skip(_e=None):
         state["action"] = "skip"
@@ -1636,14 +1723,19 @@ def prompt_delta_max(
         state["action"] = "back"
         plt.close(fig)
 
-    ax_accept = fig.add_axes([0.12, 0.04, 0.16, 0.05])
-    ax_retry = fig.add_axes([0.30, 0.04, 0.12, 0.05])
-    ax_skip = fig.add_axes([0.44, 0.04, 0.16, 0.05])
-    ax_back = fig.add_axes([0.62, 0.04, 0.18, 0.05])
+    # Five buttons across the bottom:
+    # Accept | Retry t₀ | Retry baseline | Skip | Back
+    ax_accept = fig.add_axes([0.06, 0.04, 0.14, 0.05])
+    ax_retry_tz = fig.add_axes([0.22, 0.04, 0.14, 0.05])
+    ax_retry_base = fig.add_axes([0.38, 0.04, 0.16, 0.05])
+    ax_skip = fig.add_axes([0.56, 0.04, 0.14, 0.05])
+    ax_back = fig.add_axes([0.72, 0.04, 0.18, 0.05])
     btn_accept = create_small_button(ax_accept, "Accept Δmax", "#90ee90", "#7cd47c")
     btn_accept.on_clicked(on_accept)
-    btn_retry = create_small_button(ax_retry, "Retry", "0.9", "0.8")
-    btn_retry.on_clicked(on_retry)
+    btn_retry_tz = create_small_button(ax_retry_tz, "Retry t₀", "0.9", "0.8")
+    btn_retry_tz.on_clicked(on_retry_t0)
+    btn_retry_base = create_small_button(ax_retry_base, "Retry baseline", "0.9", "0.8")
+    btn_retry_base.on_clicked(on_retry_baseline)
     btn_skip = create_small_button(ax_skip, "Skip Δmax", "#ffcc99", "#ffaa66")
     btn_skip.on_clicked(on_skip)
     btn_back = create_small_button(ax_back, "Back → fits", "#ddddff", "#bbbbff")
