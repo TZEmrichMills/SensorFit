@@ -1028,13 +1028,26 @@ def prompt_one_fit(
 
         _clear_extrap_artists()
 
+        # Sample the actual model on a dense grid between the fit edge
+        # and the extrap target so the user sees how the curve behaves
+        # at the new t, not just a straight line to the ring.
         t_fit_start, t_fit_end = rec.fit_start_s, rec.fit_end_s
         if target_t < t_fit_start:
-            edge_t, edge_y = t_fit_start, float(rec.yhat[0])
+            t_curve = np.linspace(target_t, t_fit_start, 120)
         else:
-            edge_t, edge_y = t_fit_end, float(rec.yhat[-1])
+            t_curve = np.linspace(t_fit_end, target_t, 120)
+        if rec.model == "ManualLinear":
+            slope, intercept = rec.params
+            y_curve = slope * t_curve + intercept
+        elif rec.model == "Exponential":
+            y_curve = model_Exponential(t_curve, *rec.params)
+        elif rec.model == "IB":
+            y_curve = model_IB(t_curve, *rec.params)
+        else:
+            y_curve = np.full_like(t_curve, y_at_target, dtype=float)
+
         ln, = ax_data.plot(
-            [target_t, edge_t], [y_at_target, edge_y],
+            t_curve, y_curve,
             color="red", lw=1.6, ls=":", alpha=0.9, zorder=6,
         )
         circle, = ax_data.plot(
@@ -1047,17 +1060,19 @@ def prompt_one_fit(
         extrap_state["new_rate"] = float(new_rate)
         ax_data.legend(loc="best", fontsize=8)
 
-        # Auto-expand axes to include the extrap target so the red ring
-        # is always visible — even if it lands well above/below or
-        # outside the original interval window.
+        # Auto-expand axes to include the whole extrap curve (the swept
+        # curve may rise above or dip below the target value depending on
+        # the model and direction).
         xmin, xmax = ax_data.get_xlim()
         ymin, ymax = ax_data.get_ylim()
         x_margin = (xmax - xmin) * 0.05 or 1.0
         y_margin = (ymax - ymin) * 0.08 or 1.0
-        new_xmin = min(xmin, target_t - x_margin)
-        new_xmax = max(xmax, target_t + x_margin)
-        new_ymin = min(ymin, y_at_target - y_margin)
-        new_ymax = max(ymax, y_at_target + y_margin)
+        curve_ymin = float(np.min(y_curve))
+        curve_ymax = float(np.max(y_curve))
+        new_xmin = min(xmin, float(np.min(t_curve)) - x_margin)
+        new_xmax = max(xmax, float(np.max(t_curve)) + x_margin)
+        new_ymin = min(ymin, curve_ymin - y_margin, y_at_target - y_margin)
+        new_ymax = max(ymax, curve_ymax + y_margin, y_at_target + y_margin)
         if (new_xmin, new_xmax, new_ymin, new_ymax) != (xmin, xmax, ymin, ymax):
             ax_data.set_xlim(new_xmin, new_xmax)
             ax_data.set_ylim(new_ymin, new_ymax)
