@@ -457,12 +457,27 @@ def process_file(
                     ))
                     if pi.fits:
                         f0 = pi.fits[0]
+                        # The new per-interval flow lets the user pick a
+                        # SUB-RANGE of the interval for the fit, so
+                        # f0.yhat is shorter than pi.data.  Pad it with
+                        # NaN outside the fit range so the column writes
+                        # cleanly into save_interval_with_fits.
+                        t_interval = pi.data[pi.time_col].to_numpy(dtype=float)
+                        yhat_padded = np.full(len(t_interval), np.nan, dtype=float)
+                        in_fit = (t_interval >= f0.fit_start_s) & (t_interval <= f0.fit_end_s)
+                        if in_fit.any():
+                            fit_t_dense = np.linspace(
+                                f0.fit_start_s, f0.fit_end_s, len(f0.yhat)
+                            )
+                            yhat_padded[in_fit] = np.interp(
+                                t_interval[in_fit], fit_t_dense, np.asarray(f0.yhat, dtype=float)
+                            )
                         all_fit_results[pi.index] = {
                             f0.model: {
                                 "model": f0.model,
                                 "params": np.array(f0.params, dtype=float),
                                 "names": f0.param_names,
-                                "yhat": f0.yhat,
+                                "yhat": yhat_padded,
                                 "r2": f0.r2,
                                 "rss": f0.rss,
                                 "init_rate": f0.init_rate_uM_per_s,
