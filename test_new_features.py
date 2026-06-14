@@ -494,21 +494,31 @@ def test_delta_max_pure_helpers() -> bool:
     assert abs(delta_max_from_fit(rec_exp, 10.0) - 60.6531) < 1e-3
     print("  ✓ from_fit (Exponential) recovers c*exp(-k*Δt)")
 
-    # ── from_linear ──────────────────────────────────────────────────
-    # y = 100 - 2*t on [0, 50].  Line through indices 5..15 (t=5..15) →
-    # slope=-2, intercept=100.  At t_zero=0 the line is at 100, so with
-    # max_uM=100 → Δmax = max_uM − y_line(t_zero) = 100 − 100 = 0.
-    # With max_uM=150 and y_line(t_zero=5) = 100 − 10 = 90, Δmax = 60.
-    t_arr = np.linspace(0, 50, 51)
-    y_arr = 100.0 - 2.0 * t_arr
-    delta, slope, intercept = delta_max_from_linear(t_arr, y_arr, 5, 15, t_zero=0.0, max_uM=100.0)
-    assert abs(slope - (-2.0)) < 1e-6
-    assert abs(intercept - 100.0) < 1e-6
-    assert abs(delta - 0.0) < 1e-6
-    print("  ✓ from_linear (y=100-2t, t_zero=0, max_uM=100) → Δmax = 0")
-    delta2, _, _ = delta_max_from_linear(t_arr, y_arr, 5, 15, t_zero=5.0, max_uM=150.0)
-    assert abs(delta2 - 60.0) < 1e-6
-    print("  ✓ from_linear (y=100-2t, t_zero=5, max_uM=150) → Δmax = 60")
+    # ── from_linear (two-point API) ──────────────────────────────────
+    # Line through (t1=5, y1=90) and (t2=15, y2=70) is y = 100 − 2t.
+    # At t_zero=0 the line is at 100, so with max_uM=100 → Δmax = 0.
+    # With max_uM=150 and t_zero=5 → y_line(5)=90, Δmax=60.
+    delta, slope, intercept = delta_max_from_linear(
+        5.0, 90.0, 15.0, 70.0, t_zero=0.0, max_uM=100.0,
+    )
+    assert abs(slope - (-2.0)) < 1e-6, f"slope={slope}"
+    assert abs(intercept - 100.0) < 1e-6, f"intercept={intercept}"
+    assert abs(delta - 0.0) < 1e-6, f"delta={delta}"
+    print("  ✓ from_linear (two-point, t_zero=0, max_uM=100) → Δmax = 0")
+
+    delta2, _, _ = delta_max_from_linear(
+        5.0, 90.0, 15.0, 70.0, t_zero=5.0, max_uM=150.0,
+    )
+    assert abs(delta2 - 60.0) < 1e-6, f"delta2={delta2}"
+    print("  ✓ from_linear (two-point, t_zero=5, max_uM=150) → Δmax = 60")
+
+    # ValueError when the two points share the same t
+    try:
+        delta_max_from_linear(5.0, 1.0, 5.0, 2.0, t_zero=0.0)
+    except ValueError:
+        print("  ✓ ValueError when t1 == t2")
+    else:
+        raise AssertionError("expected ValueError for equal-t points")
 
     # ── from_point ───────────────────────────────────────────────────
     # Δmax = max_uM − y_at_tzero.  Default max_uM=100.

@@ -44,6 +44,7 @@ from .calibration import (
     CALIBRATED_COLUMN,
     IntervalSubset,
     add_instruction_banner,
+    average_window,
     create_small_button,
     truncate_filename,
 )
@@ -149,34 +150,34 @@ def delta_max_from_fit(fit: FitRecord, t_zero: float) -> float:
 
 
 def delta_max_from_linear(
-    t: np.ndarray, y: np.ndarray,
-    line_start_idx: int, line_end_idx: int,
+    t1: float, y1: float,
+    t2: float, y2: float,
     t_zero: float,
     max_uM: float = 100.0,
 ) -> tuple[float, float, float]:
-    """Δmax from a straight line fitted between two user-picked points.
+    """Δmax from a straight line through TWO user-picked points.
 
-    The straight line is a baseline / asymptote estimate (typically picked
-    from the tail of the trace).  Evaluating it at ``t_zero`` gives the
-    "remaining H₂O₂ at t₀"; Δmax is then ``max_uM − y_line(t_zero)``.
+    Each ``(t_i, y_i)`` is typically already averaged over a window of
+    samples around the user's click (so noise on individual samples
+    doesn't dominate).  The line through both is evaluated at ``t_zero``;
+    Δmax = ``max_uM − y_line(t_zero)``.
 
     Returns ``(delta_max_uM, slope, intercept_at_0)``.
     """
-    if line_end_idx <= line_start_idx + 1:
-        raise ValueError("Linear Δmax needs ≥2 points on the fit segment.")
-    t_seg = t[line_start_idx : line_end_idx + 1].astype(float)
-    y_seg = y[line_start_idx : line_end_idx + 1].astype(float)
-    slope, intercept_at_0 = np.polyfit(t_seg, y_seg, 1)
-    y_at_tzero = float(slope * t_zero + intercept_at_0)
+    if abs(t2 - t1) < 1e-12:
+        raise ValueError("Linear Δmax needs two points at different t-values.")
+    slope = (float(y2) - float(y1)) / (float(t2) - float(t1))
+    intercept_at_0 = float(y1) - slope * float(t1)
+    y_at_tzero = slope * float(t_zero) + intercept_at_0
     return float(max_uM) - y_at_tzero, float(slope), float(intercept_at_0)
 
 
 def delta_max_from_point(y_at_tzero: float, max_uM: float = 100.0) -> float:
     """Single-point Δmax: ``max_uM − y(t_zero)``.
 
-    The picked point represents the "remaining H₂O₂" level.  Δmax is the
-    distance from there up to the user-set maximum (largest calibration
-    value, defaulting to 100 µM).
+    ``y_at_tzero`` is the windowed-average of the user's click (using the
+    Δmax window size, defaulting to ±50 samples).  Δmax is the height
+    from there up to ``max_uM``.
     """
     return float(max_uM) - float(y_at_tzero)
 
@@ -1303,6 +1304,9 @@ def prompt_delta_max(
         "span_artists": [],
         "annotation": None,
     }
+    # ± window for averaging y around each baseline click, mirroring
+    # baseline/calibration screens.  Default 50 samples either side.
+    window_state = {"value": 50}
 
     # Top controls: mode buttons + cal-max TextBox.  TextBox shifted right
     # and its label placed ABOVE (not beside) to avoid colliding with the
@@ -1331,12 +1335,21 @@ def prompt_delta_max(
         ),
     }
 
+    # max-µM (the calibration max) and click-averaging window TextBoxes.
+    # Labels are placed ABOVE so they don't bleed into the Point button.
     fig.text(
-        0.77, 0.795, "max [H₂O₂] (µM)",
+        0.66, 0.795, "max [H₂O₂] (µM)",
         ha="center", va="center", fontsize=9, color="dimgrey",
     )
-    ax_max = fig.add_axes([0.72, 0.745, 0.10, 0.04])
+    ax_max = fig.add_axes([0.61, 0.745, 0.10, 0.04])
     tb_max = TextBox(ax_max, "", initial=f"{cal_max_uM:.2f}")
+
+    fig.text(
+        0.84, 0.795, "window ±",
+        ha="center", va="center", fontsize=9, color="dimgrey",
+    )
+    ax_window = fig.add_axes([0.81, 0.745, 0.06, 0.04])
+    tb_window = TextBox(ax_window, "", initial=str(window_state["value"]))
 
     if not has_usable_fit:
         fig.text(
@@ -1427,20 +1440,45 @@ def prompt_delta_max(
 
     tb_max.on_submit(_on_max_submit)
 
+    def _on_window_submit(text):
+        try:
+            v = int(float(text))
+            if v < 1:
+                raise ValueError
+        except ValueError:
+            _update_status(f"window must be a positive integer; got '{text}'.", "darkred")
+            tb_window.set_val(str(window_state["value"]))
+            return
+        window_state["value"] = v
+        # Re-run the computation with the new window so baseline
+        # averages update immediately.
+        if state["t_zero_idx"] is not None:
+            _replay_after_max_change()
+        else:
+            _update_status(_initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]))
+
+    tb_window.on_submit(_on_window_submit)
+
+    def _avg_y(idx: int) -> float:
+        """Windowed average of interval_y around the given index."""
+        return float(average_window(interval_y, idx, window_state["value"]))
+
     def _draw_t_zero_marker(idx):
-        m, = ax.plot(
-            interval_t[idx], interval_y[idx], "P",
-            ms=14, color="#8B008B", mec="white", mew=1.0, zorder=6,
-        )
+        # Just a vertical dashed line at t₀.  The y-value of the click
+        # doesn't matter for any of the calculations, so no cross is
+        # needed (and the cross was visually noisy).
         ln = ax.axvline(
-            interval_t[idx], color="#8B008B", lw=1.4, ls="--", alpha=0.85, zorder=4,
+            interval_t[idx], color="#8B008B", lw=1.6, ls="--", alpha=0.9, zorder=4,
         )
-        state["tz_artists"].extend([m, ln])
+        state["tz_artists"].append(ln)
         fig.canvas.draw_idle()
 
     def _draw_baseline_point(idx):
+        # Marker sits at the WINDOWED-AVERAGE y so the user can see what
+        # value is actually being used in the calculation.
+        y_avg = _avg_y(idx)
         m, = ax.plot(
-            interval_t[idx], interval_y[idx], "o",
+            interval_t[idx], y_avg, "o",
             ms=11, mfc="#8B008B", mec="white", mew=1.0, zorder=6,
         )
         state["baseline_artists"].append(m)
@@ -1540,9 +1578,15 @@ def prompt_delta_max(
             if len(state["linear_clicks"]) != 2:
                 return
             i0, i1 = sorted(state["linear_clicks"])
+            # Use windowed averages around each click so individual-sample
+            # noise doesn't dominate the line direction.
+            y0_avg = _avg_y(i0)
+            y1_avg = _avg_y(i1)
             try:
                 delta, slope, intercept = delta_max_from_linear(
-                    interval_t, interval_y, i0, i1, t_zero, max_uM=max_uM,
+                    float(interval_t[i0]), y0_avg,
+                    float(interval_t[i1]), y1_avg,
+                    t_zero, max_uM=max_uM,
                 )
             except ValueError as exc:
                 _update_status(f"Linear Δmax: {exc}", "darkred")
@@ -1578,7 +1622,9 @@ def prompt_delta_max(
         elif mode_state["mode"] == "point":
             if state["point_idx"] is None:
                 return
-            y_at_point = float(interval_y[state["point_idx"]])
+            # Use the windowed average around the click so single-sample
+            # noise doesn't skew Δmax.
+            y_at_point = _avg_y(state["point_idx"])
             delta = delta_max_from_point(y_at_point, max_uM=max_uM)
             # Horizontal purple dotted line through the picked point so the
             # user sees the "remaining H₂O₂" level extended across.
