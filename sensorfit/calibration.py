@@ -524,13 +524,12 @@ def select_baseline(
         if action == "redraw":
             continue
         if action == "skip":
+            # Skip the Step-2 review entirely — no baseline to confirm.
             print(
                 "\nBaseline selection skipped by user. "
                 "Proceeding with raw signal as baseline-corrected data."
             )
-            corrected_signal = signal_values.copy()
-            baseline_meta: tuple[float, float] | dict = (0.0, 0.0)
-            break
+            return signal_values.copy(), (0.0, 0.0)
 
         if action == "continue":
             if mode_state["mode"] == "line":
@@ -714,6 +713,67 @@ def _fit_back_extrap_calibration_exponential(
     return t, fit_y, extrap_t, extrap_y, extrap_value
 
 
+def _draw_standard_calibration_icon(ax_icon) -> None:
+    """Tiny "ladder" illustration: a stepped trace descending through a
+    series of plateaus with a red dot on each plateau midpoint, evoking
+    a [H₂O₂] addition series."""
+    ax_icon.set_xlim(0, 10)
+    ax_icon.set_ylim(-0.5, 10.5)
+    # Stepped descent (a typical raw-current trace as H₂O₂ aliquots are added)
+    x_steps = [0.5, 2.0, 2.0, 4.0, 4.0, 6.0, 6.0, 8.0, 8.0, 9.5]
+    y_steps = [8.7, 8.7, 6.5, 6.5, 4.3, 4.3, 2.3, 2.3, 0.6, 0.6]
+    ax_icon.plot(x_steps, y_steps, "-", color="#1f77b4", lw=1.3)
+    # Red dots on each plateau midpoint (the calibration clicks).
+    ax_icon.plot(
+        [1.25, 3.0, 5.0, 7.0, 8.75],
+        [8.7, 6.5, 4.3, 2.3, 0.6],
+        "o", color="red", ms=2.5, zorder=5,
+    )
+    ax_icon.set_xticks([])
+    ax_icon.set_yticks([])
+    for spine in ax_icon.spines.values():
+        spine.set_visible(False)
+
+
+def _draw_back_extrap_calibration_icon(ax_icon) -> None:
+    """Tiny illustration of a back-extrapolation: a vertical dashed
+    purple line at the assumed injection t, a noisy "deadtime" region
+    just after, a clean exponential decay from then on, and a red
+    dashed back-extrapolation of the fit meeting the vertical line at
+    a red open circle.  Mirrors the new "click 2 = vertical line"
+    behaviour."""
+    ax_icon.set_xlim(0, 10)
+    ax_icon.set_ylim(-0.5, 10.5)
+    # Pre-injection baseline
+    ax_icon.plot([0.0, 1.5], [1.0, 1.0], color="#1f77b4", lw=1.3)
+    # Vertical dashed purple line at the injection time (this is the
+    # click-2 in real flow: "t([H₂O₂]max)").
+    inj_t = 1.5
+    ax_icon.axvline(inj_t, color="#8B008B", lw=1.0, ls="--", alpha=0.85)
+    # Sharp spike + brief deadtime noise
+    np.random.seed(7)
+    t_dead = np.linspace(inj_t, inj_t + 1.0, 8)
+    y_dead = 8.0 + np.random.uniform(-1.2, 1.0, 8)
+    y_dead[0] = 9.0
+    ax_icon.plot([inj_t, inj_t], [1.0, 9.0], color="#1f77b4", lw=1.3)
+    ax_icon.plot(t_dead, y_dead, color="#1f77b4", lw=1.0, alpha=0.7)
+    # Clean exponential decay after the deadtime
+    t_clean = np.linspace(inj_t + 1.0, 9.5, 30)
+    y_clean = 1.2 + 7.6 * np.exp(-0.40 * (t_clean - (inj_t + 1.0)))
+    ax_icon.plot(t_clean, y_clean, color="#1f77b4", lw=1.3)
+    # Back-extrapolation of the fit from end-of-deadtime BACK to the
+    # injection vertical line.
+    t_extrap = np.linspace(inj_t, inj_t + 1.0, 12)
+    y_extrap = 1.2 + 7.6 * np.exp(-0.40 * (t_extrap - (inj_t + 1.0)))
+    ax_icon.plot(t_extrap, y_extrap, "--", color="red", lw=1.5)
+    # Open red circle at the back-extrap target
+    ax_icon.plot([inj_t], [y_extrap[0]], "o", mfc="none", mec="red", mew=1.5, ms=5)
+    ax_icon.set_xticks([])
+    ax_icon.set_yticks([])
+    for spine in ax_icon.spines.values():
+        spine.set_visible(False)
+
+
 def select_points(
     time_values: np.ndarray,
     signal_values: np.ndarray,
@@ -761,7 +821,14 @@ def select_points(
 
     # Use a mutable container for num_points so it can be updated
     num_points_ref = {"value": num_points}
-    current_window = {"value": int(window)}
+    # Per-mode default windows.  The CLI --window value is intentionally
+    # NOT used here — calibration plateau picks need a wider window
+    # (Standard mode default ±40 samples) while back-extrap clicks need
+    # the exact sample at the click (±0).  The user can still edit the
+    # TextBox to override.
+    STANDARD_DEFAULT_WINDOW = 40
+    BACK_EXTRAP_DEFAULT_WINDOW = 0
+    current_window = {"value": STANDARD_DEFAULT_WINDOW}
 
     state = {
         "calibration_values": current_calibration_values.copy(),
@@ -785,6 +852,14 @@ def select_points(
     btn_mode_std = create_small_button(ax_mode_std, "Standard", "#90ee90", "#7cd47c")
     btn_mode_be = create_small_button(ax_mode_be, "Back-extrap (4-pt)", "0.85", "0.75")
     tb_window = TextBox(ax_window, "Window ±", initial=str(current_window["value"]))
+
+    # ── Tiny illustration axes above each mode button (logo-style hints
+    # at what each mode is for).  Drawn after the button so it sits on
+    # top in the z-order; click events on the button itself still fire.
+    ax_icon_std = fig.add_axes([0.05, 0.91, 0.12, 0.05])
+    ax_icon_be = fig.add_axes([0.18, 0.91, 0.14, 0.05])
+    _draw_standard_calibration_icon(ax_icon_std)
+    _draw_back_extrap_calibration_icon(ax_icon_be)
 
     BACK_EXTRAP_ROLES = ["[H₂O₂]=0", "t([H₂O₂]max)", "fit-start", "fit-end"]
     BACK_EXTRAP_COLORS = ["gold", "darkorange", "tab:blue", "tab:blue"]
@@ -910,13 +985,26 @@ def select_points(
         selected_indices.append(idx)
 
         if mode_state["mode"] == "back_extrap":
-            colour = BACK_EXTRAP_COLORS[len(selected_indices) - 1]
-            role = BACK_EXTRAP_ROLES[len(selected_indices) - 1]
-            marker, = ax.plot(
-                time_values[idx], signal_values[idx],
-                "o", ms=12, mfc=colour, mec="black", mew=1.5, zorder=5,
-                label=f"{role}",
-            )
+            n_clicks = len(selected_indices)  # 1, 2, 3, 4
+            role = BACK_EXTRAP_ROLES[n_clicks - 1]
+            if n_clicks == 2:
+                # The t([H₂O₂]max) click — ONLY the x-value matters
+                # (it's used as the extrapolation target time).  The
+                # y-value can sit inside the deadtime and so is unreliable.
+                # Draw a vertical dashed line at the click's t instead of
+                # a circle.
+                marker = ax.axvline(
+                    time_values[idx], color="darkorange",
+                    lw=1.8, ls="--", alpha=0.9, zorder=5,
+                    label=role,
+                )
+            else:
+                colour = BACK_EXTRAP_COLORS[n_clicks - 1]
+                marker, = ax.plot(
+                    time_values[idx], signal_values[idx],
+                    "o", ms=12, mfc=colour, mec="black", mew=1.5, zorder=5,
+                    label=role,
+                )
         else:
             marker, = ax.plot(
                 time_values[idx],
@@ -941,9 +1029,14 @@ def select_points(
         mode_state["mode"] = "standard"
         btn_mode_std.color = "#90ee90"
         btn_mode_be.color = "0.85"
-        # Reset state when switching modes
+        # Reset state + restore the mode's default window (user can edit).
         on_retry(None)
-        print("Calibration mode → Standard (N-point)")
+        current_window["value"] = STANDARD_DEFAULT_WINDOW
+        tb_window.set_val(str(STANDARD_DEFAULT_WINDOW))
+        print(
+            f"Calibration mode → Standard (N-point).  "
+            f"Window reset to ±{STANDARD_DEFAULT_WINDOW} (editable)."
+        )
 
     def on_mode_back_extrap(_event=None) -> None:
         if mode_state["mode"] == "back_extrap":
@@ -952,7 +1045,12 @@ def select_points(
         btn_mode_std.color = "0.85"
         btn_mode_be.color = "#90ee90"
         on_retry(None)
-        print("Calibration mode → Back-extrap (4-pt)")
+        current_window["value"] = BACK_EXTRAP_DEFAULT_WINDOW
+        tb_window.set_val(str(BACK_EXTRAP_DEFAULT_WINDOW))
+        print(
+            f"Calibration mode → Back-extrap (4-pt).  "
+            f"Window reset to ±{BACK_EXTRAP_DEFAULT_WINDOW} (editable)."
+        )
         print("  Click 4 points in order: [H₂O₂]=0, t([H₂O₂]max), fit-start, fit-end.")
 
     def on_window_submit(text: str) -> None:
@@ -1042,10 +1140,9 @@ def select_points(
 
     add_instruction_banner(
         fig,
-        "Top-left: choose Standard (N-point ladder) or Back-extrap (4-pt with "
-        "exponential extrapolation).  Top-centre: window TextBox (±samples).  "
-        "Click on the plot to add points.  Buttons below: Change-values, Retry, "
-        "Go Back, Discard, Continue.",
+        "Pick mode below; click on the plot to add calibration points; "
+        "edit Window ± and press Enter to apply.",
+        y=0.985, width=140,
     )
     
     # Create buttons - adjust layout to fit "Change calibration values" button
