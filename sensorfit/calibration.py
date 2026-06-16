@@ -212,9 +212,17 @@ def truncate_filename(filename: str, max_length: int = 15) -> str:
 
 
 def average_window(signal_values: np.ndarray, center_idx: int, window: int) -> float:
-    """Average signal values around a center index."""
-    if window <= 0:
-        raise ValueError("window must be positive")
+    """Average signal values around a center index.
+
+    ``window == 0`` is a valid degenerate case: it means "no averaging —
+    return the single sample at ``center_idx``."  Used by the back-extrap
+    calibration mode where individual clicks need to pick specific
+    samples (the deadtime spike) rather than the noisy plateau average.
+    """
+    if window < 0:
+        raise ValueError("window must be non-negative")
+    if window == 0:
+        return float(signal_values[center_idx])
     half = max(window // 2, 1)
     start = max(center_idx - half, 0)
     end = min(center_idx + half + 1, signal_values.size)
@@ -443,17 +451,20 @@ def select_baseline(
             try:
                 w = int(float(text))
             except ValueError:
-                print(f"Window must be a positive integer; got '{text}'.  Keeping {current_window['value']}.")
+                print(f"Window must be a non-negative integer; got '{text}'.  Keeping {current_window['value']}.")
                 tb_window.set_val(str(current_window["value"]))
                 return
-            if w < 1:
-                print(f"Window must be ≥1; got {w}.  Keeping {current_window['value']}.")
+            if w < 0:
+                print(f"Window must be ≥0; got {w}.  Keeping {current_window['value']}.")
                 tb_window.set_val(str(current_window["value"]))
                 return
             current_window["value"] = w
             _recompute_points_from_indices()
             update_baseline_overlay()
-            print(f"Window updated to ±{w}; all existing points re-averaged.")
+            if w == 0:
+                print("Window updated to ±0; points are now the exact clicked sample.")
+            else:
+                print(f"Window updated to ±{w}; all existing points re-averaged.")
 
         btn_mode_line.on_clicked(on_mode_line)
         btn_mode_curve.on_clicked(on_mode_curve)
@@ -1119,15 +1130,18 @@ def select_points(
         try:
             w = int(float(text))
         except ValueError:
-            print(f"Window must be a positive integer; got '{text}'.")
+            print(f"Window must be a non-negative integer; got '{text}'.")
             tb_window.set_val(str(current_window["value"]))
             return
-        if w < 1:
-            print(f"Window must be ≥1.")
+        if w < 0:
+            print(f"Window must be ≥0.")
             tb_window.set_val(str(current_window["value"]))
             return
         current_window["value"] = w
-        print(f"Calibration window updated to ±{w}.")
+        if w == 0:
+            print("Calibration window updated to ±0 (single sample, no averaging).")
+        else:
+            print(f"Calibration window updated to ±{w}.")
 
     def on_continue(_event) -> None:
         target = _effective_num_points()

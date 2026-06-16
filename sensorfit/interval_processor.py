@@ -1443,10 +1443,10 @@ def prompt_delta_max(
     def _on_window_submit(text):
         try:
             v = int(float(text))
-            if v < 1:
+            if v < 0:
                 raise ValueError
         except ValueError:
-            _update_status(f"window must be a positive integer; got '{text}'.", "darkred")
+            _update_status(f"window must be a non-negative integer; got '{text}'.", "darkred")
             tb_window.set_val(str(window_state["value"]))
             return
         window_state["value"] = v
