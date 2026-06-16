@@ -854,26 +854,31 @@ def select_points(
     update_calibration_callback: Callable[[list[float], bool], None] | None = None,
     filename: str | None = None,
     window: int = 50,
-) -> tuple[list[int], list[float]] | tuple[list[int], list[float], list[float]] | str:
+) -> tuple[list[int], list[float], list[float]] | str:
     """Select calibration points interactively.
+
+    Returns a uniform 3-tuple ``(indices, calibration_values, mean_currents)``
+    in BOTH modes (or a sentinel string for discard / go-back).  The
+    ``mean_currents`` are computed with the in-screen window the user set,
+    so the caller must NOT recompute them with the CLI ``--window``.
 
     Two modes via the toggle at top-left:
 
-    - **Standard** (default): the existing N-point calibration. Pick
-      ``num_points`` points; the linear calibration is built downstream.
-      Returns ``(indices, calibration_values)``.
+    - **Standard** (default): N-point calibration.  ``mean_currents`` is the
+      windowed-average current at each picked plateau.  In-screen window
+      defaults to ±40 (``STANDARD_DEFAULT_WINDOW``), editable.
     - **Back-extrap (4-pt)**: pick 4 points in order — (1) baseline /
       [H₂O₂]=0, (2) timepoint that corresponds to peak [H₂O₂] (its
       *current* value will be back-extrapolated, so noise/deadtime here
       is fine), (3) start of the exponential-fit region, (4) end of it.
       The exponential is fit between (3) and (4) and evaluated at the
-      timepoint of click (2); that extrapolated value becomes the
-      "max-current" anchor. Returns
-      ``(indices, calibration_values, mean_currents_override)`` where
-      ``mean_currents_override`` is ``[zero_avg_current, extrap_value]``.
+      timepoint of click (2); ``mean_currents`` is then
+      ``[zero_avg_current, extrap_value]`` and ``calibration_values`` is
+      ``[zero_uM, max_uM]``.  In-screen window defaults to ±0
+      (``BACK_EXTRAP_DEFAULT_WINDOW``), editable.
 
-    A window-size TextBox at top-centre lets the user change the click
-    averaging window on the fly (default = the ``window`` kwarg).
+    The ``window`` kwarg is retained for signature compatibility but is no
+    longer used — the calibration screen uses mode-specific defaults.
     """
     fig, ax = plt.subplots(figsize=(14, 7))
     try:
@@ -1289,7 +1294,17 @@ def select_points(
     if state["action"] != "continue" or len(selected_indices) != final_num_points:
         raise RuntimeError(f"Selection incomplete or cancelled: {len(selected_indices)}/{final_num_points} points selected.")
 
-    return selected_indices, state["calibration_values"]
+    # Compute the averaged currents HERE using the in-screen window the user
+    # actually set/edited (default ±40, see STANDARD_DEFAULT_WINDOW) — NOT the
+    # CLI --window.  Returned as the 3rd element so the caller uses these
+    # directly instead of recomputing with the wrong window.  This mirrors
+    # the back-extrap branch's 3-tuple shape, so the caller can treat both
+    # modes uniformly.
+    mean_currents = [
+        average_window(signal_values, idx, current_window["value"])
+        for idx in selected_indices
+    ]
+    return selected_indices, state["calibration_values"], mean_currents
 
 
 def build_calibration(mean_currents: Sequence[float], concentrations: Sequence[float]) -> CalibrationResult:
@@ -3134,6 +3149,7 @@ def review_results(
     turnover_results: dict[int, float | None],
     filename: str | None = None,
     skip_calibration: bool = False,
+    per_interval_mode: bool = False,
 ) -> str:
     """
     Display a summary of all fits and turnover results and let the user
@@ -3145,6 +3161,14 @@ def review_results(
         When True, the "Redo baseline" and "Redo calibration" buttons are
         hidden (those phases were never run because the input was already
         calibrated [H₂O₂]).
+    per_interval_mode : bool
+        When True (the modern per-interval flow), the "Redo fitting" and
+        "Redo turnover" buttons are hidden — those phases no longer exist
+        as separate steps (fitting + Δmax happen inside the per-interval
+        loop).  "Redo intervals" re-runs the whole per-interval flow and is
+        relabelled accordingly.  Leaving these legacy buttons visible would
+        re-open the deprecated multi-model fitting UI (which still offers
+        GFI) and desync the per-fit data structures.
 
     Returns:
     --------
@@ -3207,17 +3231,22 @@ def review_results(
     # Row 1: redo buttons.  Baseline + calibration are hidden in skip-
     # calibration mode (those phases never ran).
     row1_y = 0.14
+    intervals_label = "Redo intervals & fits" if per_interval_mode else "Redo intervals"
     all_redo_labels = [
         ("Redo baseline",     "baseline",     "#d0d0ff", "#a8a8ff"),
         ("Redo calibration",  "calibration",  "#d0d0ff", "#a8a8ff"),
-        ("Redo intervals",    "intervals",    "#d0d0ff", "#a8a8ff"),
+        (intervals_label,     "intervals",    "#d0d0ff", "#a8a8ff"),
         ("Redo fitting",      "fitting",      "#d0d0ff", "#a8a8ff"),
         ("Redo turnover",     "turnover",     "#d0d0ff", "#a8a8ff"),
     ]
+    hidden_actions = set()
     if skip_calibration:
-        labels_row1 = [t for t in all_redo_labels if t[1] not in ("baseline", "calibration")]
-    else:
-        labels_row1 = all_redo_labels
+        hidden_actions |= {"baseline", "calibration"}
+    if per_interval_mode:
+        # Fitting + turnover happen inside the per-interval loop now; the
+        # legacy phase screens are deprecated.  Hide their redo buttons.
+        hidden_actions |= {"fitting", "turnover"}
+    labels_row1 = [t for t in all_redo_labels if t[1] not in hidden_actions]
     x = 0.05
     for label, action, col, hov in labels_row1:
         bax = fig.add_axes([x, row1_y, btn_w, btn_h])

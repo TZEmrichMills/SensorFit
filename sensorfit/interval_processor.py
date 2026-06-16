@@ -1858,6 +1858,7 @@ def run_per_interval_flow(
     session_intervals: list[ProcessedInterval] | None = None,
     new_control_callback=None,
     cal_max_uM: float = 100.0,
+    enable_subtraction: bool = True,
 ) -> list[ProcessedInterval] | str:
     """Drive the per-interval state machine until the user says "Done".
 
@@ -1866,6 +1867,14 @@ def run_per_interval_flow(
     the caller provides to process a new control file modal-style and return
     its reference interval.  If None, the "Subtract new" option will tell the
     user to use the grouping UI instead.
+
+    ``enable_subtraction`` — when False, the per-interval control-subtraction
+    step is skipped entirely (the flow goes interval → fit → Δmax).  Used for
+    grouped samples under ``--control-mode``, where subtraction is instead
+    handled centrally by the group-planning step (averaged within sub-groups,
+    sequential across them).  Suppressing it here prevents the file being
+    subtracted twice (once per-interval, once by group planning) and keeps the
+    original/corrected variant model intact.
 
     Returns the list of accepted ``ProcessedInterval``s, or the sentinel
     string ``"go_back_to_calibration"`` if the user asked to back out before
@@ -1932,7 +1941,10 @@ def run_per_interval_flow(
         # Each step's "back" decrements step; each "skip" or "accept and
         # done with step" increments step.  This is the fix for the
         # reported bug where Back from Δmax was bouncing forward.
-        step = "subtract"
+        # When subtraction is disabled (grouped samples under --control-mode,
+        # where the group-planning step handles subtraction centrally), the
+        # flow starts at "fit" and Back from fit bails to interval-pick.
+        step = "subtract" if enable_subtraction else "fit"
         abort_to_pick = False  # True if user wants to bail back to interval pick
 
         while step != "done":
@@ -2025,10 +2037,14 @@ def run_per_interval_flow(
                 if res == "retry":
                     continue
                 if res == "back":
-                    # Back from fitting → revisit subtraction (preserves
-                    # any fits the user already added so they're not lost)
-                    step = "subtract"
-                    continue
+                    if enable_subtraction:
+                        # Back from fitting → revisit subtraction (preserves
+                        # any fits the user already added so they're not lost)
+                        step = "subtract"
+                        continue
+                    # No subtraction step to go back to → bail to interval pick
+                    abort_to_pick = True
+                    break
                 # Fallback
                 step = "delta_max"
 

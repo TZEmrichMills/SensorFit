@@ -3,6 +3,7 @@
 import argparse
 import shutil
 import sys
+import traceback
 from pathlib import Path
 from typing import Sequence
 
@@ -45,6 +46,7 @@ from .group_planning import (
 from .interval_processor import (
     ProcessedInterval,
     run_per_interval_flow,
+    select_one_interval,
 )
 
 
@@ -123,6 +125,135 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     return parser.parse_args(argv)
+
+
+def _pad_fit_yhat(fit_record, t_interval: np.ndarray) -> np.ndarray:
+    """Project a FitRecord's yhat (which spans only the user-picked fit
+    sub-range) onto the full interval time grid, NaN outside the range.
+
+    The per-interval flow lets the user fit a sub-range, so ``yhat`` is
+    shorter than the interval.  We interpolate it onto the actual sample
+    times within [fit_start_s, fit_end_s] and leave the rest NaN so the
+    column writes cleanly into the interval Excel.
+    """
+    yhat_padded = np.full(len(t_interval), np.nan, dtype=float)
+    in_fit = (t_interval >= fit_record.fit_start_s) & (t_interval <= fit_record.fit_end_s)
+    if in_fit.any():
+        fit_t_dense = np.linspace(
+            fit_record.fit_start_s, fit_record.fit_end_s, len(fit_record.yhat)
+        )
+        yhat_padded[in_fit] = np.interp(
+            t_interval[in_fit], fit_t_dense, np.asarray(fit_record.yhat, dtype=float)
+        )
+    return yhat_padded
+
+
+def _modal_process_control(
+    path: Path,
+    *,
+    time_col_idx: int,
+    current_col_idx: int,
+    num_points: int,
+    window: int,
+    calibration_values: list[float],
+    update_calibration_callback,
+    skip_calibration: bool,
+    calibrated_dir: Path,
+    force: bool,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Process a freshly-picked control file modal-style and return its
+    chosen interval as ``(time, [H₂O₂])``.
+
+    This backs the per-interval flow's "Subtract new control alongside"
+    option.  It runs a stripped pipeline — baseline (skippable) →
+    calibration → single-interval selection — then saves the control's
+    calibrated trace and that interval under ``Calibrated/`` exactly as if
+    the file had been processed independently (so it's also available later
+    via the "Subtract existing" picker).  No fitting / Δmax / fit_summary
+    rows are written (a control template needs none).
+
+    Returns ``None`` if the user discards / cancels at any step.
+    """
+    print(f"\n[modal control] Processing {path.name} for subtraction…")
+    try:
+        frame = load_trace(path, time_col_idx, current_col_idx)
+    except Exception as exc:
+        print(f"[modal control] Could not load {path.name}: {exc}")
+        return None
+    time_col = frame.columns[0]
+    current_col = frame.columns[1]
+    time_values = frame[time_col].to_numpy(dtype=float)
+    raw = frame[current_col].to_numpy(dtype=float)
+
+    if skip_calibration:
+        frame[CALIBRATED_COLUMN] = raw.copy()
+    else:
+        # Loop so "Go Back" from calibration re-opens baseline.
+        while True:
+            signal_values = None
+            while True:
+                br = select_baseline(time_values, raw, window=20, filename=path.name)
+                if br is None:
+                    print("[modal control] Discarded at baseline.")
+                    return None
+                if br == "redraw":
+                    continue
+                signal_values, _meta = br
+                break
+            frame[current_col] = signal_values
+
+            result = select_points(
+                time_values, signal_values, num_points,
+                calibration_values, update_calibration_callback,
+                filename=path.name, window=window,
+            )
+            if result == "discard":
+                print("[modal control] Discarded at calibration.")
+                return None
+            if result == "go_back_to_baseline":
+                continue  # re-open baseline
+            indices, _vals, mean_currents = result
+            calibration = build_calibration(mean_currents, _vals)
+            frame[CALIBRATED_COLUMN] = apply_calibration(frame[current_col], calibration)
+            break
+
+    # Pick one interval as the control template.
+    sel = select_one_interval(
+        time_values, frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
+        already_defined=[], filename=f"{path.name} (control)", interval_number=1,
+    )
+    if not isinstance(sel, tuple):
+        print("[modal control] No interval selected; subtraction cancelled.")
+        return None
+    s_t, e_t = sel
+    mask = (time_values >= s_t) & (time_values <= e_t)
+    if not np.any(mask):
+        print("[modal control] Empty interval; subtraction cancelled.")
+        return None
+
+    # Save "as if processed independently": calibrated trace + interval excel.
+    calibrated_dir.mkdir(parents=True, exist_ok=True)
+    out_path = calibrated_dir / f"{path.stem}_calibrated.xlsx"
+    if not (out_path.exists() and not force):
+        try:
+            frame.to_excel(out_path, index=False)
+            print(f"[modal control] Saved calibrated trace → {out_path.name}")
+        except Exception as exc:
+            print(f"[modal control] Warning: could not save calibrated trace: {exc}")
+
+    sub_df = frame.loc[mask, [time_col, CALIBRATED_COLUMN]].copy().reset_index(drop=True)
+    interval_dir = calibrated_dir / f"{path.stem}_intervals"
+    interval_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        sub_df.to_excel(interval_dir / "interval_01.xlsx", index=False)
+        print(f"[modal control] Saved control interval → {interval_dir.name}/interval_01.xlsx")
+    except Exception as exc:
+        print(f"[modal control] Warning: could not save control interval: {exc}")
+
+    return (
+        sub_df[time_col].to_numpy(dtype=float),
+        sub_df[CALIBRATED_COLUMN].to_numpy(dtype=float),
+    )
 
 
 def _legacy_template_filename(group: "ControlGroup | None") -> str | None:
@@ -247,6 +378,9 @@ def process_file(
     # When the new per-interval flow runs we keep the full ProcessedInterval
     # list around so the save phase can emit one fit_summary row per fit.
     processed_intervals: list = []
+    # Map interval index → {unique_label: fit_dict} for ALL fits, so the
+    # per-interval Excel can carry a column per fit (not just the first).
+    excel_fits_by_index: dict = {}
 
     # In skip-calibration mode the baseline and calibration phases are bypassed
     # entirely.  The CALIBRATED_COLUMN is populated directly from the input
@@ -304,17 +438,14 @@ def process_file(
                 phase = "baseline"
                 continue
 
-            # select_points may return a 2-tuple (standard mode) or a 3-tuple
-            # (back-extrap mode, where the 3rd element overrides mean_currents).
-            if len(result) == 3:
-                indices, final_calibration_values, mean_currents_override = result
-                mean_currents = list(mean_currents_override)
-                print("Using back-extrap calibration (4-pt exponential extrapolation).")
-            else:
-                indices, final_calibration_values = result
-                mean_currents = [
-                    average_window(signal_values, idx, window) for idx in indices
-                ]
+            # select_points returns a uniform 3-tuple in BOTH modes:
+            # (indices, calibration_values, mean_currents).  The mean_currents
+            # are computed inside select_points using the in-screen window
+            # (Standard ±40 default / Back-extrap ±0 default, both editable) —
+            # so we use them directly rather than recomputing with the CLI
+            # --window (which would silently override the user's choice).
+            indices, final_calibration_values, mean_currents = result
+            mean_currents = list(mean_currents)
             current_calibration_values = final_calibration_values
             calibration = build_calibration(mean_currents, final_calibration_values)
             frame[CALIBRATED_COLUMN] = apply_calibration(frame[current_col], calibration)
@@ -412,6 +543,32 @@ def process_file(
                     cal_max_uM = 100.0
                 if not (cal_max_uM and cal_max_uM > 0):
                     cal_max_uM = 100.0
+                # Grouped samples (control_role == "sample") have their
+                # subtraction handled centrally — either by the inline
+                # control_subtract phase (legacy single-control) or by the
+                # group-planning step (multi-control, averaged/sequential).
+                # Disable the per-interval subtraction prompt for them to
+                # avoid subtracting twice.  Ungrouped files (role None) keep
+                # the per-interval picker as their subtraction mechanism.
+                _enable_sub = control_role != "sample"
+
+                # Callback for "Subtract new control alongside": run a modal
+                # baseline→calibration→one-interval pipeline on the picked
+                # file and hand back its chosen interval.
+                def _new_control_cb(picked_path: Path):
+                    return _modal_process_control(
+                        picked_path,
+                        time_col_idx=time_col_idx,
+                        current_col_idx=current_col_idx,
+                        num_points=num_points,
+                        window=window,
+                        calibration_values=current_calibration_values,
+                        update_calibration_callback=update_calibration_callback,
+                        skip_calibration=skip_calibration,
+                        calibrated_dir=calibrated_dir_for_flow,
+                        force=force,
+                    )
+
                 _pi = run_per_interval_flow(
                     time_values=time_values,
                     h2o2_values=frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
@@ -420,6 +577,8 @@ def process_file(
                     filename=path.name,
                     calibrated_dir=calibrated_dir_for_flow,
                     cal_max_uM=cal_max_uM,
+                    enable_subtraction=_enable_sub,
+                    new_control_callback=_new_control_cb,
                 )
                 if isinstance(_pi, list):
                     processed_intervals = _pi
@@ -442,11 +601,13 @@ def process_file(
                     return out_path, path, False, control_info, None
 
                 # Build legacy-shaped containers so the existing save phase
-                # can persist outputs.  Multi-fit per interval is collapsed
-                # to the first fit here; C6 will switch fit_summary to one
-                # row per (file, interval, fit_number) and use the full list.
+                # can persist outputs.  fit_summary emits one row per fit
+                # (from pi.fits); the Excel carries one column per fit (from
+                # excel_fits_by_index); all_fit_results keeps just the first
+                # fit for the legacy best-model summary columns.
                 subsets = []
-                all_fit_results = {}
+                all_fit_results = {}      # first fit only → legacy summary columns
+                excel_fits_by_index = {}  # ALL fits → per-interval Excel columns
                 turnover_results = {}
                 for pi in processed_intervals_local:
                     subsets.append(IntervalSubset(
@@ -456,28 +617,32 @@ def process_file(
                         data=pi.data,
                     ))
                     if pi.fits:
-                        f0 = pi.fits[0]
-                        # The new per-interval flow lets the user pick a
-                        # SUB-RANGE of the interval for the fit, so
-                        # f0.yhat is shorter than pi.data.  Pad it with
-                        # NaN outside the fit range so the column writes
-                        # cleanly into save_interval_with_fits.
                         t_interval = pi.data[pi.time_col].to_numpy(dtype=float)
-                        yhat_padded = np.full(len(t_interval), np.nan, dtype=float)
-                        in_fit = (t_interval >= f0.fit_start_s) & (t_interval <= f0.fit_end_s)
-                        if in_fit.any():
-                            fit_t_dense = np.linspace(
-                                f0.fit_start_s, f0.fit_end_s, len(f0.yhat)
-                            )
-                            yhat_padded[in_fit] = np.interp(
-                                t_interval[in_fit], fit_t_dense, np.asarray(f0.yhat, dtype=float)
-                            )
+                        # Build a column for EVERY fit (not just the first),
+                        # with a unique key so two fits of the same model
+                        # don't collide on the Excel column name.
+                        excel_fits: dict[str, dict] = {}
+                        for fnum, frec in enumerate(pi.fits, start=1):
+                            label = frec.model if len(pi.fits) == 1 else f"{frec.model}#{fnum}"
+                            excel_fits[label] = {
+                                "model": frec.model,
+                                "params": np.array(frec.params, dtype=float),
+                                "names": frec.param_names,
+                                "yhat": _pad_fit_yhat(frec, t_interval),
+                                "r2": frec.r2,
+                                "rss": frec.rss,
+                                "init_rate": frec.init_rate_uM_per_s,
+                            }
+                        excel_fits_by_index[pi.index] = excel_fits
+                        # Legacy summary dict keeps just the first fit (the
+                        # full per-fit detail is emitted as separate rows).
+                        f0 = pi.fits[0]
                         all_fit_results[pi.index] = {
                             f0.model: {
                                 "model": f0.model,
                                 "params": np.array(f0.params, dtype=float),
                                 "names": f0.param_names,
-                                "yhat": yhat_padded,
+                                "yhat": _pad_fit_yhat(f0, t_interval),
                                 "r2": f0.r2,
                                 "rss": f0.rss,
                                 "init_rate": f0.init_rate_uM_per_s,
@@ -641,10 +806,15 @@ def process_file(
         # PHASE: review
         # ────────────────────────────────────────────────────────
         elif phase == "review":
+            # The review screen is only reached by non-control files, which
+            # all go through the per-interval flow.  Hide the deprecated
+            # Redo-fitting / Redo-turnover buttons (they'd reopen the legacy
+            # multi-model UI and desync the per-fit data).
             decision = review_results(
                 subsets, all_fit_results, turnover_results,
                 filename=path.name,
                 skip_calibration=skip_calibration,
+                per_interval_mode=True,
             )
             if decision == "discard":
                 print(f"\nDataset {path.name} discarded at review.")
@@ -691,8 +861,12 @@ def process_file(
     for subset in subsets:
         interval_fits = all_fit_results.get(subset.index, None)
         turnover_uM = turnover_results.get(subset.index, None)
+        # The Excel gets ALL fits (one yhat/residual column each); the
+        # legacy summary still uses the first-fit dict.  Fall back to
+        # interval_fits for the control/legacy path (no per-fit detail).
+        excel_fits = excel_fits_by_index.get(subset.index, interval_fits)
         excel_path = save_interval_with_fits(
-            subset, time_col, CALIBRATED_COLUMN, interval_fits, interval_dir
+            subset, time_col, CALIBRATED_COLUMN, excel_fits, interval_dir
         )
         print(f"  Saved: {excel_path.name}")
 
@@ -1040,7 +1214,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return int(exc.code)
             except Exception as exc:
                 print(f"Failed to process control {ctrl_path}: {exc}")
-                import traceback
                 traceback.print_exc()
                 return 1
 
@@ -1059,7 +1232,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return int(exc.code)
             except Exception as exc:
                 print(f"Failed to process sample {sample_path}: {exc}")
-                import traceback
                 traceback.print_exc()
                 return 1
 
@@ -1092,7 +1264,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             return int(exc.code)
         except Exception as exc:
             print(f"Failed to process {file_path}: {exc}")
-            import traceback
             traceback.print_exc()
             return 1
 
@@ -1149,6 +1320,5 @@ def _persist_group_corrected_outputs(
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())
 

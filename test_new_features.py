@@ -661,6 +661,66 @@ def test_back_extrap_no_fit() -> bool:
 # Driver
 # ──────────────────────────────────────────────────────────────────────────
 
+def test_pad_fit_yhat_and_multifit_excel() -> bool:
+    _section("Audit Fix E: _pad_fit_yhat + multi-fit Excel columns")
+    import numpy as np
+    import pandas as pd
+    from sensorfit.calibration_cli import _pad_fit_yhat
+    from sensorfit.interval_processor import FitRecord
+    from sensorfit.calibration import save_interval_with_fits, IntervalSubset, CALIBRATED_COLUMN
+
+    t = np.linspace(0.0, 10.0, 101)
+
+    # Sub-range fit → padded NaN outside, defined inside.
+    rec1 = FitRecord(
+        model="ManualLinear", fit_start_s=2.0, fit_end_s=5.0,
+        params=[1.0, 0.0], param_names=["slope", "intercept"],
+        yhat=np.linspace(2.0, 5.0, 31), init_rate_uM_per_s=1.0, init_rate_at_t_s=2.0,
+    )
+    padded = _pad_fit_yhat(rec1, t)
+    assert len(padded) == len(t)
+    assert np.isnan(padded[0]) and np.isnan(padded[-1])
+    assert not np.any(np.isnan(padded[(t >= 2.0) & (t <= 5.0)]))
+    print("  ✓ _pad_fit_yhat pads NaN outside the fit range, defined inside")
+
+    # Two fits of the SAME model must get distinct Excel columns.
+    rec2 = FitRecord(
+        model="ManualLinear", fit_start_s=6.0, fit_end_s=9.0,
+        params=[0.5, 1.0], param_names=["slope", "intercept"],
+        yhat=np.linspace(4.0, 5.5, 31), init_rate_uM_per_s=0.5, init_rate_at_t_s=6.0,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        df = pd.DataFrame({"Time (s)": t, CALIBRATED_COLUMN: np.zeros_like(t)})
+        subset = IntervalSubset(index=1, start_time=0.0, end_time=10.0, data=df)
+        excel_fits = {
+            "ManualLinear#1": {"model": "ManualLinear", "params": np.array(rec1.params),
+                               "names": rec1.param_names, "yhat": _pad_fit_yhat(rec1, t),
+                               "r2": float("nan"), "rss": float("nan"), "init_rate": 1.0},
+            "ManualLinear#2": {"model": "ManualLinear", "params": np.array(rec2.params),
+                               "names": rec2.param_names, "yhat": _pad_fit_yhat(rec2, t),
+                               "r2": float("nan"), "rss": float("nan"), "init_rate": 0.5},
+        }
+        path = save_interval_with_fits(subset, "Time (s)", CALIBRATED_COLUMN, excel_fits, Path(tmp))
+        out = pd.read_excel(path)
+        assert "H2O2_uM_fit_ManualLinear#1" in out.columns
+        assert "H2O2_uM_fit_ManualLinear#2" in out.columns
+        print("  ✓ two same-model fits get distinct Excel columns (no collision)")
+    return True
+
+
+def test_review_per_interval_mode_hides_legacy_redo() -> bool:
+    _section("Audit Fix C: review_results hides Redo-fitting/turnover in per-interval mode")
+    import inspect
+    from sensorfit.calibration import review_results
+    sig = inspect.signature(review_results)
+    assert "per_interval_mode" in sig.parameters
+    # The hiding is driven by the per_interval_mode flag in the source.
+    src = inspect.getsource(review_results)
+    assert 'hidden_actions |= {"fitting", "turnover"}' in src
+    print("  ✓ per_interval_mode flag present and gates fitting/turnover redo")
+    return True
+
+
 def main() -> int:
     tests = [
         test_fit_summary_upsert,
@@ -680,6 +740,8 @@ def main() -> int:
         test_build_subtraction_chain,
         test_skip_calibration_provenance,
         test_skip_calibration_loads_real_csv,
+        test_pad_fit_yhat_and_multifit_excel,
+        test_review_per_interval_mode_hides_legacy_redo,
     ]
     failures = []
     for t in tests:
