@@ -713,22 +713,46 @@ def _fit_back_extrap_calibration_exponential(
     return t, fit_y, extrap_t, extrap_y, extrap_value
 
 
+_CAL_ICON_BLUE = "#1f77b4"  # raw-data colour, used in BOTH icons
+
+
 def _draw_standard_calibration_icon(ax_icon) -> None:
-    """Tiny "ladder" illustration: a stepped trace descending through a
-    series of plateaus with a red dot on each plateau midpoint, evoking
-    a [H₂O₂] addition series."""
-    ax_icon.set_xlim(0, 10)
-    ax_icon.set_ylim(-0.5, 10.5)
-    # Stepped descent (a typical raw-current trace as H₂O₂ aliquots are added)
-    x_steps = [0.5, 2.0, 2.0, 4.0, 4.0, 6.0, 6.0, 8.0, 8.0, 9.5]
-    y_steps = [8.7, 8.7, 6.5, 6.5, 4.3, 4.3, 2.3, 2.3, 0.6, 0.6]
-    ax_icon.plot(x_steps, y_steps, "-", color="#1f77b4", lw=1.3)
-    # Red dots on each plateau midpoint (the calibration clicks).
-    ax_icon.plot(
-        [1.25, 3.0, 5.0, 7.0, 8.75],
-        [8.7, 6.5, 4.3, 2.3, 0.6],
-        "o", color="red", ms=2.5, zorder=5,
-    )
+    """Tiny "ladder" illustration of a standard calibration trace.
+
+    A descending step-trace (current drops as each H₂O₂ aliquot is added)
+    with a small amount of noise on each plateau — to convey raw data
+    rather than a fit — and a red dot on each plateau midpoint marking
+    where the user would click.
+    """
+    ax_icon.set_xlim(-0.2, 10.2)
+    ax_icon.set_ylim(-0.3, 11.0)
+
+    rng = np.random.default_rng(7)
+    plateaus = [
+        (0.3, 1.8, 9.2),
+        (1.8, 3.5, 7.0),
+        (3.5, 5.5, 4.9),
+        (5.5, 7.5, 2.9),
+        (7.5, 9.7, 1.2),
+    ]
+    # Noisy plateaus + vertical drops between them
+    for i, (t_start, t_end, level) in enumerate(plateaus):
+        n = 22
+        t_seg = np.linspace(t_start, t_end, n)
+        y_seg = level + rng.uniform(-0.18, 0.18, n)
+        ax_icon.plot(t_seg, y_seg, color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85)
+        if i + 1 < len(plateaus):
+            next_level = plateaus[i + 1][2]
+            ax_icon.plot(
+                [t_end, t_end], [level, next_level],
+                color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85,
+            )
+    # Red dots on plateau midpoints (the calibration clicks)
+    for t_start, t_end, level in plateaus:
+        ax_icon.plot(
+            [(t_start + t_end) / 2], [level],
+            "o", color="red", ms=2.5, zorder=5,
+        )
     ax_icon.set_xticks([])
     ax_icon.set_yticks([])
     for spine in ax_icon.spines.values():
@@ -736,38 +760,75 @@ def _draw_standard_calibration_icon(ax_icon) -> None:
 
 
 def _draw_back_extrap_calibration_icon(ax_icon) -> None:
-    """Tiny illustration of a back-extrapolation: a vertical dashed
-    purple line at the assumed injection t, a noisy "deadtime" region
-    just after, a clean exponential decay from then on, and a red
-    dashed back-extrapolation of the fit meeting the vertical line at
-    a red open circle.  Mirrors the new "click 2 = vertical line"
-    behaviour."""
-    ax_icon.set_xlim(0, 10)
-    ax_icon.set_ylim(-0.5, 10.5)
-    # Pre-injection baseline
-    ax_icon.plot([0.0, 1.5], [1.0, 1.0], color="#1f77b4", lw=1.3)
-    # Vertical dashed purple line at the injection time (this is the
-    # click-2 in real flow: "t([H₂O₂]max)").
+    """Tiny illustration of a back-extrapolation calibration.
+
+    Shows the typical pattern of a reaction started by H₂O₂ injection:
+      - noisy baseline (small negative current)
+      - vertical dashed purple line at the injection time (this is
+        click 2 in the real flow — "t([H₂O₂]max)")
+      - a sharp DROP at injection (current goes more negative because
+        the freshly-injected H₂O₂ pulls current strongly)
+      - noisy "deadtime" briefly after the spike
+      - clean exponential recovery as H₂O₂ is consumed (current rises
+        back toward baseline)
+      - red dashed back-extrapolation of the fit going BACK across the
+        deadtime to the injection vertical line
+      - open red circle at the back-extrap target (the model's
+        prediction of where the current would have been at injection)
+    """
+    ax_icon.set_xlim(-0.2, 10.2)
+    ax_icon.set_ylim(-0.3, 11.0)
+
     inj_t = 1.5
+    baseline = 9.0
+    amp = 6.5            # current drop amplitude
+    k = 0.20             # recovery rate (mild — keeps back-extrap on-screen)
+    t_clean_start = inj_t + 1.0  # 2.5 s — end of deadtime
+
+    rng = np.random.default_rng(7)
+
+    # Pre-injection baseline (small noise)
+    n_pre = 14
+    t_pre = np.linspace(0.2, inj_t, n_pre)
+    y_pre = baseline + rng.uniform(-0.18, 0.18, n_pre)
+    ax_icon.plot(t_pre, y_pre, color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85)
+
+    # Vertical dashed purple line at injection (matches click 2 in real flow)
     ax_icon.axvline(inj_t, color="#8B008B", lw=1.0, ls="--", alpha=0.85)
-    # Sharp spike + brief deadtime noise
-    np.random.seed(7)
-    t_dead = np.linspace(inj_t, inj_t + 1.0, 8)
-    y_dead = 8.0 + np.random.uniform(-1.2, 1.0, 8)
-    y_dead[0] = 9.0
-    ax_icon.plot([inj_t, inj_t], [1.0, 9.0], color="#1f77b4", lw=1.3)
-    ax_icon.plot(t_dead, y_dead, color="#1f77b4", lw=1.0, alpha=0.7)
-    # Clean exponential decay after the deadtime
-    t_clean = np.linspace(inj_t + 1.0, 9.5, 30)
-    y_clean = 1.2 + 7.6 * np.exp(-0.40 * (t_clean - (inj_t + 1.0)))
-    ax_icon.plot(t_clean, y_clean, color="#1f77b4", lw=1.3)
-    # Back-extrapolation of the fit from end-of-deadtime BACK to the
-    # injection vertical line.
-    t_extrap = np.linspace(inj_t, inj_t + 1.0, 12)
-    y_extrap = 1.2 + 7.6 * np.exp(-0.40 * (t_extrap - (inj_t + 1.0)))
+
+    # Sharp DROP at injection (negative-going current spike)
+    spike_bottom = 1.8
+    ax_icon.plot(
+        [inj_t, inj_t], [baseline, spike_bottom],
+        color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85,
+    )
+
+    # Deadtime: very noisy briefly after the spike
+    n_dead = 14
+    t_dead = np.linspace(inj_t, t_clean_start, n_dead)
+    y_dead = spike_bottom + rng.uniform(-0.9, 0.7, n_dead)
+    y_dead[0] = spike_bottom
+    ax_icon.plot(t_dead, y_dead, color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85)
+
+    # Clean exponential recovery from t_clean_start onward (light noise)
+    n_clean = 40
+    t_clean = np.linspace(t_clean_start, 9.7, n_clean)
+    y_clean_smooth = baseline - amp * np.exp(-k * (t_clean - t_clean_start))
+    y_clean_noisy = y_clean_smooth + rng.uniform(-0.22, 0.22, n_clean)
+    ax_icon.plot(t_clean, y_clean_noisy, color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85)
+
+    # Back-extrapolation of the FIT (smooth, no noise) from t_clean_start
+    # back to inj_t
+    t_extrap = np.linspace(inj_t, t_clean_start, 15)
+    y_extrap = baseline - amp * np.exp(-k * (t_extrap - t_clean_start))
     ax_icon.plot(t_extrap, y_extrap, "--", color="red", lw=1.5)
-    # Open red circle at the back-extrap target
-    ax_icon.plot([inj_t], [y_extrap[0]], "o", mfc="none", mec="red", mew=1.5, ms=5)
+
+    # Red open circle at the back-extrap target (model prediction at
+    # injection time).  With baseline=9, amp=6.5, k=0.20 this lands
+    # around y=1.1 — well inside the (−0.3, 11) y-range.
+    ax_icon.plot([inj_t], [float(y_extrap[0])],
+                 "o", mfc="none", mec="red", mew=1.5, ms=5)
+
     ax_icon.set_xticks([])
     ax_icon.set_yticks([])
     for spine in ax_icon.spines.values():
@@ -854,10 +915,11 @@ def select_points(
     tb_window = TextBox(ax_window, "Window ±", initial=str(current_window["value"]))
 
     # ── Tiny illustration axes above each mode button (logo-style hints
-    # at what each mode is for).  Drawn after the button so it sits on
-    # top in the z-order; click events on the button itself still fire.
-    ax_icon_std = fig.add_axes([0.05, 0.91, 0.12, 0.05])
-    ax_icon_be = fig.add_axes([0.18, 0.91, 0.14, 0.05])
+    # at what each mode is for).  Sized to fit cleanly between the banner
+    # (y≈0.96 at the bottom) and the button row (y=0.90 at the top), with
+    # a small gap on each side.
+    ax_icon_std = fig.add_axes([0.05, 0.905, 0.13, 0.05])
+    ax_icon_be = fig.add_axes([0.19, 0.905, 0.15, 0.05])
     _draw_standard_calibration_icon(ax_icon_std)
     _draw_back_extrap_calibration_icon(ax_icon_be)
 
