@@ -612,6 +612,11 @@ def preview_per_interval_subtraction(
         width=110,
     )
 
+    # Autoscale only on the very first draw.  On subsequent re-anchors the
+    # user's current view (including any zoom they set to pick t carefully)
+    # is preserved — pressing 'r' resets the view if they want it back.
+    view = {"autoscaled": False}
+
     def redraw():
         shifted_t = control_t + anchor["t0"]
         interp, _ = interpolate_control_to_grid(shifted_t, control_y, sample_t)
@@ -619,9 +624,11 @@ def preview_per_interval_subtraction(
         line_corr.set_data(sample_t, sample_y - interp)
         anchor_line_top.set_xdata([anchor["t0"], anchor["t0"]])
         anchor_line_bot.set_xdata([anchor["t0"], anchor["t0"]])
-        for a in (ax_top, ax_bot):
-            a.relim()
-            a.autoscale_view()
+        if not view["autoscaled"]:
+            for a in (ax_top, ax_bot):
+                a.relim()
+                a.autoscale_view()
+            view["autoscaled"] = True
         fig.canvas.draw_idle()
 
     def on_click(event):
