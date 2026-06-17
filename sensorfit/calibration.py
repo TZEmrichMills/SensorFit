@@ -1692,7 +1692,6 @@ def append_fit_summary(
     control_subtracted: bool | None = None,
     control_group: str | None = None,
     variant: str = "original",
-    correction_meta: dict | None = None,
     calibration_skipped: bool | None = None,
     fit_number: int = 0,
     fit_record: object | None = None,
@@ -1774,14 +1773,6 @@ def append_fit_summary(
         row_data["control_group"] = str(control_group)
     if calibration_skipped is not None:
         row_data["calibration_skipped"] = bool(calibration_skipped)
-    if correction_meta is not None:
-        # Flatten the per-row correction metadata into columns
-        if "n_subgroups" in correction_meta:
-            row_data["correction_n_subgroups"] = int(correction_meta["n_subgroups"])
-        if "anchor_t0" in correction_meta:
-            row_data["correction_anchor_t0_s"] = float(correction_meta["anchor_t0"])
-        if "subgroup_descriptions" in correction_meta:
-            row_data["correction_chain"] = " | ".join(correction_meta["subgroup_descriptions"])
 
     # Add fit parameters for each model
     if fit_results:
@@ -1933,9 +1924,6 @@ def append_fit_summary(
         "calibration_skipped",
         "control_subtracted",
         "control_group",
-        "correction_n_subgroups",
-        "correction_anchor_t0_s",
-        "correction_chain",
     ]
     
     # Build ordered column list

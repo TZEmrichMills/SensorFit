@@ -1,6 +1,6 @@
 """SensorFit - A package for fitting sensor timecourse data."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .models import MODEL_FUNCS
 from .fitting import fit_IB, fit_Exponential, fit_GFI
@@ -11,23 +11,12 @@ from .calibration import (
     select_points,
     build_calibration,
     apply_calibration,
-    select_intervals,
-    build_interval_subsets,
     persist_interval_subsets,
-    interactive_interval_fitting,
 )
 from .controls import (
-    ControlGroup,
-    ControlSubgroup,
-    ControlSpec,
-    show_grouping_ui,
-    save_controls_manifest,
-    load_controls_manifest,
     save_control_template,
     load_control_template,
     interpolate_control_to_grid,
-    interactive_subtract,
-    select_control_reference_interval,
 )
 from .back_extrap import compute_back_extrap
 from .interval_processor import (
@@ -38,14 +27,6 @@ from .interval_processor import (
     delta_max_from_fit,
     delta_max_from_linear,
     delta_max_from_point,
-)
-from .group_planning import (
-    SampleState,
-    build_subtraction_chain,
-    planning_picker,
-    preview_and_apply_subtraction,
-    run_group_planning,
-    offer_refit_for_corrected_intervals,
 )
 
 __all__ = [
@@ -63,25 +44,14 @@ __all__ = [
     "select_points",
     "build_calibration",
     "apply_calibration",
-    "select_intervals",
-    "build_interval_subsets",
     "persist_interval_subsets",
-    "interactive_interval_fitting",
-    # Control-subtraction exports
-    "ControlGroup",
-    "ControlSubgroup",
-    "ControlSpec",
-    "show_grouping_ui",
-    "save_controls_manifest",
-    "load_controls_manifest",
+    # Control-template helpers (reused by per-interval subtraction)
     "save_control_template",
     "load_control_template",
     "interpolate_control_to_grid",
-    "interactive_subtract",
-    "select_control_reference_interval",
-    # Back-extrapolation (math only; standalone UI removed)
+    # Back-extrapolation (math only)
     "compute_back_extrap",
-    # Per-interval processor (replaces standalone fitting + turnover phases)
+    # Per-interval processor (the single processing flow)
     "ProcessedInterval",
     "FitRecord",
     "DeltaMaxRecord",
@@ -89,11 +59,4 @@ __all__ = [
     "delta_max_from_fit",
     "delta_max_from_linear",
     "delta_max_from_point",
-    # Group-planning exports
-    "SampleState",
-    "build_subtraction_chain",
-    "planning_picker",
-    "preview_and_apply_subtraction",
-    "run_group_planning",
-    "offer_refit_for_corrected_intervals",
 ]

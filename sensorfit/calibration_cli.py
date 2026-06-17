@@ -12,36 +12,15 @@ import numpy as np
 from .calibration import (
     apply_calibration,
     append_fit_summary,
-    average_window,
     build_calibration,
-    build_interval_subsets,
     CALIBRATED_COLUMN,
-    calculate_turnover_before_inactivation,
-    get_model_display_name,
-    interactive_interval_fitting,
     IntervalSubset,
     load_trace,
     persist_interval_subsets,
     review_results,
     save_interval_with_fits,
     select_baseline,
-    select_intervals,
     select_points,
-)
-from .controls import (
-    ControlGroup,
-    interactive_subtract,
-    load_control_template,
-    load_controls_manifest,
-    save_control_template,
-    save_controls_manifest,
-    select_control_reference_interval,
-    show_grouping_ui,
-)
-from .group_planning import (
-    SampleState,
-    offer_refit_for_corrected_intervals,
-    run_group_planning,
 )
 from .interval_processor import (
     ProcessedInterval,
@@ -104,15 +83,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Overwrite output files if they already exist",
-    )
-    parser.add_argument(
-        "--control-mode",
-        action="store_true",
-        help=(
-            "Open the control-grouping UI at session start so a 'no-enzyme' (or other) "
-            "control trace can be subtracted from selected samples.  Auto-enabled if "
-            "Calibrated/controls.json already exists from a prior session."
-        ),
     )
     parser.add_argument(
         "--skip-calibration",
@@ -256,22 +226,6 @@ def _modal_process_control(
     )
 
 
-def _legacy_template_filename(group: "ControlGroup | None") -> str | None:
-    """Single-subgroup, single-control legacy shim.
-
-    For groups built before the multi-control restructure (or for new groups
-    that happen to contain exactly one sub-group with one control) we still
-    use the simple inline `control_subtract` phase inside ``process_file``.
-    This helper extracts the one template name; returns None if the group
-    has zero or multiple controls.
-    """
-    if group is None or not group.subgroups:
-        return None
-    if len(group.subgroups) != 1 or len(group.subgroups[0].controls) != 1:
-        return None
-    return group.subgroups[0].controls[0].template_filename
-
-
 def parse_calibration_values(arg: str, num_points: int) -> list[float]:
     """Parse calibration values from string."""
     if not arg.strip():
@@ -296,31 +250,21 @@ def process_file(
     update_calibration_callback,
     force: bool,
     summary_path: Path,
-    control_role: str | None = None,
-    control_group: "ControlGroup | None" = None,
     calibrated_dir: Path | None = None,
     skip_calibration: bool = False,
-) -> tuple[Path | None, Path, bool, "dict | None"]:
+) -> tuple[Path | None, Path, bool]:
     """Process a single file through a phase-based state machine.
 
-    Phases: baseline → calibration → [control_subtract] → intervals → fitting →
-    turnover → review → save.  Every phase can navigate backwards to the
-    previous phase, and the review screen can jump to any earlier phase.  File
-    I/O is deferred until the review screen is accepted.
+    Phases: baseline → calibration → intervals (per-interval loop) → review
+    → save.  Per-interval control subtraction, fitting and Δmax all happen
+    inside the per-interval loop (run_per_interval_flow).  File I/O is
+    deferred until the review screen is accepted.
 
     Parameters
     ----------
-    control_role : "control" | "sample" | None
-        If "control", after interval selection the user is asked which interval
-        is the subtraction reference, and the reference is saved as a control
-        template.  If "sample", after calibration the user is shown the control
-        template aligned to the sample and can choose to subtract.  None means
-        the file is processed normally.
-    control_group : ControlGroup | None
-        Required when control_role is set; carries the group name, the control
-        file, and (for samples) the path to the already-saved control template.
     calibrated_dir : Path | None
-        Where the Calibrated/ folder lives.  Required for control templates.
+        Where the Calibrated/ folder lives.  Used for discovering existing
+        control intervals (for per-interval subtraction) and saving outputs.
     skip_calibration : bool
         If True, treat ``current_col_idx`` as the already-calibrated [H₂O₂]
         column (µM).  Baseline and calibration phases are skipped entirely
@@ -330,10 +274,7 @@ def process_file(
 
     Returns
     -------
-    (out_path, original_path, has_fits, control_info)
-        ``control_info`` is None for ungrouped files; for samples it is
-        ``{"subtracted": bool, "group": str}``; for controls it carries the
-        chosen reference interval index.
+    (out_path, original_path, has_fits)
     """
     print(f"\nProcessing {path}")
     frame = load_trace(path, time_col_idx, current_col_idx)
@@ -369,17 +310,13 @@ def process_file(
     signal_values = None
     calibration = None
     current_calibration_values = calibration_values
-    intervals = None
     subsets = None
     all_fit_results: dict[int, dict[str, dict]] = {}
     turnover_results: dict[int, float | None] = {}
-    control_subtracted = False
-    control_info: dict | None = None
-    # When the new per-interval flow runs we keep the full ProcessedInterval
-    # list around so the save phase can emit one fit_summary row per fit.
+    # The per-interval flow keeps the full ProcessedInterval list so the
+    # save phase can emit one fit_summary row per fit and one Excel column
+    # per fit.
     processed_intervals: list = []
-    # Map interval index → {unique_label: fit_dict} for ALL fits, so the
-    # per-interval Excel can carry a column per fit (not just the first).
     excel_fits_by_index: dict = {}
 
     # In skip-calibration mode the baseline and calibration phases are bypassed
@@ -403,13 +340,11 @@ def process_file(
                 )
                 if baseline_result is None:
                     print(f"Dataset {path.name} discarded by user.")
-                    return None, path, False, control_info, None
+                    return None, path, False
                 if baseline_result == "redraw":
                     continue
-                # baseline_result is (corrected_signal, meta) where meta is
-                # either (slope, intercept) for line mode or a dict for curve.
-                # We only need the corrected signal here; the metadata isn't
-                # persisted anywhere downstream yet.
+                # baseline_result is (corrected_signal, meta); only the
+                # corrected signal is needed downstream.
                 signal_values, _baseline_meta = baseline_result
                 frame[current_col] = signal_values
                 break
@@ -432,18 +367,15 @@ def process_file(
             )
             if result == "discard":
                 print(f"\nDataset {path.name} discarded during calibration.")
-                return None, path, False, control_info, None
+                return None, path, False
             if result == "go_back_to_baseline":
                 print("\nReturning to baseline selection...")
                 phase = "baseline"
                 continue
 
             # select_points returns a uniform 3-tuple in BOTH modes:
-            # (indices, calibration_values, mean_currents).  The mean_currents
-            # are computed inside select_points using the in-screen window
-            # (Standard ±40 default / Back-extrap ±0 default, both editable) —
-            # so we use them directly rather than recomputing with the CLI
-            # --window (which would silently override the user's choice).
+            # (indices, calibration_values, mean_currents), the mean_currents
+            # computed with the in-screen window.
             indices, final_calibration_values, mean_currents = result
             mean_currents = list(mean_currents)
             current_calibration_values = final_calibration_values
@@ -456,348 +388,114 @@ def process_file(
                 print(f"  idx={idx:5d}, current={current: .4e} A, conc={conc: .3f} µM")
             print(f"Calibration: µM = {calibration.slope:.4e} * current + {calibration.intercept:.4f}")
 
-            # Branch to control-subtract phase for sample files whose group
-            # already has a saved template.  Controls and ungrouped files
-            # bypass straight to interval selection.
-            # NOTE: the old single-control subtraction phase is retained for
-            # legacy single-control single-subgroup groups (so anyone running
-            # with a controls.json built before the multi-control restructure
-            # still works the same way).  Groups with >=2 controls or >=2
-            # sub-groups go through the new GROUP-LEVEL planning phase after
-            # all files in the group are processed, not through this
-            # inline-per-file path.
-            _legacy_single_ctrl_template = _legacy_template_filename(control_group)
-            if (
-                control_role == "sample"
-                and control_group is not None
-                and _legacy_single_ctrl_template is not None
-                and len(control_group.subgroups) == 1
-                and len(control_group.subgroups[0].controls) == 1
-            ):
-                phase = "control_subtract"
-            else:
-                phase = "intervals"
-            continue
-
-        # ────────────────────────────────────────────────────────
-        # PHASE: control_subtract  (samples only, after calibration)
-        # ────────────────────────────────────────────────────────
-        elif phase == "control_subtract":
-            assert control_group is not None and calibrated_dir is not None
-            tpl_name = _legacy_template_filename(control_group)
-            try:
-                ct, cy = load_control_template(calibrated_dir, tpl_name)
-            except Exception as exc:
-                print(
-                    f"Warning: could not load control template "
-                    f"{tpl_name}: {exc}.  Skipping subtraction."
-                )
-                phase = "intervals"
-                continue
-            result = interactive_subtract(
-                sample_time=time_values,
-                sample_h2o2=frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
-                control_t=ct,
-                control_y=cy,
-                filename=path.name,
-                group_name=control_group.name,
-            )
-            if isinstance(result, str) and result == "back":
-                phase = "calibration"
-                continue
-            if isinstance(result, str) and result == "skip":
-                print("Subtraction skipped by user.")
-                control_subtracted = False
-                phase = "intervals"
-                continue
-            # result is np.ndarray
-            frame[CALIBRATED_COLUMN] = result
-            control_subtracted = True
-            print(
-                f"Control template '{control_group.name}' subtracted from "
-                f"{path.name} ({len(result)} samples)."
-            )
             phase = "intervals"
             continue
 
         # ────────────────────────────────────────────────────────
-        # PHASE: intervals
+        # PHASE: intervals  (per-interval loop — selection, optional
+        # control subtraction, fits, Δmax all happen inside)
         # ────────────────────────────────────────────────────────
         elif phase == "intervals":
-            # New per-interval flow for SAMPLE and UNGROUPED files: interval
-            # selection, optional subtraction, fits, and Δmax all happen
-            # inside run_per_interval_flow.  Control files still use the
-            # legacy select_intervals path so they can supply a reference
-            # template to the group.
-            if control_role != "control":
-                calibrated_dir_for_flow = (
-                    calibrated_dir if calibrated_dir is not None else output_dir / "Calibrated"
-                )
-                # Default Δmax max-µM = largest calibration value (or 100
-                # if we skipped calibration or only have one value).
-                try:
-                    cal_max_uM = max(
-                        float(v) for v in (current_calibration_values or [])
-                    )
-                except (TypeError, ValueError):
-                    cal_max_uM = 100.0
-                if not (cal_max_uM and cal_max_uM > 0):
-                    cal_max_uM = 100.0
-                # Grouped samples (control_role == "sample") have their
-                # subtraction handled centrally — either by the inline
-                # control_subtract phase (legacy single-control) or by the
-                # group-planning step (multi-control, averaged/sequential).
-                # Disable the per-interval subtraction prompt for them to
-                # avoid subtracting twice.  Ungrouped files (role None) keep
-                # the per-interval picker as their subtraction mechanism.
-                _enable_sub = control_role != "sample"
-
-                # Callback for "Subtract new control alongside": run a modal
-                # baseline→calibration→one-interval pipeline on the picked
-                # file and hand back its chosen interval.
-                def _new_control_cb(picked_path: Path):
-                    return _modal_process_control(
-                        picked_path,
-                        time_col_idx=time_col_idx,
-                        current_col_idx=current_col_idx,
-                        num_points=num_points,
-                        window=window,
-                        calibration_values=current_calibration_values,
-                        update_calibration_callback=update_calibration_callback,
-                        skip_calibration=skip_calibration,
-                        calibrated_dir=calibrated_dir_for_flow,
-                        force=force,
-                    )
-
-                _pi = run_per_interval_flow(
-                    time_values=time_values,
-                    h2o2_values=frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
-                    time_col=time_col,
-                    full_frame=frame,
-                    filename=path.name,
-                    calibrated_dir=calibrated_dir_for_flow,
-                    cal_max_uM=cal_max_uM,
-                    enable_subtraction=_enable_sub,
-                    new_control_callback=_new_control_cb,
-                )
-                if isinstance(_pi, list):
-                    processed_intervals = _pi
-                processed_intervals_result = _pi
-                # alias for legacy logic below
-                processed_intervals_local = _pi
-                if processed_intervals_result == "go_back_to_calibration":
-                    if skip_calibration:
-                        print("\nNothing to go back to in skip-calibration mode; reopening intervals.")
-                        continue
-                    print("\nReturning to calibration point selection...")
-                    phase = "calibration"
-                    continue
-                if not processed_intervals_local:
-                    print("No intervals saved.")
-                    calibrated_dir_local = output_dir / "Calibrated"
-                    calibrated_dir_local.mkdir(parents=True, exist_ok=True)
-                    out_path = calibrated_dir_local / f"{path.stem}_calibrated.xlsx"
-                    frame.to_excel(out_path, index=False)
-                    return out_path, path, False, control_info, None
-
-                # Build legacy-shaped containers so the existing save phase
-                # can persist outputs.  fit_summary emits one row per fit
-                # (from pi.fits); the Excel carries one column per fit (from
-                # excel_fits_by_index); all_fit_results keeps just the first
-                # fit for the legacy best-model summary columns.
-                subsets = []
-                all_fit_results = {}      # first fit only → legacy summary columns
-                excel_fits_by_index = {}  # ALL fits → per-interval Excel columns
-                turnover_results = {}
-                for pi in processed_intervals_local:
-                    subsets.append(IntervalSubset(
-                        index=pi.index,
-                        start_time=pi.start_time,
-                        end_time=pi.end_time,
-                        data=pi.data,
-                    ))
-                    if pi.fits:
-                        t_interval = pi.data[pi.time_col].to_numpy(dtype=float)
-                        # Build a column for EVERY fit (not just the first),
-                        # with a unique key so two fits of the same model
-                        # don't collide on the Excel column name.
-                        excel_fits: dict[str, dict] = {}
-                        for fnum, frec in enumerate(pi.fits, start=1):
-                            label = frec.model if len(pi.fits) == 1 else f"{frec.model}#{fnum}"
-                            excel_fits[label] = {
-                                "model": frec.model,
-                                "params": np.array(frec.params, dtype=float),
-                                "names": frec.param_names,
-                                "yhat": _pad_fit_yhat(frec, t_interval),
-                                "r2": frec.r2,
-                                "rss": frec.rss,
-                                "init_rate": frec.init_rate_uM_per_s,
-                            }
-                        excel_fits_by_index[pi.index] = excel_fits
-                        # Legacy summary dict keeps just the first fit (the
-                        # full per-fit detail is emitted as separate rows).
-                        f0 = pi.fits[0]
-                        all_fit_results[pi.index] = {
-                            f0.model: {
-                                "model": f0.model,
-                                "params": np.array(f0.params, dtype=float),
-                                "names": f0.param_names,
-                                "yhat": _pad_fit_yhat(f0, t_interval),
-                                "r2": f0.r2,
-                                "rss": f0.rss,
-                                "init_rate": f0.init_rate_uM_per_s,
-                            },
-                        }
-                    if pi.delta_max is not None:
-                        turnover_results[pi.index] = pi.delta_max.value_uM
-                    else:
-                        turnover_results[pi.index] = None
-
-                if control_role == "sample" and control_group is not None:
-                    if any(pi.control_subtracted for pi in processed_intervals_local):
-                        control_subtracted = True
-
-                # Skip the old fitting + turnover phases — already done.
-                phase = "review"
-                continue
-
-            # ── legacy path for control files ────────────────────────
-            intervals = select_intervals(
-                time_values,
-                frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
-                filename=path.name,
+            calibrated_dir_for_flow = (
+                calibrated_dir if calibrated_dir is not None else output_dir / "Calibrated"
             )
-            if intervals == "discard":
-                print(f"\nDataset {path.name} discarded during interval selection.")
-                return None, path, False, control_info, None
-            if intervals is None:
+            # Default Δmax max-µM = largest calibration value (or 100 if we
+            # skipped calibration or only have one value).
+            try:
+                cal_max_uM = max(float(v) for v in (current_calibration_values or []))
+            except (TypeError, ValueError):
+                cal_max_uM = 100.0
+            if not (cal_max_uM and cal_max_uM > 0):
+                cal_max_uM = 100.0
+
+            # Callback for "Subtract new control alongside": run a modal
+            # baseline→calibration→one-interval pipeline on the picked file
+            # and hand back its chosen interval.
+            def _new_control_cb(picked_path: Path):
+                return _modal_process_control(
+                    picked_path,
+                    time_col_idx=time_col_idx,
+                    current_col_idx=current_col_idx,
+                    num_points=num_points,
+                    window=window,
+                    calibration_values=current_calibration_values,
+                    update_calibration_callback=update_calibration_callback,
+                    skip_calibration=skip_calibration,
+                    calibrated_dir=calibrated_dir_for_flow,
+                    force=force,
+                )
+
+            _pi = run_per_interval_flow(
+                time_values=time_values,
+                h2o2_values=frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
+                time_col=time_col,
+                full_frame=frame,
+                filename=path.name,
+                calibrated_dir=calibrated_dir_for_flow,
+                cal_max_uM=cal_max_uM,
+                new_control_callback=_new_control_cb,
+            )
+            if _pi == "go_back_to_calibration":
                 if skip_calibration:
-                    # No calibration phase to return to — re-open intervals.
-                    print("\nNothing to go back to in skip-calibration mode; reopening interval selection.")
+                    print("\nNothing to go back to in skip-calibration mode; reopening intervals.")
                     continue
                 print("\nReturning to calibration point selection...")
                 phase = "calibration"
                 continue
-            if not intervals:
-                print("No intervals selected; skipping subset export.")
-                # Still need to write calibrated file
+            if not _pi:
+                print("No intervals saved.")
                 calibrated_dir_local = output_dir / "Calibrated"
                 calibrated_dir_local.mkdir(parents=True, exist_ok=True)
                 out_path = calibrated_dir_local / f"{path.stem}_calibrated.xlsx"
                 frame.to_excel(out_path, index=False)
-                return out_path, path, False, control_info, None
+                return out_path, path, False
+            processed_intervals = _pi
 
-            subsets = build_interval_subsets(frame, time_col, CALIBRATED_COLUMN, intervals)
-            if not subsets:
-                print("Intervals contained no data points; nothing saved.")
-                return None, path, False, control_info, None
-
-            # For control files: pick the reference interval and save the
-            # template to disk so subsequent samples can subtract it.  The
-            # template is recorded against the specific ControlSpec within
-            # the group's sub-group structure.
-            if control_role == "control" and control_group is not None:
-                lookup = control_group.find_spec(path.name)
-                if lookup is None:
-                    # Shouldn't happen — main() puts the file in the group
-                    print(f"Warning: control {path.name} not found in group '{control_group.name}'; skipping reference selection.")
-                else:
-                    subgroup_idx, spec = lookup
-                    chosen = select_control_reference_interval(
-                        subsets, time_col, filename=path.name
-                    )
-                    if chosen is None:
-                        print("No reference interval chosen — control will not be subtracted from samples.")
-                        spec.reference_interval_index = None
-                        spec.template_filename = None
-                    else:
-                        ref = next((s for s in subsets if s.index == chosen), subsets[0])
-                        if calibrated_dir is None:
-                            calibrated_dir_local = output_dir / "Calibrated"
-                        else:
-                            calibrated_dir_local = calibrated_dir
-                        # Disambiguate templates with the same file appearing
-                        # in different groups by prefixing with group name.
-                        template_key = f"{control_group.name}__sg{subgroup_idx}__{Path(path.stem).name}"
-                        tpl_path = save_control_template(
-                            calibrated_dir_local,
-                            template_key,
-                            ref.data[time_col].to_numpy(dtype=float),
-                            ref.data[CALIBRATED_COLUMN].to_numpy(dtype=float),
-                        )
-                        spec.reference_interval_index = int(ref.index)
-                        spec.template_filename = tpl_path.name
-                        control_info = {
-                            "role": "control",
-                            "group": control_group.name,
-                            "subgroup_index": subgroup_idx,
-                            "reference_interval_index": int(ref.index),
-                            "template_filename": tpl_path.name,
+            # Build the containers the save phase consumes.  fit_summary
+            # emits one row per fit (from pi.fits); the Excel carries one
+            # column per fit (excel_fits_by_index); all_fit_results keeps
+            # just the first fit for the legacy best-model summary columns.
+            subsets = []
+            all_fit_results = {}
+            excel_fits_by_index = {}
+            turnover_results = {}
+            for pi in processed_intervals:
+                subsets.append(IntervalSubset(
+                    index=pi.index,
+                    start_time=pi.start_time,
+                    end_time=pi.end_time,
+                    data=pi.data,
+                ))
+                if pi.fits:
+                    t_interval = pi.data[pi.time_col].to_numpy(dtype=float)
+                    excel_fits: dict[str, dict] = {}
+                    for fnum, frec in enumerate(pi.fits, start=1):
+                        label = frec.model if len(pi.fits) == 1 else f"{frec.model}#{fnum}"
+                        excel_fits[label] = {
+                            "model": frec.model,
+                            "params": np.array(frec.params, dtype=float),
+                            "names": frec.param_names,
+                            "yhat": _pad_fit_yhat(frec, t_interval),
+                            "r2": frec.r2,
+                            "rss": frec.rss,
+                            "init_rate": frec.init_rate_uM_per_s,
                         }
-                        print(
-                            f"Saved control template for {control_group.name}/"
-                            f"{control_group.subgroups[subgroup_idx].name}/{path.name} "
-                            f"(interval #{ref.index}) → {tpl_path}"
-                        )
-
-            # Control files skip fitting / turnover (no fits needed) and
-            # go directly to save.
-            phase = "save"
-            continue
-
-        # ────────────────────────────────────────────────────────
-        # PHASE: fitting
-        # ────────────────────────────────────────────────────────
-        elif phase == "fitting":
-            print(f"\n{'='*60}")
-            print("Interactive Fitting Interface")
-            print(f"{'='*60}")
-            fit_result = interactive_interval_fitting(
-                subsets, time_col, CALIBRATED_COLUMN, filename=path.name
-            )
-            if fit_result == "discard_file":
-                print(f"\nDataset {path.name} discarded during fitting.")
-                return None, path, False, control_info, None
-            if fit_result == "go_back_phase":
-                phase = "intervals"
-                continue
-            all_fit_results = fit_result
-
-            if all_fit_results:
-                print(f"\nFit results for {len(all_fit_results)} interval(s):")
-                for interval_idx, models in all_fit_results.items():
-                    display_names = [get_model_display_name(n) for n in models]
-                    print(f"  Interval #{interval_idx}: {', '.join(display_names)}")
-
-            phase = "turnover"
-            continue
-
-        # ────────────────────────────────────────────────────────
-        # PHASE: turnover
-        # ────────────────────────────────────────────────────────
-        elif phase == "turnover":
-            print(f"\n{'='*60}")
-            print("Calculate Maximum H₂O₂ Turnover Before Inactivation")
-            print(f"{'='*60}")
-            turnover_result = calculate_turnover_before_inactivation(
-                subsets, all_fit_results, time_col, CALIBRATED_COLUMN, filename=path.name
-            )
-            if turnover_result == "discard_file":
-                print(f"\nDataset {path.name} discarded during turnover calculation.")
-                return None, path, False, control_info, None
-            if turnover_result == "go_back_phase":
-                phase = "fitting"
-                continue
-            turnover_results = turnover_result
-
-            if turnover_results:
-                n_calc = len([v for v in turnover_results.values() if v is not None])
-                print(f"\nTurnover results for {n_calc} interval(s):")
-                for interval_idx, turnover in turnover_results.items():
-                    if turnover is not None:
-                        print(f"  Interval #{interval_idx}: {turnover:.3f} µM")
-                    else:
-                        print(f"  Interval #{interval_idx}: skipped")
+                    excel_fits_by_index[pi.index] = excel_fits
+                    f0 = pi.fits[0]
+                    all_fit_results[pi.index] = {
+                        f0.model: {
+                            "model": f0.model,
+                            "params": np.array(f0.params, dtype=float),
+                            "names": f0.param_names,
+                            "yhat": _pad_fit_yhat(f0, t_interval),
+                            "r2": f0.r2,
+                            "rss": f0.rss,
+                            "init_rate": f0.init_rate_uM_per_s,
+                        },
+                    }
+                turnover_results[pi.index] = (
+                    pi.delta_max.value_uM if pi.delta_max is not None else None
+                )
 
             phase = "review"
             continue
@@ -806,10 +504,6 @@ def process_file(
         # PHASE: review
         # ────────────────────────────────────────────────────────
         elif phase == "review":
-            # The review screen is only reached by non-control files, which
-            # all go through the per-interval flow.  Hide the deprecated
-            # Redo-fitting / Redo-turnover buttons (they'd reopen the legacy
-            # multi-model UI and desync the per-fit data).
             decision = review_results(
                 subsets, all_fit_results, turnover_results,
                 filename=path.name,
@@ -818,17 +512,16 @@ def process_file(
             )
             if decision == "discard":
                 print(f"\nDataset {path.name} discarded at review.")
-                return None, path, False, control_info, None
+                return None, path, False
             if decision == "accept":
                 phase = "save"
                 continue
-            # Any redo option maps directly to a phase name.  In skip-
-            # calibration mode, baseline / calibration are not available;
-            # but defend in depth in case some other entry point passes one.
             if decision in ("baseline", "calibration") and skip_calibration:
-                print(f"  (baseline/calibration not available in skip-calibration mode; staying at review)")
+                print("  (baseline/calibration not available in skip-calibration mode; staying at review)")
                 continue
-            if decision in ("baseline", "calibration", "intervals", "fitting", "turnover"):
+            # Per-interval mode only exposes Redo-baseline / Redo-calibration /
+            # Redo-intervals.  "intervals" re-runs the whole per-interval flow.
+            if decision in ("baseline", "calibration", "intervals"):
                 print(f"\nRedoing {decision} phase...")
                 phase = decision
                 continue
@@ -870,24 +563,22 @@ def process_file(
         )
         print(f"  Saved: {excel_path.name}")
 
+        # Per-interval control-subtraction provenance comes from the
+        # ProcessedInterval itself (subtraction is per-interval now).
+        pi = pi_by_index.get(subset.index)
+        was_subtracted = bool(pi.control_subtracted) if pi is not None else False
+        ctrl_source = pi.control_source if (pi is not None and was_subtracted) else None
         common_kwargs = dict(
             summary_path=summary_path,
             source_file=path.name,
             interval_index=subset.index,
             start_time=subset.start_time,
             end_time=subset.end_time,
-            control_subtracted=(
-                control_subtracted if control_role == "sample" else None
-            ),
-            control_group=(
-                control_group.name
-                if (control_role == "sample" and control_subtracted and control_group is not None)
-                else None
-            ),
+            control_subtracted=was_subtracted if pi is not None else None,
+            control_group=ctrl_source,
             calibration_skipped=True if skip_calibration else None,
         )
 
-        pi = pi_by_index.get(subset.index)
         if pi is not None and pi.fits:
             # New flow: one row per fit (fit_number = 1, 2, …), each
             # carrying the FitRecord columns + the (denormalised) Δmax.
@@ -939,29 +630,7 @@ def process_file(
     print(f"  Summary Excel: {summary_path}")
     print(f"{'='*60}\n")
 
-    # Build a control_info payload for sample files so main() can log
-    if control_role == "sample" and control_group is not None:
-        control_info = {
-            "role": "sample",
-            "group": control_group.name,
-            "subtracted": bool(control_subtracted),
-        }
-
-    # Build a SampleState payload so the group orchestration can run
-    # planning + optional re-fit later.  Only meaningful for grouped sample
-    # files; controls and ungrouped files get None here.
-    sample_state: SampleState | None = None
-    if control_role == "sample" and control_group is not None and subsets:
-        sample_state = SampleState(
-            file_name=path.name,
-            calibrated_frame=frame.copy(),
-            time_col=time_col,
-            subsets=list(subsets),
-            fit_results=dict(all_fit_results),
-            turnover_results=dict(turnover_results),
-        )
-
-    return out_path, path, has_fits, control_info, sample_state
+    return out_path, path, has_fits
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1072,51 +741,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     processed_dir.mkdir(exist_ok=True)
     calibrated_dir.mkdir(exist_ok=True)
 
-    # ── Control-mode setup ────────────────────────────────────────────
-    # Auto-enable control mode if a manifest already exists from a prior run.
-    existing_groups = load_controls_manifest(calibrated_out_dir)
-    control_mode = args.control_mode or (existing_groups is not None)
-    groups: dict[str, ControlGroup] = {}
-    role_of: dict[str, str] = {}       # filename → "control" | "sample"
-    group_of: dict[str, ControlGroup] = {}  # filename → its ControlGroup
-
-    if control_mode:
-        print("\nControl-mode is ON.  Opening grouping UI...")
-        ui_result = show_grouping_ui(files, existing_groups=existing_groups)
-        if ui_result is None:
-            print("Grouping cancelled.  No subtraction will be performed.")
-        else:
-            groups = ui_result
-            # Carry over already-saved templates from existing_groups so a
-            # session can resume without re-processing controls.  Match by
-            # group name + control file name + sub-group index.
-            if existing_groups:
-                for name, g in groups.items():
-                    if name not in existing_groups:
-                        continue
-                    old_group = existing_groups[name]
-                    for sg_idx, sg in enumerate(g.subgroups):
-                        if sg_idx >= len(old_group.subgroups):
-                            break
-                        old_sg = old_group.subgroups[sg_idx]
-                        for spec in sg.controls:
-                            old_spec = next(
-                                (c for c in old_sg.controls if c.file_name == spec.file_name),
-                                None,
-                            )
-                            if old_spec and old_spec.template_filename:
-                                spec.template_filename = old_spec.template_filename
-                                spec.reference_interval_index = old_spec.reference_interval_index
-            save_controls_manifest(groups, calibrated_out_dir)
-            for g in groups.values():
-                for ctrl_name in g.all_control_files():
-                    role_of[ctrl_name] = "control"
-                    group_of[ctrl_name] = g
-                for s in g.sample_files:
-                    role_of[s] = "sample"
-                    group_of[s] = g
-            print(f"  {len(groups)} group(s) defined.  Manifest saved to {calibrated_out_dir / 'controls.json'}")
-
     # Use mutable containers for calibration values and num_points
     session_calibration = {"values": calibration_values}
     session_num_points = {"value": args.num_points}
@@ -1151,10 +775,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return False
             raise
 
-    def run_one(file_path: Path, role: str | None, grp: ControlGroup | None) -> SampleState | None:
-        """Call process_file and handle the post-processing housekeeping.
-        Returns the SampleState if available; else None."""
-        out_path, original_path, has_fits, control_info, sample_state = process_file(
+    def run_one(file_path: Path) -> None:
+        """Call process_file and handle the post-processing housekeeping."""
+        out_path, original_path, has_fits = process_file(
             path=file_path,
             output_dir=args.output_dir,
             time_col_idx=args.time_col,
@@ -1165,15 +788,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             update_calibration_callback=update_calibration,
             force=args.force,
             summary_path=summary_path,
-            control_role=role,
-            control_group=grp,
             calibrated_dir=calibrated_out_dir,
             skip_calibration=args.skip_calibration,
         )
-        # Persist manifest after each control so an interrupted session
-        # can resume with saved templates intact.
-        if role == "control" and groups:
-            save_controls_manifest(groups, calibrated_out_dir)
         if not _move_to_processed(original_path):
             raise SystemExit(1)
         if out_path is None:
@@ -1183,83 +800,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if has_fits:
                 stats["successful"] += 1
             print(f"Calibration successful; moved original file to {processed_dir / original_path.name}")
-        return sample_state
 
-    # ── Group-by-group orchestration ──────────────────────────────────────
-    # Process each group as a unit:
-    #   1) all controls (templates saved as we go)
-    #   2) all samples (state accumulated)
-    #   3) per-group subtraction-planning UI
-    #   4) optional re-fit + re-turnover on corrected intervals
-    #   5) write "corrected" rows to fit_summary + save corrected interval files
-    # Then process any ungrouped files normally.
-    by_name: dict[str, Path] = {p.name: p for p in files}
-
-    for group in groups.values():
-        print(f"\n{'#' * 60}")
-        print(f"Group '{group.name}' — {len(group.all_control_files())} control(s) "
-              f"in {len(group.subgroups)} sub-group(s); "
-              f"{len(group.sample_files)} sample(s)")
-        print(f"{'#' * 60}")
-
-        # 1) Process controls
-        for ctrl_name in group.all_control_files():
-            ctrl_path = by_name.get(ctrl_name)
-            if ctrl_path is None:
-                print(f"Skipping control '{ctrl_name}' — not found in input directory.")
-                continue
-            try:
-                run_one(ctrl_path, "control", group)
-            except SystemExit as exc:
-                return int(exc.code)
-            except Exception as exc:
-                print(f"Failed to process control {ctrl_path}: {exc}")
-                traceback.print_exc()
-                return 1
-
-        # 2) Process samples and accumulate SampleState
-        sample_states: list[SampleState] = []
-        for sample_name in group.sample_files:
-            sample_path = by_name.get(sample_name)
-            if sample_path is None:
-                print(f"Skipping sample '{sample_name}' — not found in input directory.")
-                continue
-            try:
-                state = run_one(sample_path, "sample", group)
-                if state is not None:
-                    sample_states.append(state)
-            except SystemExit as exc:
-                return int(exc.code)
-            except Exception as exc:
-                print(f"Failed to process sample {sample_path}: {exc}")
-                traceback.print_exc()
-                return 1
-
-        # 3) + 4) Planning + optional re-fit (only meaningful for multi-control
-        # or multi-subgroup groups; legacy single-control already did inline
-        # subtraction inside process_file)
-        is_legacy_single = (
-            len(group.subgroups) == 1
-            and len(group.subgroups[0].controls) == 1
-        )
-        if sample_states and not is_legacy_single:
-            updated = run_group_planning(group, sample_states, calibrated_out_dir)
-            offer_refit_for_corrected_intervals(
-                updated,
-                interactive_interval_fitting,
-                calculate_turnover_before_inactivation,
-            )
-            # 5) Persist corrected outputs
-            _persist_group_corrected_outputs(
-                group, updated, calibrated_out_dir, summary_path
-            )
-
-    # 6) Process any ungrouped files normally
+    # ── Process each file in turn ──────────────────────────────────────────
+    # Control subtraction is handled per-interval inside each file's flow
+    # (the user picks/averages control intervals when defining an interval).
     for file_path in files:
-        if file_path.name in role_of:
-            continue
         try:
-            run_one(file_path, None, None)
+            run_one(file_path)
         except SystemExit as exc:
             return int(exc.code)
         except Exception as exc:
@@ -1278,45 +825,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"{'='*60}\n")
 
     return 0
-
-
-def _persist_group_corrected_outputs(
-    group: ControlGroup,
-    sample_states: dict[str, "SampleState"],
-    calibrated_dir: Path,
-    summary_path: Path,
-) -> None:
-    """Save corrected interval excels and append `variant=corrected` rows to
-    fit_summary.  Pre-subtraction `variant=original` rows were already written
-    by process_file's save phase.
-    """
-    for state in sample_states.values():
-        if not state.corrected_subsets:
-            continue
-        interval_dir = calibrated_dir / f"{Path(state.file_name).stem}_intervals"
-        interval_dir.mkdir(parents=True, exist_ok=True)
-        for idx, corrected in state.corrected_subsets.items():
-            # Per-interval corrected Excel
-            out_path = interval_dir / f"interval_{idx:02d}_corrected.xlsx"
-            corrected.data.to_excel(out_path, index=False)
-            print(f"  Saved corrected interval → {out_path.name}")
-
-            # Choose post-subtraction fits/turnover where available
-            post_fits = state.refit_results.get(idx, None)
-            post_turn = state.refit_turnover.get(idx, None)
-            append_fit_summary(
-                summary_path=summary_path,
-                source_file=state.file_name,
-                interval_index=idx,
-                start_time=corrected.start_time,
-                end_time=corrected.end_time,
-                fit_results=post_fits if post_fits else None,
-                turnover_uM=post_turn,
-                control_subtracted=True,
-                control_group=group.name,
-                correction_meta=state.correction_meta.get(idx),
-                variant="corrected",
-            )
 
 
 if __name__ == "__main__":

@@ -105,89 +105,25 @@ def test_fit_summary_filter() -> bool:
 # 2) Control subtraction (Commit 2)
 # ──────────────────────────────────────────────────────────────────────────
 
-def test_controls_manifest_roundtrip() -> bool:
-    _section("Commit 2: controls manifest round-trip (new multi-control model)")
-    import json
-    from sensorfit.controls import (
-        ControlGroup, ControlSubgroup, ControlSpec,
-        save_controls_manifest, load_controls_manifest,
-    )
+def test_grouping_modules_gone() -> bool:
+    _section("Grouping removed: group_planning + grouping symbols are gone")
+    # The upfront sample-grouping feature was removed; its module and the
+    # grouping dataclasses/UI should no longer be importable.
+    try:
+        import sensorfit.group_planning  # noqa: F401
+    except ModuleNotFoundError:
+        print("  ✓ sensorfit.group_planning no longer importable")
+    else:
+        raise AssertionError("group_planning should have been deleted")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        calib = Path(tmp) / "Calibrated"
-        groups = {
-            "G_A": ControlGroup(
-                name="G_A",
-                subgroups=[
-                    ControlSubgroup(
-                        name="Sub-group 1",
-                        controls=[
-                            ControlSpec(
-                                file_name="ctrl1.xlsx",
-                                reference_interval_index=2,
-                                template_filename="G_A_ctrl1.csv",
-                            ),
-                            ControlSpec(
-                                file_name="ctrl1b.xlsx",
-                                reference_interval_index=1,
-                                template_filename="G_A_ctrl1b.csv",
-                            ),
-                        ],
-                    ),
-                    ControlSubgroup(
-                        name="Sub-group 2",
-                        controls=[
-                            ControlSpec(file_name="ctrl2.xlsx"),
-                        ],
-                    ),
-                ],
-                sample_files=["s1.xlsx", "s2.xlsx"],
-            ),
-            "G_B": ControlGroup(
-                name="G_B",
-                subgroups=[
-                    ControlSubgroup(name="Sub-group 1", controls=[ControlSpec(file_name="ctrl3.xlsx")]),
-                ],
-                sample_files=["s3.xlsx"],
-            ),
-        }
-        save_controls_manifest(groups, calib)
-        loaded = load_controls_manifest(calib)
-        assert set(loaded) == set(groups)
-        assert len(loaded["G_A"].subgroups) == 2
-        assert len(loaded["G_A"].subgroups[0].controls) == 2
-        assert loaded["G_A"].subgroups[0].controls[0].reference_interval_index == 2
-        assert loaded["G_A"].subgroups[0].controls[0].template_filename == "G_A_ctrl1.csv"
-        assert loaded["G_A"].sample_files == ["s1.xlsx", "s2.xlsx"]
-        print("  ✓ new multi-control manifest round-trips (2 subgroups, 3 controls in G_A)")
-
-    # Legacy auto-upgrade: a manifest written in the old single-control format
-    # should load into a single-subgroup, single-control group.
-    with tempfile.TemporaryDirectory() as tmp:
-        calib = Path(tmp) / "Calibrated"
-        calib.mkdir(parents=True)
-        legacy_payload = {
-            "version": 1,
-            "groups": [
-                {
-                    "name": "G_legacy",
-                    "control_file": "old_ctrl.xlsx",
-                    "sample_files": ["s1.xlsx"],
-                    "reference_interval_index": 1,
-                    "template_filename": "old_ctrl.csv",
-                }
-            ],
-        }
-        with open(calib / "controls.json", "w") as fh:
-            json.dump(legacy_payload, fh)
-        loaded = load_controls_manifest(calib)
-        assert loaded is not None and "G_legacy" in loaded
-        g = loaded["G_legacy"]
-        assert len(g.subgroups) == 1 and len(g.subgroups[0].controls) == 1
-        assert g.subgroups[0].controls[0].file_name == "old_ctrl.xlsx"
-        assert g.subgroups[0].controls[0].template_filename == "old_ctrl.csv"
-        assert g.sample_files == ["s1.xlsx"]
-        print("  ✓ legacy single-control manifest auto-upgrades to new nested format")
+    import sensorfit.controls as c
+    for gone in ("ControlGroup", "show_grouping_ui", "save_controls_manifest",
+                 "select_control_reference_interval", "interactive_subtract"):
+        assert not hasattr(c, gone), f"controls.{gone} should have been removed"
+    # The reused template helpers must remain.
+    for kept in ("save_control_template", "load_control_template", "interpolate_control_to_grid"):
+        assert hasattr(c, kept), f"controls.{kept} must be kept"
+    print("  ✓ grouping symbols removed; template helpers kept")
     return True
 
 
@@ -596,54 +532,6 @@ def test_zoom_hotkey_install() -> bool:
     return True
 
 
-def test_build_subtraction_chain() -> bool:
-    _section("Restructure: build_subtraction_chain (averaged-within / sequential-across)")
-    import numpy as np
-    from sensorfit.group_planning import build_subtraction_chain
-
-    ct = np.linspace(0, 10, 51)
-    sample_t = np.linspace(100, 110, 51)
-    anchor = 100.0
-
-    # 1) Single sub-group of two constants (5 and 7) → averaged to 6
-    combined, per_sg = build_subtraction_chain(
-        sample_t,
-        [[(ct, np.full_like(ct, 5.0)), (ct, np.full_like(ct, 7.0))]],
-        anchor,
-    )
-    assert np.allclose(combined, 6.0)
-    assert len(per_sg) == 1
-    print("  ✓ single sub-group of 2 controls (5, 7) → avg = 6")
-
-    # 2) Two sub-groups subtracted sequentially: 3 + 2 = 5
-    combined, per_sg = build_subtraction_chain(
-        sample_t,
-        [[(ct, np.full_like(ct, 3.0))], [(ct, np.full_like(ct, 2.0))]],
-        anchor,
-    )
-    assert np.allclose(combined, 5.0)
-    assert len(per_sg) == 2
-    print("  ✓ two sub-groups (3, 2) → sum = 5")
-
-    # 3) Empty chain → zero correction
-    combined, per_sg = build_subtraction_chain(sample_t, [], anchor)
-    assert np.allclose(combined, 0.0)
-    assert per_sg == []
-    print("  ✓ empty chain → zero correction")
-
-    # 4) Averaging templates of different lengths
-    ct_short = np.linspace(0, 8, 41)
-    cy_short = ct_short * 0.5  # 0..4
-    ct_long = np.linspace(0, 10, 51)
-    cy_long = ct_long * 1.0    # 0..10
-    sample_t = np.array([100.0, 105.0])
-    combined, _ = build_subtraction_chain(
-        sample_t, [[(ct_short, cy_short), (ct_long, cy_long)]], 100.0
-    )
-    # At t=105 (5s after anchor): short=2.5, long=5.0, avg=3.75
-    assert abs(combined[1] - 3.75) < 1e-6
-    print("  ✓ averaging of different-length templates (0.5*t and 1.0*t at t=5s → avg=3.75)")
-    return True
 
 
 def test_back_extrap_no_fit() -> bool:
@@ -725,10 +613,10 @@ def main() -> int:
     tests = [
         test_fit_summary_upsert,
         test_fit_summary_filter,
-        test_controls_manifest_roundtrip,
         test_control_template_roundtrip,
         test_interpolate_control,
         test_residual_activity_module_gone,
+        test_grouping_modules_gone,
         test_back_extrap_exponential,
         test_back_extrap_linear_fallback,
         test_back_extrap_no_fit,
@@ -737,7 +625,6 @@ def main() -> int:
         test_delta_max_pure_helpers,
         test_fit_summary_per_fit_columns,
         test_zoom_hotkey_install,
-        test_build_subtraction_chain,
         test_skip_calibration_provenance,
         test_skip_calibration_loads_real_csv,
         test_pad_fit_yhat_and_multifit_excel,
