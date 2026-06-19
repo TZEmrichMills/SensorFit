@@ -1691,6 +1691,7 @@ def append_fit_summary(
     turnover_uM: float | None = None,
     control_subtracted: bool | None = None,
     control_group: str | None = None,
+    control_n_averaged: int | None = None,
     variant: str = "original",
     calibration_skipped: bool | None = None,
     fit_number: int = 0,
@@ -1771,6 +1772,8 @@ def append_fit_summary(
         row_data["control_subtracted"] = bool(control_subtracted)
     if control_group is not None:
         row_data["control_group"] = str(control_group)
+    if control_n_averaged is not None and control_n_averaged > 0:
+        row_data["control_n_averaged"] = int(control_n_averaged)
     if calibration_skipped is not None:
         row_data["calibration_skipped"] = bool(calibration_skipped)
 
@@ -1924,6 +1927,7 @@ def append_fit_summary(
         "calibration_skipped",
         "control_subtracted",
         "control_group",
+        "control_n_averaged",
     ]
     
     # Build ordered column list

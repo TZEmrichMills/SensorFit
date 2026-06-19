@@ -576,6 +576,7 @@ def process_file(
             end_time=subset.end_time,
             control_subtracted=was_subtracted if pi is not None else None,
             control_group=ctrl_source,
+            control_n_averaged=pi.control_n_averaged if pi is not None else None,
             calibration_skipped=True if skip_calibration else None,
         )
 

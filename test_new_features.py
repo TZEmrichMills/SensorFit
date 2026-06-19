@@ -609,6 +609,35 @@ def test_review_per_interval_mode_hides_legacy_redo() -> bool:
     return True
 
 
+def test_average_controls_on_grid() -> bool:
+    _section("Multi-control averaging: average_controls_on_grid")
+    import numpy as np
+    from sensorfit.controls import average_controls_on_grid
+
+    sample_t = np.linspace(0.0, 10.0, 101)
+
+    ctrl_a = (np.linspace(0.0, 10.0, 51), np.ones(51) * 2.0)
+    ctrl_b = (np.linspace(0.0, 10.0, 51), np.ones(51) * 4.0)
+
+    avg, interps = average_controls_on_grid([ctrl_a, ctrl_b], sample_t, anchor_t0=0.0)
+    assert len(avg) == len(sample_t)
+    assert len(interps) == 2
+    assert np.allclose(avg, 3.0, atol=0.01), f"Expected ~3.0, got {avg[:5]}"
+    print("  ✓ two flat controls averaged correctly")
+
+    avg1, interps1 = average_controls_on_grid([ctrl_a], sample_t, anchor_t0=0.0)
+    assert np.allclose(avg1, 2.0, atol=0.01)
+    print("  ✓ single control returns itself")
+
+    try:
+        average_controls_on_grid([], sample_t)
+        assert False, "Should have raised"
+    except ValueError:
+        pass
+    print("  ✓ empty list raises ValueError")
+    return True
+
+
 def main() -> int:
     tests = [
         test_fit_summary_upsert,
@@ -629,6 +658,7 @@ def main() -> int:
         test_skip_calibration_loads_real_csv,
         test_pad_fit_yhat_and_multifit_excel,
         test_review_per_interval_mode_hides_legacy_redo,
+        test_average_controls_on_grid,
     ]
     failures = []
     for t in tests:

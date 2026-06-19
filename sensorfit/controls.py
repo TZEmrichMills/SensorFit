@@ -139,3 +139,39 @@ def interpolate_control_to_grid(
         "n_extrap_right": n_extrap_right,
         "warning": warning,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Multi-control averaging
+# ──────────────────────────────────────────────────────────────────────────
+
+def average_controls_on_grid(
+    members: list[tuple[np.ndarray, np.ndarray]],
+    sample_t: np.ndarray,
+    anchor_t0: float | None = None,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Average multiple control traces after aligning them onto *sample_t*.
+
+    Each member is ``(control_t_zero_based, control_y)``.  If *anchor_t0*
+    is given every member is shifted so its t=0 maps to that absolute time;
+    otherwise each member's t=0 maps to ``sample_t[0]``.
+
+    Returns ``(averaged_y, individual_interps)`` where *individual_interps*
+    has the same length as *members* — each entry is the member interpolated
+    onto *sample_t* (useful for the preview plot).
+    """
+    if not members:
+        raise ValueError("Need at least one control member to average.")
+
+    if anchor_t0 is None:
+        anchor_t0 = float(sample_t[0])
+
+    interps: list[np.ndarray] = []
+    for ct_zero, cy in members:
+        shifted = np.asarray(ct_zero, dtype=float) + anchor_t0
+        interp, _ = interpolate_control_to_grid(shifted, cy, sample_t)
+        interps.append(interp)
+
+    stacked = np.vstack(interps)
+    averaged = np.nanmean(stacked, axis=0)
+    return averaged, interps

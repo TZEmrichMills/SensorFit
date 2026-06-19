@@ -48,7 +48,7 @@ from .calibration import (
     create_small_button,
     truncate_filename,
 )
-from .controls import interpolate_control_to_grid
+from .controls import average_controls_on_grid, interpolate_control_to_grid
 from .fitting import fit_IB, fit_Exponential
 from .models import model_Exponential, model_IB
 from .zoom_hotkey import install_zoom_keys
@@ -115,6 +115,7 @@ class ProcessedInterval:
     time_col: str
     control_subtracted: bool = False
     control_source: str | None = None  # human-readable description
+    control_n_averaged: int = 0        # how many controls were averaged (0 = none)
     fits: list[FitRecord] = field(default_factory=list)
     delta_max: DeltaMaxRecord | None = None
 
@@ -378,8 +379,11 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     """Small dialog asking how (if at all) to subtract a control from this
     interval.  Returns one of: ``"none"``, ``"existing"``, ``"new"``,
     ``"back"``.
+
+    "Existing" and "new" both lead to the multi-control averaging hub,
+    which lets the user accumulate one or more controls before accepting.
     """
-    fig, ax = plt.subplots(figsize=(8, 3.4))
+    fig, ax = plt.subplots(figsize=(8, 3.8))
     try:
         fig.canvas.manager.set_window_title("SensorFit — Subtraction choice")
     except Exception:
@@ -390,9 +394,10 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
         f"{interval_summary}\n\n"
         "Apply control subtraction?\n\n"
         "• None — use this interval as-is.\n"
-        "• Subtract existing — pick a control interval already in this session\n"
-        "  or in Calibrated/.\n"
-        "• Subtract new — process a fresh control file (modal mini-flow).",
+        "• Subtract existing — start from an already-processed control interval\n"
+        "  (you can add more controls and they will be averaged).\n"
+        "• Subtract new — process a fresh control file first\n"
+        "  (you can add more controls and they will be averaged).",
         ha="center", va="center", fontsize=10,
     )
     fig.suptitle("Per-interval control subtraction", fontsize=11, fontweight="bold")
@@ -495,69 +500,9 @@ def _discover_existing_control_intervals(
     return out
 
 
-def pick_existing_interval(
-    candidates: list[dict],
-    filename: str | None = None,
-):
-    """Open a small dialog letting the user pick one of the discovered
-    intervals.  Returns the chosen dict (with ``load`` callable) or None
-    if cancelled / no candidates.
-    """
-    if not candidates:
-        print("No existing intervals available for subtraction.")
-        return None
-
-    n = len(candidates)
-    fig_h = 0.7 + 0.30 * max(3, n) + 1.0
-    fig = plt.figure(figsize=(9, fig_h))
-    fig.suptitle(
-        f"Pick a control interval to subtract"
-        + (f" from {truncate_filename(filename)}" if filename else ""),
-        fontsize=11,
-    )
-    add_instruction_banner(
-        fig,
-        "Click a button to pick that interval as the control.  Cancel returns "
-        "to the subtraction-choice dialog.",
-        y=0.985,
-        width=110,
-    )
-
-    chosen = {"idx": None}
-    btns = []
-
-    def make_picker(i):
-        def _f(_e=None):
-            chosen["idx"] = i
-            plt.close(fig)
-        return _f
-
-    # Each row is a button labelled with the candidate's text
-    btn_h = 0.06
-    spacing = 0.015
-    available_h = 0.78
-    btn_w = 0.85
-    if n * (btn_h + spacing) > available_h:
-        btn_h = max(0.03, (available_h - n * spacing) / n)
-
-    for i, c in enumerate(candidates):
-        y = 0.85 - (i + 1) * (btn_h + spacing)
-        ax_btn = fig.add_axes([0.075, y, btn_w, btn_h])
-        b = create_small_button(ax_btn, c["label"], "#ffe680", "#ffcd55")
-        b.on_clicked(make_picker(i))
-        btns.append(b)
-
-    ax_cancel = fig.add_axes([0.35, 0.03, 0.30, 0.06])
-    btn_cancel = create_small_button(ax_cancel, "Cancel", "#ddddff", "#bbbbff")
-    btn_cancel.on_clicked(lambda _e=None: plt.close(fig))
-
-    plt.show()
-    plt.close(fig)
-    return candidates[chosen["idx"]] if chosen["idx"] is not None else None
-
-
 # ────────────────────────────────────────────────────────────────────────
-# UI: subtraction preview
+# UI: subtraction preview (used by the averaging hub's single-control
+# legacy path is gone; this is kept for potential direct use)
 # ────────────────────────────────────────────────────────────────────────
 
 
@@ -684,6 +629,295 @@ def preview_per_interval_subtraction(
     if decision["value"] == "skip":
         return "skip"
     return "back"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# UI: multi-select existing-interval picker
+# ────────────────────────────────────────────────────────────────────────
+
+def pick_existing_intervals_multi(
+    candidates: list[dict],
+    filename: str | None = None,
+) -> list[dict] | None:
+    """Let the user pick one or more existing intervals via toggle buttons.
+
+    Returns a list of chosen candidate dicts, or None if cancelled.
+    """
+    if not candidates:
+        print("No existing intervals available for subtraction.")
+        return None
+
+    n = len(candidates)
+    fig_h = 1.0 + 0.30 * max(3, n) + 1.2
+    fig = plt.figure(figsize=(9, fig_h))
+    fig.suptitle(
+        "Select one or more control intervals"
+        + (f" for {truncate_filename(filename)}" if filename else ""),
+        fontsize=11,
+    )
+    add_instruction_banner(
+        fig,
+        "Click to toggle selection (highlighted = selected).  "
+        "Accept adds all selected controls to the averaging set.",
+        y=0.985, width=110,
+    )
+
+    selected = set()
+    btn_objs = []
+    btn_axes = []
+    result = {"accepted": False}
+
+    def _toggle(i):
+        def _f(_e=None):
+            if i in selected:
+                selected.discard(i)
+            else:
+                selected.add(i)
+            _update_colours()
+        return _f
+
+    def _update_colours():
+        for j, (ax_b, _) in enumerate(zip(btn_axes, btn_objs)):
+            if j in selected:
+                ax_b.set_facecolor("#90ee90")
+            else:
+                ax_b.set_facecolor("#ffe680")
+        fig.canvas.draw_idle()
+
+    btn_h = 0.055
+    spacing = 0.012
+    available_h = 0.76
+    btn_w = 0.85
+    if n * (btn_h + spacing) > available_h:
+        btn_h = max(0.028, (available_h - n * spacing) / n)
+
+    for i, c in enumerate(candidates):
+        y = 0.84 - (i + 1) * (btn_h + spacing)
+        ax_btn = fig.add_axes([0.075, y, btn_w, btn_h])
+        b = create_small_button(ax_btn, c["label"], "#ffe680", "#ffcd55")
+        b.on_clicked(_toggle(i))
+        btn_objs.append(b)
+        btn_axes.append(ax_btn)
+
+    def _accept(_e=None):
+        result["accepted"] = True
+        plt.close(fig)
+
+    ax_accept = fig.add_axes([0.25, 0.025, 0.22, 0.055])
+    ax_cancel = fig.add_axes([0.53, 0.025, 0.22, 0.055])
+    _btn_accept = create_small_button(ax_accept, "Accept selection", "#90ee90", "#7cd47c")
+    _btn_accept.on_clicked(_accept)
+    _btn_cancel = create_small_button(ax_cancel, "Cancel", "#ddddff", "#bbbbff")
+    _btn_cancel.on_clicked(lambda _e=None: plt.close(fig))
+
+    plt.show()
+    plt.close(fig)
+
+    if result["accepted"] and selected:
+        return [candidates[i] for i in sorted(selected)]
+    return None
+
+
+# ────────────────────────────────────────────────────────────────────────
+# UI: multi-control averaging hub (live preview)
+# ────────────────────────────────────────────────────────────────────────
+
+ControlMember = tuple  # (label: str, t_zero_based: ndarray, y: ndarray)
+
+
+def averaging_hub(
+    sample_t: np.ndarray,
+    sample_y: np.ndarray,
+    initial_members: list[ControlMember],
+    filename: str | None = None,
+    *,
+    existing_candidates: list[dict] | None = None,
+    new_control_callback=None,
+    calibrated_dir: Path | None = None,
+) -> tuple[str, list[ControlMember]]:
+    """Show a live-preview hub where the user builds an averaging set.
+
+    Top pane: sample (green), each member control faint, averaged control
+    bold red, anchor line.  Bottom pane: sample − averaged control (blue).
+
+    Buttons: Add existing / Add new / Remove last / Accept & subtract /
+    Skip / Back.
+
+    Returns ``(decision, members)`` where decision is ``"accept"``,
+    ``"skip"``, or ``"back"``.
+    """
+    members: list[ControlMember] = list(initial_members)
+    anchor = {"t0": float(sample_t[0])}
+
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(11, 7.8), sharex=True)
+    try:
+        fig.canvas.manager.set_window_title(
+            "SensorFit — Multi-control averaging"
+            + (f": {truncate_filename(filename)}" if filename else "")
+        )
+    except Exception:
+        pass
+    plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.78, hspace=0.25)
+
+    ax_top.plot(sample_t, sample_y, color="tab:green", lw=1.3, label="Sample")
+    anchor_line_top = ax_top.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9, label="Anchor")
+    anchor_line_bot = ax_bot.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9)
+    ax_top.set_ylabel("H₂O₂ (µM)")
+    ax_bot.axhline(0.0, color="grey", lw=0.6, ls=":")
+    ax_bot.set_xlabel("Time (s)")
+    ax_bot.set_ylabel("H₂O₂ (µM, corrected)")
+
+    dynamic_lines: list = []
+    line_avg = [None]
+    line_corr = [None]
+
+    member_colours = [
+        "#d4a0a0", "#a0a0d4", "#a0d4a0", "#d4d4a0", "#d4a0d4",
+        "#a0d4d4", "#c8a080", "#80c8a0",
+    ]
+
+    add_instruction_banner(
+        fig,
+        "Build your control-averaging set.  "
+        "Top: sample (green) + individual controls (faint) + average (red).  "
+        "Bottom: sample − average.  "
+        "Click upper plot to re-anchor.  "
+        "Add controls, then Accept.",
+        y=0.985, width=110,
+    )
+
+    view = {"autoscaled": False}
+
+    def redraw():
+        for ln in dynamic_lines:
+            ln.remove()
+        dynamic_lines.clear()
+        if line_avg[0] is not None:
+            line_avg[0].remove()
+            line_avg[0] = None
+        if line_corr[0] is not None:
+            line_corr[0].remove()
+            line_corr[0] = None
+
+        if not members:
+            ax_top.legend(loc="upper right", fontsize=9)
+            ax_bot.legend(loc="upper right", fontsize=9)
+            if not view["autoscaled"]:
+                for a in (ax_top, ax_bot):
+                    a.relim()
+                    a.autoscale_view()
+                view["autoscaled"] = True
+            fig.canvas.draw_idle()
+            return
+
+        pairs = [(ct, cy) for (_label, ct, cy) in members]
+        averaged, interps = average_controls_on_grid(pairs, sample_t, anchor["t0"])
+
+        for i, (interp_y, (label, _ct, _cy)) in enumerate(zip(interps, members)):
+            c = member_colours[i % len(member_colours)]
+            ln, = ax_top.plot(sample_t, interp_y, color=c, lw=0.8, alpha=0.55,
+                              label=f"Ctrl {i+1}")
+            dynamic_lines.append(ln)
+
+        ln_a, = ax_top.plot(sample_t, averaged, color="tab:red", lw=1.6,
+                            label=f"Average ({len(members)} ctrl)")
+        line_avg[0] = ln_a
+
+        ln_c, = ax_bot.plot(sample_t, sample_y - averaged, color="tab:blue",
+                            lw=1.3, label="Sample − Avg control")
+        line_corr[0] = ln_c
+
+        anchor_line_top.set_xdata([anchor["t0"], anchor["t0"]])
+        anchor_line_bot.set_xdata([anchor["t0"], anchor["t0"]])
+
+        ax_top.legend(loc="upper right", fontsize=9)
+        ax_bot.legend(loc="upper right", fontsize=9)
+
+        if not view["autoscaled"]:
+            for a in (ax_top, ax_bot):
+                a.relim()
+                a.autoscale_view()
+            view["autoscaled"] = True
+        fig.canvas.draw_idle()
+
+    def on_click(event):
+        if event.inaxes is not ax_top or event.button != 1 or event.xdata is None:
+            return
+        if getattr(fig.canvas.toolbar, "mode", "") in ("zoom rect", "pan/zoom", "zoom", "pan"):
+            return
+        anchor["t0"] = float(event.xdata)
+        redraw()
+
+    fig.canvas.mpl_connect("button_press_event", on_click)
+
+    decision = {"value": None}
+
+    def _close_with(v):
+        def _f(_e=None):
+            decision["value"] = v
+            plt.close(fig)
+        return _f
+
+    def _add_existing(_e=None):
+        if existing_candidates is None or not existing_candidates:
+            print("No existing intervals available.")
+            return
+        picked = pick_existing_intervals_multi(existing_candidates, filename=filename)
+        if picked:
+            for p in picked:
+                ct, cy = p["load"]()
+                ct_zero = ct - ct[0]
+                members.append((p["label"], ct_zero, cy))
+            redraw()
+
+    def _add_new(_e=None):
+        if new_control_callback is None:
+            print("No callback for new-control processing.")
+            return
+        picked_path = _qt_pick_control_file(
+            calibrated_dir.parent if calibrated_dir is not None else None
+        )
+        if picked_path is not None:
+            template = new_control_callback(picked_path)
+            if template is not None:
+                ct, cy = template
+                ct_zero = ct - ct[0]
+                members.append((f"new: {picked_path.name}", ct_zero, cy))
+                redraw()
+
+    def _remove_last(_e=None):
+        if members:
+            members.pop()
+            redraw()
+
+    ax_add_ex  = fig.add_axes([0.03, 0.03, 0.16, 0.06])
+    ax_add_new = fig.add_axes([0.20, 0.03, 0.14, 0.06])
+    ax_rm      = fig.add_axes([0.35, 0.03, 0.14, 0.06])
+    ax_accept  = fig.add_axes([0.51, 0.03, 0.18, 0.06])
+    ax_skip    = fig.add_axes([0.70, 0.03, 0.12, 0.06])
+    ax_back    = fig.add_axes([0.83, 0.03, 0.12, 0.06])
+
+    _btn_add_ex  = create_small_button(ax_add_ex,  "Add existing…", "#ffe680", "#ffcd55")
+    _btn_add_new = create_small_button(ax_add_new, "Add new…",      "#ffcc99", "#ffaa66")
+    _btn_rm      = create_small_button(ax_rm,      "Remove last",       "0.9", "0.8")
+    _btn_accept  = create_small_button(ax_accept,  "Accept & subtract", "#90ee90", "#7cd47c")
+    _btn_skip    = create_small_button(ax_skip,    "Skip",              "#ffcc99", "#ffaa66")
+    _btn_back    = create_small_button(ax_back,    "Back",              "#ddddff", "#bbbbff")
+
+    _btn_add_ex.on_clicked(_add_existing)
+    _btn_add_new.on_clicked(_add_new)
+    _btn_rm.on_clicked(_remove_last)
+    _btn_accept.on_clicked(_close_with("accept"))
+    _btn_skip.on_clicked(_close_with("skip"))
+    _btn_back.on_clicked(_close_with("back"))
+
+    redraw()
+    install_zoom_keys(fig, [ax_top, ax_bot])
+    plt.show()
+    plt.close(fig)
+
+    d = decision["value"] or "skip"
+    return (d, members if d == "accept" else [])
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -1865,23 +2099,14 @@ def run_per_interval_flow(
     session_intervals: list[ProcessedInterval] | None = None,
     new_control_callback=None,
     cal_max_uM: float = 100.0,
-    enable_subtraction: bool = True,
 ) -> list[ProcessedInterval] | str:
     """Drive the per-interval state machine until the user says "Done".
 
     ``new_control_callback`` is an optional callable
     ``(picked_path: Path) -> (t: np.ndarray, y: np.ndarray) | None`` that
     the caller provides to process a new control file modal-style and return
-    its reference interval.  If None, the "Subtract new" option will tell the
-    user to use the grouping UI instead.
-
-    ``enable_subtraction`` — when False, the per-interval control-subtraction
-    step is skipped entirely (the flow goes interval → fit → Δmax).  Used for
-    grouped samples under ``--control-mode``, where subtraction is instead
-    handled centrally by the group-planning step (averaged within sub-groups,
-    sequential across them).  Suppressing it here prevents the file being
-    subtracted twice (once per-interval, once by group planning) and keeps the
-    original/corrected variant model intact.
+    its reference interval.  If None, the "Add new" button in the averaging
+    hub will be disabled.
 
     Returns the list of accepted ``ProcessedInterval``s, or the sentinel
     string ``"go_back_to_calibration"`` if the user asked to back out before
@@ -1941,18 +2166,13 @@ def run_per_interval_flow(
         interval_y = original_y.copy()
         control_subtracted = False
         control_source = None
+        control_n_averaged = 0
         fits: list[FitRecord] = []
         delta: DeltaMaxRecord | None = None
 
         # ── Inner state machine: subtract → fit → delta_max → done ──
-        # Each step's "back" decrements step; each "skip" or "accept and
-        # done with step" increments step.  This is the fix for the
-        # reported bug where Back from Δmax was bouncing forward.
-        # When subtraction is disabled (grouped samples under --control-mode,
-        # where the group-planning step handles subtraction centrally), the
-        # flow starts at "fit" and Back from fit bails to interval-pick.
-        step = "subtract" if enable_subtraction else "fit"
-        abort_to_pick = False  # True if user wants to bail back to interval pick
+        step = "subtract"
+        abort_to_pick = False
 
         while step != "done":
             if step == "subtract":
@@ -1963,61 +2183,64 @@ def run_per_interval_flow(
                     abort_to_pick = True
                     break
 
-                # Reset subtraction state on each entry so re-visiting via
-                # Back from fits gets a clean slate.
+                # Reset subtraction state on re-entry (e.g. Back from fit).
                 control_subtracted = False
                 control_source = None
+                control_n_averaged = 0
                 interval_y = original_y.copy()
                 interval_df[CALIBRATED_COLUMN] = interval_y
 
-                if sub_choice == "existing":
+                if sub_choice in ("existing", "new"):
+                    initial_members: list[ControlMember] = []
                     candidates = _discover_existing_control_intervals(
                         calibrated_dir, session_intervals, self_stem
                     )
-                    picked = pick_existing_interval(candidates, filename=filename)
-                    if picked is not None:
-                        ct, cy = picked["load"]()
-                        ct_zero = ct - ct[0]
-                        result = preview_per_interval_subtraction(
-                            interval_t, interval_y, ct_zero, cy,
-                            filename=filename, label=picked["label"],
-                        )
-                        if isinstance(result, np.ndarray):
-                            interval_y = result
-                            interval_df[CALIBRATED_COLUMN] = result
-                            control_subtracted = True
-                            control_source = picked["label"]
-                        elif result == "back":
-                            # stay on subtract step; re-open the choice
-                            continue
 
-                elif sub_choice == "new":
-                    if new_control_callback is None:
-                        print(
-                            "No callback for new-control processing was provided.  "
-                            "Falling back to Skip — process the control as a normal "
-                            "file and then choose 'Subtract existing'."
+                    if sub_choice == "existing":
+                        picked = pick_existing_intervals_multi(candidates, filename=filename)
+                        if picked:
+                            for p in picked:
+                                ct, cy = p["load"]()
+                                initial_members.append((p["label"], ct - ct[0], cy))
+
+                    elif sub_choice == "new":
+                        if new_control_callback is None:
+                            print(
+                                "No callback for new-control processing.  "
+                                "Process the control as a normal file first, "
+                                "then choose 'Subtract existing'."
+                            )
+                        else:
+                            picked_path = _qt_pick_control_file(
+                                calibrated_dir.parent if calibrated_dir is not None else None
+                            )
+                            if picked_path is not None:
+                                template = new_control_callback(picked_path)
+                                if template is not None:
+                                    ct, cy = template
+                                    initial_members.append((f"new: {picked_path.name}", ct - ct[0], cy))
+
+                    if initial_members:
+                        hub_decision, hub_members = averaging_hub(
+                            interval_t, interval_y, initial_members,
+                            filename=filename,
+                            existing_candidates=candidates,
+                            new_control_callback=new_control_callback,
+                            calibrated_dir=calibrated_dir,
                         )
-                    else:
-                        picked_path = _qt_pick_control_file(
-                            calibrated_dir.parent if calibrated_dir is not None else None
-                        )
-                        if picked_path is not None:
-                            template = new_control_callback(picked_path)
-                            if template is not None:
-                                ct, cy = template
-                                ct_zero = ct - ct[0]
-                                result = preview_per_interval_subtraction(
-                                    interval_t, interval_y, ct_zero, cy,
-                                    filename=filename, label=f"new: {picked_path.name}",
-                                )
-                                if isinstance(result, np.ndarray):
-                                    interval_y = result
-                                    interval_df[CALIBRATED_COLUMN] = result
-                                    control_subtracted = True
-                                    control_source = f"new: {picked_path.name}"
-                                elif result == "back":
-                                    continue
+                        if hub_decision == "accept" and hub_members:
+                            pairs = [(ct, cy) for (_lbl, ct, cy) in hub_members]
+                            averaged, _ = average_controls_on_grid(
+                                pairs, interval_t, float(interval_t[0])
+                            )
+                            interval_y = original_y - averaged
+                            interval_df[CALIBRATED_COLUMN] = interval_y
+                            control_subtracted = True
+                            control_n_averaged = len(hub_members)
+                            labels = [lbl for (lbl, _, _) in hub_members]
+                            control_source = " | ".join(labels)
+                        elif hub_decision == "back":
+                            continue
 
                 step = "fit"
                 continue
@@ -2035,7 +2258,6 @@ def run_per_interval_flow(
                     print(f"  ✓ Fit #{fit_index} ({res.model}) accepted.")
                     if not _ask_another("Apply another fit to this interval?"):
                         step = "delta_max"
-                    # else: stay on "fit" for the next fit
                     continue
                 if res == "skip":
                     print("  → fit skipped.")
@@ -2044,15 +2266,8 @@ def run_per_interval_flow(
                 if res == "retry":
                     continue
                 if res == "back":
-                    if enable_subtraction:
-                        # Back from fitting → revisit subtraction (preserves
-                        # any fits the user already added so they're not lost)
-                        step = "subtract"
-                        continue
-                    # No subtraction step to go back to → bail to interval pick
-                    abort_to_pick = True
-                    break
-                # Fallback
+                    step = "subtract"
+                    continue
                 step = "delta_max"
 
             elif step == "delta_max":
@@ -2071,11 +2286,8 @@ def run_per_interval_flow(
                     step = "done"
                     continue
                 if dres == "back":
-                    # Back from Δmax → revisit fitting (don't clear existing
-                    # fits; user can add another or accept what's there).
                     step = "fit"
                     continue
-                # Fallback
                 step = "done"
 
         if abort_to_pick:
@@ -2089,6 +2301,7 @@ def run_per_interval_flow(
             time_col=time_col,
             control_subtracted=control_subtracted,
             control_source=control_source,
+            control_n_averaged=control_n_averaged,
             fits=fits,
             delta_max=delta,
         ))
