@@ -16,6 +16,7 @@ from .calibration import (
     CALIBRATED_COLUMN,
     IntervalSubset,
     load_trace,
+    pane_role_context,
     persist_interval_subsets,
     review_results,
     save_interval_with_fits,
@@ -155,43 +156,44 @@ def _modal_process_control(
     time_values = frame[time_col].to_numpy(dtype=float)
     raw = frame[current_col].to_numpy(dtype=float)
 
-    if skip_calibration:
-        frame[CALIBRATED_COLUMN] = raw.copy()
-    else:
-        # Loop so "Go Back" from calibration re-opens baseline.
-        while True:
-            signal_values = None
+    with pane_role_context("control"):
+        if skip_calibration:
+            frame[CALIBRATED_COLUMN] = raw.copy()
+        else:
+            # Loop so "Go Back" from calibration re-opens baseline.
             while True:
-                br = select_baseline(time_values, raw, window=20, filename=path.name)
-                if br is None:
-                    print("[modal control] Discarded at baseline.")
+                signal_values = None
+                while True:
+                    br = select_baseline(time_values, raw, window=20, filename=path.name)
+                    if br is None:
+                        print("[modal control] Discarded at baseline.")
+                        return None
+                    if br == "redraw":
+                        continue
+                    signal_values, _meta = br
+                    break
+                frame[current_col] = signal_values
+
+                result = select_points(
+                    time_values, signal_values, num_points,
+                    calibration_values, update_calibration_callback,
+                    filename=path.name, window=window,
+                )
+                if result == "discard":
+                    print("[modal control] Discarded at calibration.")
                     return None
-                if br == "redraw":
-                    continue
-                signal_values, _meta = br
+                if result == "go_back_to_baseline":
+                    continue  # re-open baseline
+                indices, _vals, mean_currents = result
+                calibration = build_calibration(mean_currents, _vals)
+                frame[CALIBRATED_COLUMN] = apply_calibration(frame[current_col], calibration)
                 break
-            frame[current_col] = signal_values
 
-            result = select_points(
-                time_values, signal_values, num_points,
-                calibration_values, update_calibration_callback,
-                filename=path.name, window=window,
-            )
-            if result == "discard":
-                print("[modal control] Discarded at calibration.")
-                return None
-            if result == "go_back_to_baseline":
-                continue  # re-open baseline
-            indices, _vals, mean_currents = result
-            calibration = build_calibration(mean_currents, _vals)
-            frame[CALIBRATED_COLUMN] = apply_calibration(frame[current_col], calibration)
-            break
-
-    # Pick one interval as the control template.
-    sel = select_one_interval(
-        time_values, frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
-        already_defined=[], filename=f"{path.name} (control)", interval_number=1,
-    )
+        # Pick one interval as the control template.
+        sel = select_one_interval(
+            time_values, frame[CALIBRATED_COLUMN].to_numpy(dtype=float),
+            already_defined=[], filename=f"{path.name} (control)", interval_number=1,
+        )
     if not isinstance(sel, tuple):
         print("[modal control] No interval selected; subtraction cancelled.")
         return None

@@ -254,6 +254,93 @@ def _fit_baseline_polynomial(
     return np.polyval(coeffs, time_values)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Pane-role orientation chrome
+# ──────────────────────────────────────────────────────────────────────────
+
+_ROLE_STYLES = {
+    "control": {"edge": "#E07020", "label": "[CONTROL]", "lw": 4.0},
+    "sample":  {"edge": "#3060C0", "label": "[SAMPLE]",  "lw": 3.0},
+}
+
+
+def apply_pane_role_chrome(fig, role: str) -> None:
+    """Apply a coloured border and role label to *fig*.
+
+    *role* is ``"control"`` (orange border) or ``"sample"`` (blue border).
+    Sets the border immediately.  The ``[CONTROL]``/``[SAMPLE]`` prefix is
+    prepended to whatever suptitle the figure has at the time of the call.
+    """
+    style = _ROLE_STYLES.get(role)
+    if style is None:
+        return
+    fig.patch.set_edgecolor(style["edge"])
+    fig.patch.set_linewidth(style["lw"])
+    existing = fig._suptitle.get_text() if fig._suptitle else ""
+    prefix = style["label"]
+    if prefix not in existing:
+        title = f"{prefix}  {existing}" if existing else prefix
+        fig.suptitle(title, fontsize=11, fontweight="bold", color=style["edge"])
+
+
+class pane_role_context:
+    """Context manager that patches ``plt.subplots``, ``plt.figure``, and
+    ``plt.show`` so every figure created and shown inside the block gets
+    orientation chrome (coloured border + role label in the suptitle).
+
+    Usage::
+
+        with pane_role_context("control"):
+            select_baseline(...)   # figure has orange border + [CONTROL]
+    """
+
+    def __init__(self, role: str):
+        self.role = role
+        self._orig_subplots = None
+        self._orig_figure = None
+        self._orig_show = None
+        self._figs: list = []
+
+    def __enter__(self):
+        self._orig_subplots = plt.subplots
+        self._orig_figure = plt.figure
+        self._orig_show = plt.show
+        role = self.role
+        figs = self._figs
+
+        def patched_subplots(*args, **kwargs):
+            result = self._orig_subplots(*args, **kwargs)
+            fig = result[0] if isinstance(result, tuple) else result
+            fig.patch.set_edgecolor(_ROLE_STYLES[role]["edge"])
+            fig.patch.set_linewidth(_ROLE_STYLES[role]["lw"])
+            figs.append(fig)
+            return result
+
+        def patched_figure(*args, **kwargs):
+            fig = self._orig_figure(*args, **kwargs)
+            fig.patch.set_edgecolor(_ROLE_STYLES[role]["edge"])
+            fig.patch.set_linewidth(_ROLE_STYLES[role]["lw"])
+            figs.append(fig)
+            return fig
+
+        def patched_show(*args, **kwargs):
+            for f in figs:
+                apply_pane_role_chrome(f, role)
+            figs.clear()
+            return self._orig_show(*args, **kwargs)
+
+        plt.subplots = patched_subplots
+        plt.figure = patched_figure
+        plt.show = patched_show
+        return self
+
+    def __exit__(self, *exc):
+        plt.subplots = self._orig_subplots
+        plt.figure = self._orig_figure
+        plt.show = self._orig_show
+        return False
+
+
 def select_baseline(
     time_values: np.ndarray,
     signal_values: np.ndarray,

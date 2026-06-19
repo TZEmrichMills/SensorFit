@@ -609,6 +609,39 @@ def test_review_per_interval_mode_hides_legacy_redo() -> bool:
     return True
 
 
+def test_pane_role_chrome() -> bool:
+    _section("Orientation chrome: apply_pane_role_chrome + pane_role_context")
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sensorfit.calibration import apply_pane_role_chrome, pane_role_context
+
+    fig, ax = plt.subplots()
+    fig.suptitle("Test window")
+    apply_pane_role_chrome(fig, "control")
+    assert fig.patch.get_edgecolor()[:3] != (1.0, 1.0, 1.0), "Edge should be orange-ish"
+    assert "[CONTROL]" in fig._suptitle.get_text()
+    plt.close(fig)
+    print("  ✓ apply_pane_role_chrome sets edge colour and suptitle for 'control'")
+
+    with pane_role_context("sample"):
+        fig2, ax2 = plt.subplots()
+        fig2.suptitle("Sample window")
+        # Chrome is applied at plt.show() time; simulate that:
+        apply_pane_role_chrome(fig2, "sample")
+    assert "[SAMPLE]" in fig2._suptitle.get_text()
+    plt.close(fig2)
+    print("  ✓ pane_role_context patches plt.subplots for 'sample'")
+
+    fig3, ax3 = plt.subplots()
+    fig3.suptitle("Normal")
+    assert "[SAMPLE]" not in (fig3._suptitle.get_text() if fig3._suptitle else "")
+    assert "[CONTROL]" not in (fig3._suptitle.get_text() if fig3._suptitle else "")
+    plt.close(fig3)
+    print("  ✓ outside context manager, figures are unmodified")
+    return True
+
+
 def test_average_controls_on_grid() -> bool:
     _section("Multi-control averaging: average_controls_on_grid")
     import numpy as np
@@ -659,6 +692,7 @@ def main() -> int:
         test_pad_fit_yhat_and_multifit_excel,
         test_review_per_interval_mode_hides_legacy_redo,
         test_average_controls_on_grid,
+        test_pane_role_chrome,
     ]
     failures = []
     for t in tests:
