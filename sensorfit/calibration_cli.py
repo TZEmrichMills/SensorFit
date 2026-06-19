@@ -1,4 +1,5 @@
 """Command-line interface for calibration module."""
+from __future__ import annotations
 
 import argparse
 import shutil

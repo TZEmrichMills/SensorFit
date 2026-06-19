@@ -175,3 +175,24 @@ def average_controls_on_grid(
     stacked = np.vstack(interps)
     averaged = np.nanmean(stacked, axis=0)
     return averaged, interps
+
+
+def deviation_from_anchor(
+    control_on_grid: np.ndarray,
+    sample_t: np.ndarray,
+    anchor_t0: float,
+) -> np.ndarray:
+    """Return the control's *deviation* from its value at the anchor time.
+
+    ``corrected = sample - deviation`` preserves the sample's absolute
+    scale while removing only the drift/background that the control
+    reveals.  Concretely::
+
+        deviation(t) = control(t) - control(anchor_t0)
+
+    so if a negative control starts at 100 µM and drifts to 95, the
+    deviation at that point is −5, and the sample gains +5 (undoing the
+    drift) instead of losing 100 (which would zero out the signal).
+    """
+    anchor_val = float(np.interp(anchor_t0, sample_t, control_on_grid))
+    return control_on_grid - anchor_val

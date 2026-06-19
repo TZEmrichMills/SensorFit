@@ -643,9 +643,9 @@ def test_pane_role_chrome() -> bool:
 
 
 def test_average_controls_on_grid() -> bool:
-    _section("Multi-control averaging: average_controls_on_grid")
+    _section("Multi-control averaging + deviation-based subtraction")
     import numpy as np
-    from sensorfit.controls import average_controls_on_grid
+    from sensorfit.controls import average_controls_on_grid, deviation_from_anchor
 
     sample_t = np.linspace(0.0, 10.0, 101)
 
@@ -657,6 +657,22 @@ def test_average_controls_on_grid() -> bool:
     assert len(interps) == 2
     assert np.allclose(avg, 3.0, atol=0.01), f"Expected ~3.0, got {avg[:5]}"
     print("  ✓ two flat controls averaged correctly")
+
+    # Deviation-based subtraction: flat control → deviation is zero everywhere
+    dev = deviation_from_anchor(avg, sample_t, 0.0)
+    assert np.allclose(dev, 0.0, atol=0.01), "Flat control deviation should be zero"
+    print("  ✓ flat control deviation is zero (preserves sample absolute scale)")
+
+    # Drifting control: starts at 100, drifts to 90
+    ctrl_drift = np.linspace(100.0, 90.0, 101)
+    dev_drift = deviation_from_anchor(ctrl_drift, sample_t, 0.0)
+    assert abs(dev_drift[0]) < 0.01, "Deviation at anchor should be ~0"
+    assert abs(dev_drift[-1] - (-10.0)) < 0.01, "Deviation at end should be -10"
+    sample = np.ones(101) * 100.0
+    corrected = sample - dev_drift
+    assert abs(corrected[0] - 100.0) < 0.01, "Corrected should keep sample's starting value"
+    assert abs(corrected[-1] - 110.0) < 0.01, "Corrected should gain +10 (undo drift)"
+    print("  ✓ drifting control: deviation removes drift, preserves absolute scale")
 
     avg1, interps1 = average_controls_on_grid([ctrl_a], sample_t, anchor_t0=0.0)
     assert np.allclose(avg1, 2.0, atol=0.01)

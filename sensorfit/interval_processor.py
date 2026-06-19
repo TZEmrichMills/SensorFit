@@ -48,7 +48,7 @@ from .calibration import (
     create_small_button,
     truncate_filename,
 )
-from .controls import average_controls_on_grid, interpolate_control_to_grid
+from .controls import average_controls_on_grid, deviation_from_anchor, interpolate_control_to_grid
 from .fitting import fit_IB, fit_Exponential
 from .models import model_Exponential, model_IB
 from .zoom_hotkey import install_zoom_keys
@@ -565,8 +565,9 @@ def preview_per_interval_subtraction(
     def redraw():
         shifted_t = control_t + anchor["t0"]
         interp, _ = interpolate_control_to_grid(shifted_t, control_y, sample_t)
+        dev = deviation_from_anchor(interp, sample_t, anchor["t0"])
         line_ctrl.set_data(sample_t, interp)
-        line_corr.set_data(sample_t, sample_y - interp)
+        line_corr.set_data(sample_t, sample_y - dev)
         anchor_line_top.set_xdata([anchor["t0"], anchor["t0"]])
         anchor_line_bot.set_xdata([anchor["t0"], anchor["t0"]])
         if not view["autoscaled"]:
@@ -625,7 +626,8 @@ def preview_per_interval_subtraction(
     if decision["value"] == "accept":
         shifted_t = control_t + anchor["t0"]
         interp, _ = interpolate_control_to_grid(shifted_t, control_y, sample_t)
-        return sample_y - interp
+        dev = deviation_from_anchor(interp, sample_t, anchor["t0"])
+        return sample_y - dev
     if decision["value"] == "skip":
         return "skip"
     return "back"
@@ -639,83 +641,105 @@ def pick_existing_intervals_multi(
     candidates: list[dict],
     filename: str | None = None,
 ) -> list[dict] | None:
-    """Let the user pick one or more existing intervals via toggle buttons.
+    """Let the user pick one or more existing intervals from a scrollable list.
 
-    Returns a list of chosen candidate dicts, or None if cancelled.
+    Uses a Qt ``QListWidget`` dialog (natively scrollable, handles hundreds
+    of items).  Returns a list of chosen candidate dicts, or None if
+    cancelled / no candidates.
     """
     if not candidates:
         print("No existing intervals available for subtraction.")
         return None
 
-    n = len(candidates)
-    fig_h = 1.0 + 0.30 * max(3, n) + 1.2
-    fig = plt.figure(figsize=(9, fig_h))
-    fig.suptitle(
-        "Select one or more control intervals"
-        + (f" for {truncate_filename(filename)}" if filename else ""),
-        fontsize=11,
-    )
-    add_instruction_banner(
-        fig,
-        "Click to toggle selection (highlighted = selected).  "
-        "Accept adds all selected controls to the averaging set.",
-        y=0.985, width=110,
+    return _qt_multi_select_dialog(
+        candidates,
+        title=(
+            "Select one or more control intervals"
+            + (f" for {truncate_filename(filename)}" if filename else "")
+        ),
+        instructions=(
+            "Click to select (Ctrl/Cmd-click or Shift-click for multiple).  "
+            "Accept adds all selected controls to the averaging set."
+        ),
     )
 
-    selected = set()
-    btn_objs = []
-    btn_axes = []
-    result = {"accepted": False}
 
-    def _toggle(i):
-        def _f(_e=None):
-            if i in selected:
-                selected.discard(i)
-            else:
-                selected.add(i)
-            _update_colours()
-        return _f
+def _qt_multi_select_dialog(
+    candidates: list[dict],
+    title: str = "Select intervals",
+    instructions: str = "",
+) -> list[dict] | None:
+    """Scrollable multi-select dialog backed by Qt."""
+    import sys as _sys
+    try:
+        from .calibration_editor import _try_import_qt, QT_AVAILABLE, QT_LIB
+    except Exception:
+        QT_AVAILABLE = False
+        QT_LIB = None
 
-    def _update_colours():
-        for j, (ax_b, _) in enumerate(zip(btn_axes, btn_objs)):
-            if j in selected:
-                ax_b.set_facecolor("#90ee90")
-            else:
-                ax_b.set_facecolor("#ffe680")
-        fig.canvas.draw_idle()
+    if not QT_AVAILABLE:
+        try:
+            ok, _, QT_LIB = _try_import_qt()
+        except Exception:
+            ok = False
+        if not ok:
+            print("Qt not available; falling back to console selection.")
+            return _console_multi_select(candidates)
 
-    btn_h = 0.055
-    spacing = 0.012
-    available_h = 0.76
-    btn_w = 0.85
-    if n * (btn_h + spacing) > available_h:
-        btn_h = max(0.028, (available_h - n * spacing) / n)
+    if QT_LIB == "PyQt5":
+        from PyQt5 import QtWidgets, QtCore
+    else:
+        from PySide6 import QtWidgets, QtCore
 
-    for i, c in enumerate(candidates):
-        y = 0.84 - (i + 1) * (btn_h + spacing)
-        ax_btn = fig.add_axes([0.075, y, btn_w, btn_h])
-        b = create_small_button(ax_btn, c["label"], "#ffe680", "#ffcd55")
-        b.on_clicked(_toggle(i))
-        btn_objs.append(b)
-        btn_axes.append(ax_btn)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(_sys.argv)
 
-    def _accept(_e=None):
-        result["accepted"] = True
-        plt.close(fig)
+    dlg = QtWidgets.QDialog()
+    dlg.setWindowTitle(title)
+    dlg.resize(620, 420)
+    layout = QtWidgets.QVBoxLayout(dlg)
 
-    ax_accept = fig.add_axes([0.25, 0.025, 0.22, 0.055])
-    ax_cancel = fig.add_axes([0.53, 0.025, 0.22, 0.055])
-    _btn_accept = create_small_button(ax_accept, "Accept selection", "#90ee90", "#7cd47c")
-    _btn_accept.on_clicked(_accept)
-    _btn_cancel = create_small_button(ax_cancel, "Cancel", "#ddddff", "#bbbbff")
-    _btn_cancel.on_clicked(lambda _e=None: plt.close(fig))
+    if instructions:
+        lbl = QtWidgets.QLabel(instructions)
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
 
-    plt.show()
-    plt.close(fig)
+    lw = QtWidgets.QListWidget()
+    lw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+    for c in candidates:
+        lw.addItem(c["label"])
+    layout.addWidget(lw)
 
-    if result["accepted"] and selected:
-        return [candidates[i] for i in sorted(selected)]
+    btn_box = QtWidgets.QHBoxLayout()
+    btn_accept = QtWidgets.QPushButton("Accept selection")
+    btn_cancel = QtWidgets.QPushButton("Cancel")
+    btn_accept.clicked.connect(dlg.accept)
+    btn_cancel.clicked.connect(dlg.reject)
+    btn_box.addWidget(btn_accept)
+    btn_box.addWidget(btn_cancel)
+    layout.addLayout(btn_box)
+
+    if dlg.exec_() == QtWidgets.QDialog.Accepted:
+        indices = sorted(idx.row() for idx in lw.selectedIndexes())
+        if indices:
+            return [candidates[i] for i in indices]
     return None
+
+
+def _console_multi_select(candidates: list[dict]) -> list[dict] | None:
+    """Fallback when Qt is unavailable: numbered console list."""
+    print("\nAvailable intervals:")
+    for i, c in enumerate(candidates):
+        print(f"  [{i}] {c['label']}")
+    raw = input("Enter indices (comma-separated) or 'c' to cancel: ").strip()
+    if raw.lower() == "c":
+        return None
+    try:
+        indices = [int(x.strip()) for x in raw.split(",")]
+        chosen = [candidates[i] for i in indices if 0 <= i < len(candidates)]
+        return chosen if chosen else None
+    except (ValueError, IndexError):
+        print("Invalid input; cancelling.")
+        return None
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -823,8 +847,9 @@ def averaging_hub(
                             label=f"Average ({len(members)} ctrl)")
         line_avg[0] = ln_a
 
-        ln_c, = ax_bot.plot(sample_t, sample_y - averaged, color="tab:blue",
-                            lw=1.3, label="Sample − Avg control")
+        dev = deviation_from_anchor(averaged, sample_t, anchor["t0"])
+        ln_c, = ax_bot.plot(sample_t, sample_y - dev, color="tab:blue",
+                            lw=1.3, label="Sample − control deviation")
         line_corr[0] = ln_c
 
         anchor_line_top.set_xdata([anchor["t0"], anchor["t0"]])
@@ -1517,23 +1542,15 @@ def prompt_delta_max(
 
     add_instruction_banner(
         fig,
-        "Pick mode; click t₀; Linear/Point also click on the baseline; "
-        "Δmax = max_uM − baseline_at_t₀.  Edit max_uM if needed.",
+        "Pick mode; click t₀; Linear/Point also click on the baseline.  "
+        "Toggle 'Set max' to click-set max [H₂O₂] (horizontal line).  "
+        "Δmax = max_uM − baseline_at_t₀.",
         y=0.985, width=130,
     )
 
     mode_state = {"mode": default_mode}
     max_uM_state = {"value": float(cal_max_uM)}
-    # Artists are tracked by category so the two Retry buttons can clear
-    # one without disturbing the other:
-    #   tz_artists       — t₀ purple cross + dashed vertical line + (in
-    #                      From-fit mode) the highlighted bold fit and
-    #                      asymptote line
-    #   baseline_artists — the baseline picks (purple circles) + Linear's
-    #                      red fit line + dotted extension + the
-    #                      horizontal dashed line at the baseline level
-    #                      (for Linear/Point modes)
-    #   span_artists     — the purple double-arrow + corner annotation
+    click_target = {"value": "t0"}  # "t0" or "max_uM"
     state = {
         "t_zero_idx": None,
         "linear_clicks": [],
@@ -1543,15 +1560,11 @@ def prompt_delta_max(
         "tz_artists": [],
         "baseline_artists": [],
         "span_artists": [],
+        "max_uM_artists": [],
         "annotation": None,
     }
-    # ± window for averaging y around each baseline click, mirroring
-    # baseline/calibration screens.  Default 50 samples either side.
     window_state = {"value": 50}
 
-    # Top controls: mode buttons + cal-max TextBox.  TextBox shifted right
-    # and its label placed ABOVE (not beside) to avoid colliding with the
-    # Point button.
     btn_axes = {
         "from-fit": fig.add_axes([0.10, 0.74, 0.13, 0.05]),
         "linear":   fig.add_axes([0.24, 0.74, 0.13, 0.05]),
@@ -1576,20 +1589,41 @@ def prompt_delta_max(
         ),
     }
 
-    # max-µM (the calibration max) and click-averaging window TextBoxes.
-    # Labels are placed ABOVE so they don't bleed into the Point button.
+    # "Set max" toggle button — switches click mode between t₀/baseline
+    # picking and max_uM picking (horizontal line from y-click).
+    ax_set_max = fig.add_axes([0.53, 0.74, 0.12, 0.05])
+    btn_set_max = create_small_button(ax_set_max, "Set max ↕", "0.85", "#ffd480")
+
+    def _toggle_click_target(_e=None):
+        if click_target["value"] == "t0":
+            click_target["value"] = "max_uM"
+            btn_set_max.color = "#ffd480"
+            _update_status(
+                "Click on the plot to set max [H₂O₂] (horizontal line).  "
+                "Click 'Set max' again to return to t₀/baseline mode.",
+                "#995500",
+            )
+        else:
+            click_target["value"] = "t0"
+            btn_set_max.color = "0.85"
+            _update_status(_initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]))
+        fig.canvas.draw_idle()
+
+    btn_set_max.on_clicked(_toggle_click_target)
+
+    # max-µM TextBox (also settable by click) and window TextBox.
     fig.text(
-        0.66, 0.795, "max [H₂O₂] (µM)",
+        0.72, 0.795, "max [H₂O₂] (µM)",
         ha="center", va="center", fontsize=9, color="dimgrey",
     )
-    ax_max = fig.add_axes([0.61, 0.745, 0.10, 0.04])
+    ax_max = fig.add_axes([0.67, 0.745, 0.10, 0.04])
     tb_max = TextBox(ax_max, "", initial=f"{cal_max_uM:.2f}")
 
     fig.text(
-        0.84, 0.795, "window ±",
+        0.88, 0.795, "window ±",
         ha="center", va="center", fontsize=9, color="dimgrey",
     )
-    ax_window = fig.add_axes([0.81, 0.745, 0.06, 0.04])
+    ax_window = fig.add_axes([0.85, 0.745, 0.06, 0.04])
     tb_window = TextBox(ax_window, "", initial=str(window_state["value"]))
 
     if not has_usable_fit:
@@ -1637,6 +1671,24 @@ def prompt_delta_max(
         state["linear_clicks"].clear()
         state["point_idx"] = None
         _clear_span()
+
+    def _clear_max_uM_line():
+        _remove_artists("max_uM_artists")
+
+    def _draw_max_uM_line(y_value):
+        """Horizontal orange dashed line showing the current max [H₂O₂]."""
+        _clear_max_uM_line()
+        hl = ax.axhline(
+            y_value, color="#E07020", lw=1.8, ls="--", alpha=0.85, zorder=4,
+        )
+        state["max_uM_artists"].append(hl)
+        lbl = ax.text(
+            0.015, y_value, f" max = {y_value:.2f} µM",
+            transform=ax.get_yaxis_transform(),
+            fontsize=8, color="#E07020", va="bottom", ha="left", zorder=5,
+        )
+        state["max_uM_artists"].append(lbl)
+        fig.canvas.draw_idle()
 
     def _clear_preview():
         _clear_t_zero()
@@ -1918,6 +1970,22 @@ def prompt_delta_max(
             return
         if getattr(fig.canvas.toolbar, "mode", "") in ("zoom rect", "pan/zoom", "zoom", "pan"):
             return
+
+        if click_target["value"] == "max_uM" and event.ydata is not None:
+            y_val = float(event.ydata)
+            max_uM_state["value"] = y_val
+            tb_max.set_val(f"{y_val:.2f}")
+            _draw_max_uM_line(y_val)
+            click_target["value"] = "t0"
+            btn_set_max.color = "0.85"
+            fig.canvas.draw_idle()
+            if state["computed"] is not None:
+                _compute_and_preview()
+            _update_status(
+                _initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]),
+            )
+            return
+
         idx = int(np.abs(interval_t - float(event.xdata)).argmin())
 
         if mode_state["mode"] == "from-fit":
@@ -2230,10 +2298,12 @@ def run_per_interval_flow(
                         )
                         if hub_decision == "accept" and hub_members:
                             pairs = [(ct, cy) for (_lbl, ct, cy) in hub_members]
+                            anchor_t = float(interval_t[0])
                             averaged, _ = average_controls_on_grid(
-                                pairs, interval_t, float(interval_t[0])
+                                pairs, interval_t, anchor_t
                             )
-                            interval_y = original_y - averaged
+                            dev = deviation_from_anchor(averaged, interval_t, anchor_t)
+                            interval_y = original_y - dev
                             interval_df[CALIBRATED_COLUMN] = interval_y
                             control_subtracted = True
                             control_n_averaged = len(hub_members)

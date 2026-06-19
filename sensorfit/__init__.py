@@ -15,6 +15,7 @@ from .calibration import (
 )
 from .controls import (
     average_controls_on_grid,
+    deviation_from_anchor,
     save_control_template,
     load_control_template,
     interpolate_control_to_grid,
@@ -48,6 +49,7 @@ __all__ = [
     "persist_interval_subsets",
     # Control-template helpers (reused by per-interval subtraction)
     "average_controls_on_grid",
+    "deviation_from_anchor",
     "save_control_template",
     "load_control_template",
     "interpolate_control_to_grid",
