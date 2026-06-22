@@ -7,7 +7,7 @@ Interactive tool for calibrating amperometric sensor traces to H₂O₂ concentr
 - [Quick Start](#quick-start)
 - [What to Expect When You Run SensorFit](#what-to-expect-when-you-run-sensorfit)
 - [Command Line Arguments](#command-line-arguments)
-- [Advanced features](#advanced-features) — control subtraction (multi-control groups), skip calibration, resilient summary
+- [Advanced features](#advanced-features) — control subtraction (per-interval, multi-control averaging), skip calibration, resilient summary
 - [Post-processing: Collecting Intervals](#post-processing-collecting-intervals)
 - [Detailed Installation Guide](#detailed-installation-guide)
 - [Troubleshooting](#troubleshooting)
@@ -145,7 +145,6 @@ If a session is interrupted, re-run the same command — SensorFit resumes from 
 | `--window` | `50` | Samples to average around each click |
 | `--calibration-values` | `"0,20,40,60,80,100"` | Comma-separated µM H₂O₂ concentrations |
 | `--force` | off | Overwrite existing output files |
-| `--control-mode` | off | Open a grouping UI at session start so a control trace (no-enzyme, etc.) can be subtracted from selected sample files. See [Control subtraction](#control-subtraction-multi-control-groups-group-as-unit-flow) below. Auto-enabled if `Calibrated/controls.json` already exists. |
 | `--skip-calibration` | off | Treat input files as already-calibrated [H₂O₂] vs time and skip the baseline / calibration phases entirely. `--current-col` is interpreted as the µM H₂O₂ column. See [Skip calibration](#skip-calibration-fitting-only-mode) below. |
 
 ---
@@ -165,31 +164,16 @@ The original (un-subtracted) interval is still saved alongside the corrected one
 
 `fit_summary.xlsx` rows for control-subtracted intervals carry:
 - `control_subtracted = True`
-- `control_group` (or the source filename for the new-alongside flow)
+- `control_group` — the control interval(s)/file(s) that were subtracted (multiple averaged controls are joined with ` | `)
+- `control_n_averaged` — how many control traces were averaged together (1 for a single control)
 
-**Optional `--control-mode` for upfront grouping.** If you'd rather declare your controls and samples upfront (instead of picking them per-interval as you go), pass `--control-mode`:
-
-```bash
-python -m sensorfit.calibration_cli --input-dir /path/to/folder --num-points 6 --calibration-values "0,20,40,60,80,100" --control-mode --force
-```
-
-A Qt window opens letting you build groups with multiple controls per group:
+**Averaging multiple controls.** Both subtraction routes drop you into an averaging hub where you can add several control traces; they are aligned onto the sample's time grid and averaged before subtraction. The subtraction itself is *deviation-based* — only the control's drift away from its value at the anchor time is removed, so a sample that starts at 100 µM is not zeroed out by a control that also starts at 100 µM:
 
 ```
-Group_A
-├── Sub-group 1 (averaged)
-│   ├── noEnz_noSub_1.xlsx
-│   └── noEnz_noSub_2.xlsx
-├── Sub-group 2
-│   └── noEnz_1.xlsx
-└── Samples
-    ├── treatment_1.xlsx
-    └── treatment_2.xlsx
+corrected(t) = sample(t) − (control(t) − control(t_anchor))
 ```
 
-Files inside the same sub-group are averaged before subtraction; different sub-groups subtract sequentially (top → bottom). Controls are processed first; once their reference intervals are saved, samples can subtract them through the per-interval picker above (the saved control intervals show up in the **Subtract existing** list).
-
-The grouping is saved to `Calibrated/controls.json` so an interrupted session can resume.
+You can re-anchor the control's t = 0 by clicking in the preview, and the corrected trace updates live.
 
 ### Skip calibration (fitting-only mode)
 
@@ -212,11 +196,11 @@ Use `--time-col` / `--current-col` to point at the right columns. The "current" 
 
 **What you still get:**
 
-- Interval selection, fitting (IB / Exponential / GFI / LinearInitialRate), max-H₂O₂-turnover, residual-activity, and back-extrapolation all work as normal.
+- Interval selection, fitting (Manual linear / Single exponential / Inactivation), control subtraction, Δ[H₂O₂]max, and back-extrapolation all work as normal.
 - The Review screen hides the "Redo baseline" / "Redo calibration" buttons since they're not applicable.
 - `fit_summary.xlsx` rows carry a new `calibration_skipped = True` column for these files (NaN for normal files), so you can filter them in Excel.
 
-**Combined with control mode:** if you have pre-calibrated controls *and* pre-calibrated samples that still need control subtraction, you can pass both `--control-mode --skip-calibration` together — the controls just have their calibration phase skipped too.
+**Combined with control subtraction:** pre-calibrated controls work too — when you reach the per-interval subtraction step, pick a pre-calibrated control file via "Subtract new alongside" and its calibration phase is skipped as well.
 
 ### Resilient `fit_summary.xlsx`
 

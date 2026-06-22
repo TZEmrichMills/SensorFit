@@ -21,7 +21,7 @@ if requirements_file.exists():
 
 setup(
     name="sensorfit",
-    version="0.1.0",
+    version="0.4.0",
     description="A Python tool for calibrating amperometric traces to H2O2 concentrations and performing curve fitting analysis",
     long_description=long_description,
     long_description_content_type="text/markdown",

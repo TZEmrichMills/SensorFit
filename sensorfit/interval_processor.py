@@ -1678,6 +1678,15 @@ def prompt_delta_max(
     def _draw_max_uM_line(y_value):
         """Horizontal orange dashed line showing the current max [H₂O₂]."""
         _clear_max_uM_line()
+        # If the chosen value sits outside the current view, widen the y-limits
+        # so the line (and its label) stay visible inside the plot rather than
+        # being clipped off-screen and colliding with the status text.
+        y0, y1 = ax.get_ylim()
+        span = (y1 - y0) or 1.0
+        if y_value > y1 - 0.02 * span:
+            ax.set_ylim(y0, y_value + 0.06 * span)
+        elif y_value < y0 + 0.02 * span:
+            ax.set_ylim(y_value - 0.06 * span, y1)
         hl = ax.axhline(
             y_value, color="#E07020", lw=1.8, ls="--", alpha=0.85, zorder=4,
         )
@@ -1974,16 +1983,17 @@ def prompt_delta_max(
         if click_target["value"] == "max_uM" and event.ydata is not None:
             y_val = float(event.ydata)
             max_uM_state["value"] = y_val
+            # set_val fires _on_max_submit, which already recomputes the
+            # preview when a t₀ is set — so we must not recompute again here.
             tb_max.set_val(f"{y_val:.2f}")
             _draw_max_uM_line(y_val)
             click_target["value"] = "t0"
             btn_set_max.color = "0.85"
+            if state["t_zero_idx"] is None:
+                _update_status(
+                    _initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]),
+                )
             fig.canvas.draw_idle()
-            if state["computed"] is not None:
-                _compute_and_preview()
-            _update_status(
-                _initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]),
-            )
             return
 
         idx = int(np.abs(interval_t - float(event.xdata)).argmin())
