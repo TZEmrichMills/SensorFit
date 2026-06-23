@@ -416,7 +416,7 @@ def edit_calibration_values(
                         marker = selected_markers.pop()
                         try:
                             marker.remove()
-                        except:
+                        except Exception:
                             pass
                 print(f"  Cleared {excess} excess selected point(s)")
         

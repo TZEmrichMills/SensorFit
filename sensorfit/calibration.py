@@ -24,6 +24,8 @@ from matplotlib.widgets import Button, CheckButtons, TextBox
 import numpy as np
 import pandas as pd
 
+from .zoom_hotkey import install_zoom_keys
+
 
 @dataclass
 class CalibrationResult:
@@ -210,13 +212,133 @@ def truncate_filename(filename: str, max_length: int = 15) -> str:
 
 
 def average_window(signal_values: np.ndarray, center_idx: int, window: int) -> float:
-    """Average signal values around a center index."""
-    if window <= 0:
-        raise ValueError("window must be positive")
+    """Average signal values around a center index.
+
+    ``window == 0`` is a valid degenerate case: it means "no averaging —
+    return the single sample at ``center_idx``."  Used by the back-extrap
+    calibration mode where individual clicks need to pick specific
+    samples (the deadtime spike) rather than the noisy plateau average.
+    """
+    if window < 0:
+        raise ValueError("window must be non-negative")
+    if window == 0:
+        return float(signal_values[center_idx])
     half = max(window // 2, 1)
     start = max(center_idx - half, 0)
     end = min(center_idx + half + 1, signal_values.size)
     return float(signal_values[start:end].mean())
+
+
+def _fit_baseline_polynomial(
+    t_clicks: list[float], y_clicks: list[float], time_values: np.ndarray
+) -> np.ndarray:
+    """Fit a polynomial through clicked baseline points and evaluate it on
+    the full time grid.
+
+    Degree is auto-chosen from the number of points:
+        2 points  → degree 1 (straight line; same as line mode)
+        3 points  → degree 2 (parabola)
+        4+ points → degree 3 (cubic, max)
+
+    Polynomial fitting (rather than a strict-interpolation spline) is chosen
+    so click-noise is smoothed *through* the points rather than reproduced
+    exactly, and so the baseline extrapolates naturally to the start/end of
+    the run.
+    """
+    t_arr = np.asarray(t_clicks, dtype=float)
+    y_arr = np.asarray(y_clicks, dtype=float)
+    if t_arr.size < 2:
+        raise ValueError("Need at least 2 points for a baseline fit.")
+    deg = min(t_arr.size - 1, 3)
+    coeffs = np.polyfit(t_arr, y_arr, deg=deg)
+    return np.polyval(coeffs, time_values)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Pane-role orientation chrome
+# ──────────────────────────────────────────────────────────────────────────
+
+_ROLE_STYLES = {
+    "control": {"edge": "#E07020", "label": "[CONTROL]", "lw": 4.0},
+    "sample":  {"edge": "#3060C0", "label": "[SAMPLE]",  "lw": 3.0},
+}
+
+
+def apply_pane_role_chrome(fig, role: str) -> None:
+    """Apply a coloured border and role label to *fig*.
+
+    *role* is ``"control"`` (orange border) or ``"sample"`` (blue border).
+    Sets the border immediately.  The ``[CONTROL]``/``[SAMPLE]`` prefix is
+    prepended to whatever suptitle the figure has at the time of the call.
+    """
+    style = _ROLE_STYLES.get(role)
+    if style is None:
+        return
+    fig.patch.set_edgecolor(style["edge"])
+    fig.patch.set_linewidth(style["lw"])
+    existing = fig._suptitle.get_text() if fig._suptitle else ""
+    prefix = style["label"]
+    if prefix not in existing:
+        title = f"{prefix}  {existing}" if existing else prefix
+        fig.suptitle(title, fontsize=11, fontweight="bold", color=style["edge"])
+
+
+class pane_role_context:
+    """Context manager that patches ``plt.subplots``, ``plt.figure``, and
+    ``plt.show`` so every figure created and shown inside the block gets
+    orientation chrome (coloured border + role label in the suptitle).
+
+    Usage::
+
+        with pane_role_context("control"):
+            select_baseline(...)   # figure has orange border + [CONTROL]
+    """
+
+    def __init__(self, role: str):
+        self.role = role
+        self._orig_subplots = None
+        self._orig_figure = None
+        self._orig_show = None
+        self._figs: list = []
+
+    def __enter__(self):
+        self._orig_subplots = plt.subplots
+        self._orig_figure = plt.figure
+        self._orig_show = plt.show
+        role = self.role
+        figs = self._figs
+
+        def patched_subplots(*args, **kwargs):
+            result = self._orig_subplots(*args, **kwargs)
+            fig = result[0] if isinstance(result, tuple) else result
+            fig.patch.set_edgecolor(_ROLE_STYLES[role]["edge"])
+            fig.patch.set_linewidth(_ROLE_STYLES[role]["lw"])
+            figs.append(fig)
+            return result
+
+        def patched_figure(*args, **kwargs):
+            fig = self._orig_figure(*args, **kwargs)
+            fig.patch.set_edgecolor(_ROLE_STYLES[role]["edge"])
+            fig.patch.set_linewidth(_ROLE_STYLES[role]["lw"])
+            figs.append(fig)
+            return fig
+
+        def patched_show(*args, **kwargs):
+            for f in figs:
+                apply_pane_role_chrome(f, role)
+            figs.clear()
+            return self._orig_show(*args, **kwargs)
+
+        plt.subplots = patched_subplots
+        plt.figure = patched_figure
+        plt.show = patched_show
+        return self
+
+    def __exit__(self, *exc):
+        plt.subplots = self._orig_subplots
+        plt.figure = self._orig_figure
+        plt.show = self._orig_show
+        return False
 
 
 def select_baseline(
@@ -224,104 +346,229 @@ def select_baseline(
     signal_values: np.ndarray,
     window: int = 50,
     filename: str | None = None,
-) -> tuple[np.ndarray, tuple[float, float]] | None | str:
+) -> tuple[np.ndarray, tuple[float, float] | dict] | None | str:
     """
-    Select baseline by clicking two points, show corrected data, and get confirmation.
-    
-    Returns:
-    --------
-    Tuple of (baseline_corrected_signal, (slope, intercept)) if accepted
+    Interactive baseline selection with two modes:
+
+    - **Line** (default, 2 clicks): straight-line fit, returns
+      ``(corrected_signal, (slope, intercept))``.
+    - **Curve** (≥3 clicks): polynomial fit (degree auto, 1/2/3 depending on
+      click count), returns ``(corrected_signal, {"mode": "curve",
+      "degree": int, "coeffs": [...], "click_points": [(t, y), ...],
+      "window": int})``.
+
+    The window-size used for averaging around each click can be changed
+    on-the-fly via the TextBox at the top of the window.
+
+    Returns
+    -------
+    Tuple of (baseline_corrected_signal, baseline_metadata) if accepted
     None if dataset is discarded
     "redraw" if user wants to retry baseline selection
     """
+    # Mutable container for the window size so closures inside the while-loop
+    # can update it via the TextBox.  Persists across Redraws.
+    current_window = {"value": int(window)}
+
     # Step 1: Select baseline points
     while True:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.80)
+        fig, ax = plt.subplots(figsize=(11, 6.8))
+        try:
+            fig.canvas.manager.set_window_title(
+                "SensorFit — Baseline selection"
+                + (f": {truncate_filename(filename)}" if filename else "")
+            )
+        except Exception:
+            pass
+        # Leave room above the plot for two rows of controls without
+        # overlapping the instruction banner.
+        plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.66)
         ax.plot(time_values, signal_values, "b-", lw=1, label="Raw data")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Current (A)")
-        title = "Click two points to define baseline (average of 20 points around each click)"
+        title = "Baseline selection — Line (2 clicks) or Curve (≥3 clicks)"
         if filename:
             display_name = truncate_filename(filename)
             title = f"{display_name}\n{title}"
         ax.set_title(title)
         ax.legend()
         ax.grid(True, alpha=0.3)
-        
-        # Add instructions text box
-        instructions_text = (
-            "Use the toolbar zoom/pan tools to explore the data. Deselect those tools, then click "
-            "two points to define the baseline. Each click averages 20 surrounding points."
-        )
-        add_instruction_banner(fig, instructions_text)
 
+        # Compact, single-line banner so it never overlaps the mode buttons.
+        add_instruction_banner(
+            fig,
+            "Pick Line / Curve below; click on the plot to add points; "
+            "type a new Window then Enter.",
+            y=0.985, width=130,
+        )
+
+        # Mode + window controls along the top, well below the banner.
+        ax_mode_line = fig.add_axes([0.10, 0.74, 0.10, 0.05])
+        ax_mode_curve = fig.add_axes([0.21, 0.74, 0.10, 0.05])
+        ax_window = fig.add_axes([0.46, 0.745, 0.07, 0.04])
+        mode_state = {"mode": "line"}
+
+        btn_mode_line = create_small_button(ax_mode_line, "Line", "#90ee90", "#7cd47c")
+        btn_mode_curve = create_small_button(ax_mode_curve, "Curve", "0.85", "0.75")
+        tb_window = TextBox(ax_window, "Window ±", initial=str(current_window["value"]))
+
+        baseline_indices: list[int] = []  # click indices for re-averaging
         baseline_points: list[tuple[float, float]] = []
-        baseline_line = None
+        click_markers: list = []  # one matplotlib artist per click
+        overlay_artist = {"line": None}
         state = {"action": None}
 
-        def update_baseline_line() -> None:
-            nonlocal baseline_line
-            if len(baseline_points) == 2:
-                if baseline_line is not None:
-                    baseline_line.remove()
-                t1, y1 = baseline_points[0]
-                t2, y2 = baseline_points[1]
-                baseline_line, = ax.plot([t1, t2], [y1, y2], "r--", lw=2, label="Baseline")
-                ax.legend()
+        def _recompute_points_from_indices() -> None:
+            """Re-run windowed averaging at each stored click index using
+            the current window value.  Updates baseline_points and the marker
+            positions in place."""
+            w = current_window["value"]
+            baseline_points.clear()
+            for idx, marker in zip(baseline_indices, click_markers):
+                avg_current = average_window(signal_values, idx, w)
+                avg_time = time_values[idx]
+                baseline_points.append((float(avg_time), float(avg_current)))
+                marker.set_data([avg_time], [avg_current])
+
+        def update_baseline_overlay() -> None:
+            """Draw the line (line mode) or polynomial fit (curve mode)."""
+            if overlay_artist["line"] is not None:
+                try:
+                    overlay_artist["line"].remove()
+                except Exception:
+                    pass
+                overlay_artist["line"] = None
+
+            if not baseline_points:
                 fig.canvas.draw_idle()
+                return
+
+            if mode_state["mode"] == "line":
+                if len(baseline_points) == 2:
+                    t1, y1 = baseline_points[0]
+                    t2, y2 = baseline_points[1]
+                    artist, = ax.plot(
+                        [t1, t2], [y1, y2], "r--", lw=2, label="Baseline (line)"
+                    )
+                    overlay_artist["line"] = artist
+            else:  # curve
+                if len(baseline_points) >= 2:
+                    t_clicks = [p[0] for p in baseline_points]
+                    y_clicks = [p[1] for p in baseline_points]
+                    try:
+                        fit = _fit_baseline_polynomial(t_clicks, y_clicks, time_values)
+                        deg_used = min(len(baseline_points) - 1, 3)
+                        artist, = ax.plot(
+                            time_values, fit, "r--", lw=2,
+                            label=f"Baseline (curve, deg {deg_used})",
+                        )
+                        overlay_artist["line"] = artist
+                    except Exception as exc:
+                        print(f"Curve fit failed: {exc}")
+
+            ax.legend(loc="best")
+            fig.canvas.draw_idle()
+
+        def _toolbar_active() -> bool:
+            toolbar = fig.canvas.toolbar
+            if toolbar is None:
+                return False
+            mode = getattr(toolbar, "mode", "")
+            if mode in ("zoom rect", "pan/zoom", "zoom", "pan"):
+                return True
+            is_active = getattr(toolbar, "_active", None)
+            if is_active and is_active not in ("", None):
+                s = str(is_active).upper()
+                if "ZOOM" in s or "PAN" in s:
+                    return True
+            return False
 
         def on_click(event) -> None:
-            # Only register clicks when:
-            # 1. Left mouse button
-            # 2. Click is inside the axes
-            # 3. Navigation toolbar is not in zoom/pan mode
             if event.button != 1 or event.inaxes != ax:
                 return
-            
-            # Check if navigation toolbar is active (zoom/pan mode)
-            # When zoom/pan tools are active, clicks are consumed by those tools
-            toolbar = fig.canvas.toolbar
-            if toolbar is not None:
-                # Check various ways the toolbar might indicate an active tool
-                mode = getattr(toolbar, 'mode', '')
-                # Some backends use '_active' attribute
-                is_active = getattr(toolbar, '_active', None)
-                
-                # If toolbar mode indicates zoom/pan is active, ignore click
-                if mode in ('zoom rect', 'pan/zoom', 'zoom', 'pan'):
-                    return
-                
-                # If there's an active tool (like zoom), ignore click
-                # The toolbar's _active attribute might be a string like 'ZOOM' or 'PAN'
-                if is_active and is_active not in ('', None):
-                    # Check if it's a navigation tool (not just None/empty)
-                    active_str = str(is_active).upper()
-                    if 'ZOOM' in active_str or 'PAN' in active_str:
-                        return
-            
-            # Register the click as a baseline point
+            if _toolbar_active():
+                return
+            if mode_state["mode"] == "line" and len(baseline_indices) >= 2:
+                print("Line mode: 2 points already selected.  Redraw to start over.")
+                return
+
             idx = int(np.abs(time_values - event.xdata).argmin())
-            avg_current = average_window(signal_values, idx, window)
+            w = current_window["value"]
+            avg_current = average_window(signal_values, idx, w)
             avg_time = time_values[idx]
-            
+
+            baseline_indices.append(idx)
             baseline_points.append((float(avg_time), float(avg_current)))
-            ax.plot(avg_time, avg_current, "ro", ms=8, zorder=5)
+            marker, = ax.plot(avg_time, avg_current, "ro", ms=8, zorder=5)
+            click_markers.append(marker)
+            update_baseline_overlay()
+
+            n = len(baseline_indices)
+            print(f"Point #{n}: t={avg_time:.3f} s, I={avg_current:.6e} A (window ±{w})")
+
+        def on_mode_line(_event=None) -> None:
+            if mode_state["mode"] == "line":
+                return
+            mode_state["mode"] = "line"
+            btn_mode_line.color = "#90ee90"
+            btn_mode_curve.color = "0.85"
+            while len(baseline_indices) > 2:
+                baseline_indices.pop()
+                baseline_points.pop()
+                marker = click_markers.pop()
+                try:
+                    marker.remove()
+                except Exception:
+                    pass
+            update_baseline_overlay()
             fig.canvas.draw_idle()
-            
-            if len(baseline_points) == 2:
-                update_baseline_line()
-                print(f"\nBaseline points selected:")
-                print(f"  Point 1: t={baseline_points[0][0]:.3f} s, I={baseline_points[0][1]:.6e} A")
-                print(f"  Point 2: t={baseline_points[1][0]:.3f} s, I={baseline_points[1][1]:.6e} A")
-                print("Click 'Continue' to see baseline-corrected data, 'Redraw' to select again, or 'Discard' to skip this file.")
+            print("Mode → Line (2 clicks)")
+
+        def on_mode_curve(_event=None) -> None:
+            if mode_state["mode"] == "curve":
+                return
+            mode_state["mode"] = "curve"
+            btn_mode_line.color = "0.85"
+            btn_mode_curve.color = "#90ee90"
+            update_baseline_overlay()
+            fig.canvas.draw_idle()
+            print("Mode → Curve (click ≥3 points; polynomial fit, degree auto)")
+
+        def on_window_submit(text: str) -> None:
+            try:
+                w = int(float(text))
+            except ValueError:
+                print(f"Window must be a non-negative integer; got '{text}'.  Keeping {current_window['value']}.")
+                tb_window.set_val(str(current_window["value"]))
+                return
+            if w < 0:
+                print(f"Window must be ≥0; got {w}.  Keeping {current_window['value']}.")
+                tb_window.set_val(str(current_window["value"]))
+                return
+            current_window["value"] = w
+            _recompute_points_from_indices()
+            update_baseline_overlay()
+            if w == 0:
+                print("Window updated to ±0; points are now the exact clicked sample.")
+            else:
+                print(f"Window updated to ±{w}; all existing points re-averaged.")
+
+        btn_mode_line.on_clicked(on_mode_line)
+        btn_mode_curve.on_clicked(on_mode_curve)
+        tb_window.on_submit(on_window_submit)
 
         def on_continue(_event) -> None:
-            if len(baseline_points) == 2:
-                state["action"] = "continue"
-                plt.close(fig)
+            n = len(baseline_indices)
+            if mode_state["mode"] == "line":
+                if n != 2:
+                    print("Line mode needs exactly 2 points.")
+                    return
             else:
-                print("Please select two points first.")
+                if n < 2:
+                    print("Curve mode needs at least 2 points (≥3 recommended).")
+                    return
+            state["action"] = "continue"
+            plt.close(fig)
 
         def on_redraw(_event) -> None:
             state["action"] = "redraw"
@@ -358,15 +605,14 @@ def select_baseline(
 
         print(
             "\nBaseline selection:\n"
-            "  • Use the toolbar zoom/pan buttons to explore the data.\n"
-            "  • When ready to select points, deselect zoom/pan tools (click the tool again to deactivate).\n"
-            "  • Then left-click on the plot to select baseline points.\n"
-            "  • Each click averages 20 surrounding points.\n"
-            "  • A red dashed line will appear connecting the two points.\n"
-            "  • Use buttons: Continue (view corrected data), Redraw (select again), "
-            "Skip baseline (use raw signal as-is), or Discard (skip this file)."
+            "  • Top-left: choose Line (2 clicks) or Curve (≥3 clicks; polynomial fit).\n"
+            "  • Top-centre: window-size TextBox; type a number and press Enter to update.\n"
+            "  • Click on the plot to add baseline points.\n"
+            "  • Buttons: Continue (apply baseline) | Redraw | Skip baseline | Discard.\n"
+            "  • Zoom: press z to toggle zoom-rectangle mode; drag to zoom; r to reset."
         )
 
+        install_zoom_keys(fig, ax)
         plt.show()
         plt.close(fig)
 
@@ -376,28 +622,49 @@ def select_baseline(
         if action == "redraw":
             continue
         if action == "skip":
+            # Skip the Step-2 review entirely — no baseline to confirm.
             print(
                 "\nBaseline selection skipped by user. "
                 "Proceeding with raw signal as baseline-corrected data."
             )
-            corrected_signal = signal_values.copy()
-            slope = 0.0
-            intercept = 0.0
-            return corrected_signal, (slope, intercept)
-        if action == "continue" and len(baseline_points) == 2:
-            t1, y1 = baseline_points[0]
-            t2, y2 = baseline_points[1]
-            if abs(t2 - t1) < 1e-9:
-                slope = 0.0
-                intercept = y1
-            else:
-                slope = (y2 - y1) / (t2 - t1)
-                intercept = y1 - slope * t1
-            
-            baseline_values = slope * time_values + intercept
-            corrected_signal = signal_values - baseline_values
-            
-            print(f"\nBaseline calculated: slope={slope:.6e} A/s, intercept={intercept:.6e} A")
+            return signal_values.copy(), (0.0, 0.0)
+
+        if action == "continue":
+            if mode_state["mode"] == "line":
+                t1, y1 = baseline_points[0]
+                t2, y2 = baseline_points[1]
+                if abs(t2 - t1) < 1e-9:
+                    slope_v = 0.0
+                    intercept_v = y1
+                else:
+                    slope_v = (y2 - y1) / (t2 - t1)
+                    intercept_v = y1 - slope_v * t1
+                baseline_values = slope_v * time_values + intercept_v
+                corrected_signal = signal_values - baseline_values
+                baseline_meta = (slope_v, intercept_v)
+                print(
+                    f"\nBaseline (line): slope={slope_v:.6e} A/s, intercept={intercept_v:.6e} A"
+                )
+            else:  # curve mode
+                t_clicks = [p[0] for p in baseline_points]
+                y_clicks = [p[1] for p in baseline_points]
+                baseline_values = _fit_baseline_polynomial(
+                    t_clicks, y_clicks, time_values
+                )
+                corrected_signal = signal_values - baseline_values
+                deg_used = min(len(baseline_points) - 1, 3)
+                coeffs = np.polyfit(np.asarray(t_clicks), np.asarray(y_clicks), deg=deg_used)
+                baseline_meta = {
+                    "mode": "curve",
+                    "degree": int(deg_used),
+                    "coeffs": coeffs.tolist(),
+                    "click_points": [(float(t), float(y)) for t, y in baseline_points],
+                    "window": current_window["value"],
+                }
+                print(
+                    f"\nBaseline (curve, deg {deg_used}): fit through "
+                    f"{len(baseline_points)} click(s)"
+                )
             print("Baseline correction applied (drift removed).")
             break
     
@@ -466,9 +733,204 @@ def select_baseline(
             return "redraw"
         if confirm_action == "accept":
             print(f"Baseline correction accepted. Proceeding with corrected data.")
-            return corrected_signal, (slope, intercept)
+            return corrected_signal, baseline_meta
         
         return None
+
+
+def _fit_back_extrap_calibration_exponential(
+    time_values: np.ndarray,
+    signal_values: np.ndarray,
+    fit_start_idx: int,
+    fit_end_idx: int,
+    max_t_idx: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Fit a single exponential between `fit_start_idx` and `fit_end_idx`,
+    then evaluate it back at `time_values[max_t_idx]`.
+
+    Returns
+    -------
+    (fit_t, fit_y, extrap_t, extrap_value)
+        ``fit_t`` / ``fit_y`` are the in-range fitted curve coordinates for
+        plotting; ``extrap_t`` is the array of time-values from
+        ``time_values[max_t_idx]`` up to the start of the fit (for the red
+        dashed extrapolation line); ``extrap_value`` is the fitted current
+        at ``time_values[max_t_idx]``.
+
+    Uses ``model_Exponential`` from sensorfit.models (a*t + b + c*exp(-k*(t-t0)))
+    with three seed sets — same robustness pattern as `fit_Exponential`.
+    """
+    from scipy.optimize import curve_fit
+    from .models import model_Exponential
+
+    if fit_end_idx <= fit_start_idx + 4:
+        raise ValueError("Back-extrap fit needs >4 data points between fit-start and fit-end.")
+
+    t = time_values[fit_start_idx : fit_end_idx + 1].astype(float)
+    y = signal_values[fit_start_idx : fit_end_idx + 1].astype(float)
+
+    dur = float(t[-1] - t[0]) if t[-1] != t[0] else 1.0
+    amp_seed = float(y[0] - y[-1])
+    slope_seed = (y[-1] - y[0]) / dur
+
+    seeds = [
+        [slope_seed * 0.5, float(y[-1]), amp_seed * 0.5, 1.0 / max(dur * 0.3, 1e-3), float(t[0])],
+        [slope_seed * 0.3, float(y[-1]), amp_seed * 0.3, 1.0 / max(dur * 0.5, 1e-3), float(t[0])],
+        [slope_seed * 0.7, float(y[-1]), amp_seed * 0.7, 1.0 / max(dur * 0.2, 1e-3), float(t[0])],
+    ]
+    lb = [-abs(slope_seed) * 10 - 1e-9, float(min(y)) - 10 * abs(amp_seed) - 100,
+          -10 * abs(amp_seed) - 100, 0.0, float(t[0]) - dur]
+    ub = [ abs(slope_seed) * 10 + 1e-9, float(max(y)) + 10 * abs(amp_seed) + 100,
+           10 * abs(amp_seed) + 100, 10.0 / max(dur * 0.02, 1e-3), float(t[-1]) + dur]
+
+    best_popt = None
+    best_rss = float("inf")
+    last_err = None
+    for p0 in seeds:
+        try:
+            popt, _ = curve_fit(model_Exponential, t, y, p0=p0, bounds=(lb, ub), maxfev=12000)
+            yhat = model_Exponential(t, *popt)
+            if not np.all(np.isfinite(yhat)):
+                continue
+            rss = float(np.sum((y - yhat) ** 2))
+            if rss < best_rss:
+                best_rss = rss
+                best_popt = popt
+        except (RuntimeError, ValueError, TypeError) as exc:
+            last_err = exc
+    if best_popt is None:
+        raise RuntimeError(f"Back-extrap exponential fit failed: {last_err}")
+
+    fit_y = model_Exponential(t, *best_popt)
+    # Extrapolation: from t[fit_start] BACK to time_values[max_t_idx]
+    t_back = float(time_values[max_t_idx])
+    extrap_t = np.linspace(t_back, float(t[0]), 60)
+    extrap_y = model_Exponential(extrap_t, *best_popt)
+    extrap_value = float(model_Exponential(np.array([t_back]), *best_popt)[0])
+
+    return t, fit_y, extrap_t, extrap_y, extrap_value
+
+
+_CAL_ICON_BLUE = "#1f77b4"  # raw-data colour, used in BOTH icons
+
+
+def _draw_standard_calibration_icon(ax_icon) -> None:
+    """Tiny "ladder" illustration of a standard calibration trace.
+
+    A descending step-trace (current drops as each H₂O₂ aliquot is added)
+    with a small amount of noise on each plateau — to convey raw data
+    rather than a fit — and a red dot on each plateau midpoint marking
+    where the user would click.
+    """
+    ax_icon.set_xlim(-0.2, 10.2)
+    ax_icon.set_ylim(-0.3, 11.0)
+
+    rng = np.random.default_rng(7)
+    plateaus = [
+        (0.3, 1.8, 9.2),
+        (1.8, 3.5, 7.0),
+        (3.5, 5.5, 4.9),
+        (5.5, 7.5, 2.9),
+        (7.5, 9.7, 1.2),
+    ]
+    # Noisy plateaus + vertical drops between them
+    for i, (t_start, t_end, level) in enumerate(plateaus):
+        n = 22
+        t_seg = np.linspace(t_start, t_end, n)
+        y_seg = level + rng.uniform(-0.18, 0.18, n)
+        ax_icon.plot(t_seg, y_seg, color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85)
+        if i + 1 < len(plateaus):
+            next_level = plateaus[i + 1][2]
+            ax_icon.plot(
+                [t_end, t_end], [level, next_level],
+                color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85,
+            )
+    # Red dots on plateau midpoints (the calibration clicks)
+    for t_start, t_end, level in plateaus:
+        ax_icon.plot(
+            [(t_start + t_end) / 2], [level],
+            "o", color="red", ms=2.5, zorder=5,
+        )
+    ax_icon.set_xticks([])
+    ax_icon.set_yticks([])
+    for spine in ax_icon.spines.values():
+        spine.set_visible(False)
+
+
+def _draw_back_extrap_calibration_icon(ax_icon) -> None:
+    """Tiny illustration of a back-extrapolation calibration.
+
+    Shows the typical pattern of a reaction started by H₂O₂ injection:
+      - noisy baseline (small negative current)
+      - vertical dashed purple line at the injection time (this is
+        click 2 in the real flow — "t([H₂O₂]max)")
+      - a sharp DROP at injection (current goes more negative because
+        the freshly-injected H₂O₂ pulls current strongly)
+      - noisy "deadtime" briefly after the spike
+      - clean exponential recovery as H₂O₂ is consumed (current rises
+        back toward baseline)
+      - red dashed back-extrapolation of the fit going BACK across the
+        deadtime to the injection vertical line
+      - open red circle at the back-extrap target (the model's
+        prediction of where the current would have been at injection)
+    """
+    ax_icon.set_xlim(-0.2, 10.2)
+    ax_icon.set_ylim(-0.3, 11.0)
+
+    inj_t = 1.5
+    baseline = 9.0
+    amp = 6.5            # current drop amplitude
+    k = 0.20             # recovery rate (mild — keeps back-extrap on-screen)
+    t_clean_start = inj_t + 1.0  # 2.5 s — end of deadtime
+
+    rng = np.random.default_rng(7)
+
+    # Pre-injection baseline (small noise)
+    n_pre = 14
+    t_pre = np.linspace(0.2, inj_t, n_pre)
+    y_pre = baseline + rng.uniform(-0.18, 0.18, n_pre)
+    ax_icon.plot(t_pre, y_pre, color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85)
+
+    # Vertical dashed purple line at injection (matches click 2 in real flow)
+    ax_icon.axvline(inj_t, color="#8B008B", lw=1.0, ls="--", alpha=0.85)
+
+    # Sharp DROP at injection (negative-going current spike)
+    spike_bottom = 1.8
+    ax_icon.plot(
+        [inj_t, inj_t], [baseline, spike_bottom],
+        color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85,
+    )
+
+    # Deadtime: very noisy briefly after the spike
+    n_dead = 14
+    t_dead = np.linspace(inj_t, t_clean_start, n_dead)
+    y_dead = spike_bottom + rng.uniform(-0.9, 0.7, n_dead)
+    y_dead[0] = spike_bottom
+    ax_icon.plot(t_dead, y_dead, color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85)
+
+    # Clean exponential recovery from t_clean_start onward (light noise)
+    n_clean = 40
+    t_clean = np.linspace(t_clean_start, 9.7, n_clean)
+    y_clean_smooth = baseline - amp * np.exp(-k * (t_clean - t_clean_start))
+    y_clean_noisy = y_clean_smooth + rng.uniform(-0.22, 0.22, n_clean)
+    ax_icon.plot(t_clean, y_clean_noisy, color=_CAL_ICON_BLUE, lw=0.9, alpha=0.85)
+
+    # Back-extrapolation of the FIT (smooth, no noise) from t_clean_start
+    # back to inj_t
+    t_extrap = np.linspace(inj_t, t_clean_start, 15)
+    y_extrap = baseline - amp * np.exp(-k * (t_extrap - t_clean_start))
+    ax_icon.plot(t_extrap, y_extrap, "--", color="red", lw=1.5)
+
+    # Red open circle at the back-extrap target (model prediction at
+    # injection time).  With baseline=9, amp=6.5, k=0.20 this lands
+    # around y=1.1 — well inside the (−0.3, 11) y-range.
+    ax_icon.plot([inj_t], [float(y_extrap[0])],
+                 "o", mfc="none", mec="red", mew=1.5, ms=5)
+
+    ax_icon.set_xticks([])
+    ax_icon.set_yticks([])
+    for spine in ax_icon.spines.values():
+        spine.set_visible(False)
 
 
 def select_points(
@@ -478,20 +940,60 @@ def select_points(
     current_calibration_values: list[float],
     update_calibration_callback: Callable[[list[float], bool], None] | None = None,
     filename: str | None = None,
-) -> tuple[list[int], list[float]] | str:
-    """Select calibration points interactively."""
+    window: int = 50,
+) -> tuple[list[int], list[float], list[float]] | str:
+    """Select calibration points interactively.
+
+    Returns a uniform 3-tuple ``(indices, calibration_values, mean_currents)``
+    in BOTH modes (or a sentinel string for discard / go-back).  The
+    ``mean_currents`` are computed with the in-screen window the user set,
+    so the caller must NOT recompute them with the CLI ``--window``.
+
+    Two modes via the toggle at top-left:
+
+    - **Standard** (default): N-point calibration.  ``mean_currents`` is the
+      windowed-average current at each picked plateau.  In-screen window
+      defaults to ±40 (``STANDARD_DEFAULT_WINDOW``), editable.
+    - **Back-extrap (4-pt)**: pick 4 points in order — (1) baseline /
+      [H₂O₂]=0, (2) timepoint that corresponds to peak [H₂O₂] (its
+      *current* value will be back-extrapolated, so noise/deadtime here
+      is fine), (3) start of the exponential-fit region, (4) end of it.
+      The exponential is fit between (3) and (4) and evaluated at the
+      timepoint of click (2); ``mean_currents`` is then
+      ``[zero_avg_current, extrap_value]`` and ``calibration_values`` is
+      ``[zero_uM, max_uM]``.  In-screen window defaults to ±0
+      (``BACK_EXTRAP_DEFAULT_WINDOW``), editable.
+
+    The ``window`` kwarg is retained for signature compatibility but is no
+    longer used — the calibration screen uses mode-specific defaults.
+    """
     fig, ax = plt.subplots(figsize=(14, 7))
-    plt.subplots_adjust(left=0.1, bottom=0.18, right=0.95, top=0.80)
+    try:
+        fig.canvas.manager.set_window_title(
+            "SensorFit — Calibration points"
+            + (f": {truncate_filename(filename)}" if filename else "")
+        )
+    except Exception:
+        pass
+    plt.subplots_adjust(left=0.1, bottom=0.18, right=0.95, top=0.74)
     line, = ax.plot(time_values, signal_values, lw=1)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Current (A)")
-    
+
     selected_indices: list[int] = []
     selected_markers: list = []
-    
+
     # Use a mutable container for num_points so it can be updated
     num_points_ref = {"value": num_points}
-    
+    # Per-mode default windows.  The CLI --window value is intentionally
+    # NOT used here — calibration plateau picks need a wider window
+    # (Standard mode default ±40 samples) while back-extrap clicks need
+    # the exact sample at the click (±0).  The user can still edit the
+    # TextBox to override.
+    STANDARD_DEFAULT_WINDOW = 40
+    BACK_EXTRAP_DEFAULT_WINDOW = 0
+    current_window = {"value": STANDARD_DEFAULT_WINDOW}
+
     state = {
         "calibration_values": current_calibration_values.copy(),
         "selection_enabled": True,
@@ -500,74 +1002,270 @@ def select_points(
         "discard": False,
     }
 
+    # Mode-toggle and per-click window controls along the top of the figure
+    mode_state = {"mode": "standard"}  # "standard" | "back_extrap"
+    back_extrap_state = {
+        "fit_artists": [],       # matplotlib artists drawn from the back-extrap fit
+        "extrap_value": None,    # back-extrapolated current at click-2's t
+        "fit_succeeded": False,  # gates the Accept button in back-extrap mode
+    }
+
+    ax_mode_std = fig.add_axes([0.05, 0.85, 0.12, 0.05])
+    ax_mode_be = fig.add_axes([0.18, 0.85, 0.14, 0.05])
+    ax_window = fig.add_axes([0.42, 0.86, 0.06, 0.04])
+    btn_mode_std = create_small_button(ax_mode_std, "Standard", "#90ee90", "#7cd47c")
+    btn_mode_be = create_small_button(ax_mode_be, "Back-extrap (4-pt)", "0.85", "0.75")
+    tb_window = TextBox(ax_window, "Window ±", initial=str(current_window["value"]))
+
+    # ── Tiny illustration axes above each mode button (logo-style hints
+    # at what each mode is for).  Sized to fit cleanly between the banner
+    # (y≈0.96 at the bottom) and the button row (y=0.90 at the top), with
+    # a small gap on each side.
+    ax_icon_std = fig.add_axes([0.05, 0.905, 0.13, 0.05])
+    ax_icon_be = fig.add_axes([0.19, 0.905, 0.15, 0.05])
+    _draw_standard_calibration_icon(ax_icon_std)
+    _draw_back_extrap_calibration_icon(ax_icon_be)
+
+    BACK_EXTRAP_ROLES = ["[H₂O₂]=0", "t([H₂O₂]max)", "fit-start", "fit-end"]
+    BACK_EXTRAP_COLORS = ["gold", "darkorange", "tab:blue", "tab:blue"]
+
+    def _effective_num_points() -> int:
+        return 4 if mode_state["mode"] == "back_extrap" else num_points_ref["value"]
+
     def update_title() -> None:
-        current_num_points = num_points_ref["value"]
-        remaining = current_num_points - len(selected_indices)
-        if remaining > 0:
-            title = f"Select {remaining} more calibration point(s). Use zoom/pan tools, then click when ready."
+        target = _effective_num_points()
+        remaining = target - len(selected_indices)
+        if mode_state["mode"] == "back_extrap":
+            if remaining > 0:
+                next_role = BACK_EXTRAP_ROLES[len(selected_indices)]
+                title = (
+                    f"Back-extrap mode: click {remaining} more point(s).  "
+                    f"Next click = {next_role}."
+                )
+            elif back_extrap_state["fit_succeeded"]:
+                title = (
+                    f"Back-extrap fit OK.  Extrapolated current at click-2 = "
+                    f"{back_extrap_state['extrap_value']:.4e} A.  "
+                    "Continue to apply, or Retry."
+                )
+            else:
+                title = "Back-extrap fit failed.  Click Retry."
         else:
-            title = f"All {current_num_points} points selected. Use buttons below to Continue or Retry."
+            if remaining > 0:
+                title = (
+                    f"Standard mode: select {remaining} more calibration point(s).  "
+                    f"Use zoom/pan or hotkey 'z'."
+                )
+            else:
+                title = f"All {target} points selected.  Continue or Retry."
         if filename:
             display_name = truncate_filename(filename)
             title = f"{display_name}\n{title}"
         ax.set_title(title)
         fig.canvas.draw_idle()
-    
+
+    def _toolbar_active() -> bool:
+        toolbar = fig.canvas.toolbar
+        if toolbar is None:
+            return False
+        if getattr(toolbar, "mode", "") in ("zoom rect", "pan/zoom", "zoom", "pan"):
+            return True
+        is_active = getattr(toolbar, "_active", None)
+        if is_active and is_active not in ("", None):
+            s = str(is_active).upper()
+            if "ZOOM" in s or "PAN" in s:
+                return True
+        return False
+
+    def _clear_back_extrap_overlay() -> None:
+        for artist in back_extrap_state["fit_artists"]:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        back_extrap_state["fit_artists"] = []
+        back_extrap_state["extrap_value"] = None
+        back_extrap_state["fit_succeeded"] = False
+
+    def _run_back_extrap_fit() -> None:
+        """Fit + draw the back-extrapolation overlay using the 4 stored clicks."""
+        _clear_back_extrap_overlay()
+        zero_idx, max_t_idx, fit_start_idx, fit_end_idx = selected_indices
+        # Ensure ordering (fit-start < fit-end and both > max_t_idx)
+        if fit_end_idx <= fit_start_idx:
+            print("  ✗ Back-extrap: fit-end must come after fit-start.  Click Retry.")
+            return
+        if fit_start_idx <= max_t_idx:
+            print("  ✗ Back-extrap: fit-start must come after the [H₂O₂]max timepoint.  Click Retry.")
+            return
+        try:
+            fit_t, fit_y, extrap_t, extrap_y, extrap_value = _fit_back_extrap_calibration_exponential(
+                time_values, signal_values, fit_start_idx, fit_end_idx, max_t_idx
+            )
+        except Exception as exc:
+            print(f"  ✗ Back-extrap fit failed: {exc}.  Click Retry.")
+            return
+
+        # Draw the fitted exponential in solid red, then a dashed extrapolation
+        # back from fit-start to the time of max-t (click 2).
+        line_fit, = ax.plot(fit_t, fit_y, "r-", lw=1.6, label="Exp fit")
+        line_extrap, = ax.plot(extrap_t, extrap_y, "r--", lw=1.6, alpha=0.85, label="Back-extrap")
+        # Highlight the extrapolated point at the t of click 2
+        t_b = float(time_values[max_t_idx])
+        circle, = ax.plot(
+            [t_b], [extrap_value],
+            "o", ms=14, mfc="none", mec="red", mew=2.5, zorder=6,
+            label="Back-extrap value",
+        )
+        ax.legend(loc="best", fontsize=9)
+        back_extrap_state["fit_artists"] = [line_fit, line_extrap, circle]
+        back_extrap_state["extrap_value"] = float(extrap_value)
+        back_extrap_state["fit_succeeded"] = True
+        # Expand the y-axis so the back-extrap circle is always visible,
+        # even when the extrapolation lands well above the original data.
+        ymin, ymax = ax.get_ylim()
+        margin = (ymax - ymin) * 0.10 if ymax > ymin else abs(extrap_value) * 0.10 or 1.0
+        new_ymin = min(ymin, extrap_value - margin)
+        new_ymax = max(ymax, extrap_value + margin)
+        if (new_ymin, new_ymax) != (ymin, ymax):
+            ax.set_ylim(new_ymin, new_ymax)
+        fig.canvas.draw_idle()
+        print(
+            f"  ✓ Back-extrap fit succeeded; extrapolated I at t={t_b:.3f}s = "
+            f"{extrap_value:.4e} A."
+        )
+
     def on_button_press(event) -> None:
         if event.button != 1 or event.inaxes != ax:
             return
-        
-        current_num_points = num_points_ref["value"]
-        if len(selected_indices) >= current_num_points:
+
+        target = _effective_num_points()
+        if len(selected_indices) >= target:
             return
-        
-        toolbar = fig.canvas.toolbar
-        if toolbar is not None:
-            mode = getattr(toolbar, 'mode', '')
-            is_active = getattr(toolbar, '_active', None)
-            if mode in ('zoom rect', 'pan/zoom', 'zoom', 'pan'):
-                return
-            if is_active and is_active not in ('', None):
-                active_str = str(is_active).upper()
-                if 'ZOOM' in active_str or 'PAN' in active_str:
-                    return
-        
+
+        if _toolbar_active():
+            return
+
         idx = int(np.abs(time_values - event.xdata).argmin())
         selected_indices.append(idx)
-        
-        marker, = ax.plot(
-            time_values[idx],
-            signal_values[idx],
-            "ro",
-            ms=10,
-            markeredgecolor="yellow",
-            markeredgewidth=2,
-            zorder=5,
-        )
+
+        if mode_state["mode"] == "back_extrap":
+            n_clicks = len(selected_indices)  # 1, 2, 3, 4
+            role = BACK_EXTRAP_ROLES[n_clicks - 1]
+            if n_clicks == 2:
+                # The t([H₂O₂]max) click — ONLY the x-value matters
+                # (it's used as the extrapolation target time).  The
+                # y-value can sit inside the deadtime and so is unreliable.
+                # Draw a vertical dashed line at the click's t instead of
+                # a circle.
+                marker = ax.axvline(
+                    time_values[idx], color="darkorange",
+                    lw=1.8, ls="--", alpha=0.9, zorder=5,
+                    label=role,
+                )
+            else:
+                colour = BACK_EXTRAP_COLORS[n_clicks - 1]
+                marker, = ax.plot(
+                    time_values[idx], signal_values[idx],
+                    "o", ms=12, mfc=colour, mec="black", mew=1.5, zorder=5,
+                    label=role,
+                )
+        else:
+            marker, = ax.plot(
+                time_values[idx],
+                signal_values[idx],
+                "ro", ms=10,
+                markeredgecolor="yellow", markeredgewidth=2, zorder=5,
+            )
         selected_markers.append(marker)
         fig.canvas.draw_idle()
-        
         update_title()
-        
-        current_num_points = num_points_ref["value"]
-        if len(selected_indices) == current_num_points:
-            print(f"\nAll {current_num_points} calibration points selected.")
+
+        if mode_state["mode"] == "back_extrap" and len(selected_indices) == 4:
+            _run_back_extrap_fit()
+            update_title()
+        elif mode_state["mode"] == "standard" and len(selected_indices) == target:
+            print(f"\nAll {target} calibration points selected.")
             print("Click 'Continue' to proceed or 'Retry' to select again.")
 
+    def on_mode_standard(_event=None) -> None:
+        if mode_state["mode"] == "standard":
+            return
+        mode_state["mode"] = "standard"
+        btn_mode_std.color = "#90ee90"
+        btn_mode_be.color = "0.85"
+        # Reset state + restore the mode's default window (user can edit).
+        on_retry(None)
+        current_window["value"] = STANDARD_DEFAULT_WINDOW
+        tb_window.set_val(str(STANDARD_DEFAULT_WINDOW))
+        print(
+            f"Calibration mode → Standard (N-point).  "
+            f"Window reset to ±{STANDARD_DEFAULT_WINDOW} (editable)."
+        )
+
+    def on_mode_back_extrap(_event=None) -> None:
+        if mode_state["mode"] == "back_extrap":
+            return
+        mode_state["mode"] = "back_extrap"
+        btn_mode_std.color = "0.85"
+        btn_mode_be.color = "#90ee90"
+        on_retry(None)
+        current_window["value"] = BACK_EXTRAP_DEFAULT_WINDOW
+        tb_window.set_val(str(BACK_EXTRAP_DEFAULT_WINDOW))
+        print(
+            f"Calibration mode → Back-extrap (4-pt).  "
+            f"Window reset to ±{BACK_EXTRAP_DEFAULT_WINDOW} (editable)."
+        )
+        print("  Click 4 points in order: [H₂O₂]=0, t([H₂O₂]max), fit-start, fit-end.")
+
+    def on_window_submit(text: str) -> None:
+        try:
+            w = int(float(text))
+        except ValueError:
+            print(f"Window must be a non-negative integer; got '{text}'.")
+            tb_window.set_val(str(current_window["value"]))
+            return
+        if w < 0:
+            print(f"Window must be ≥0.")
+            tb_window.set_val(str(current_window["value"]))
+            return
+        current_window["value"] = w
+        if w == 0:
+            print("Calibration window updated to ±0 (single sample, no averaging).")
+        else:
+            print(f"Calibration window updated to ±{w}.")
+
     def on_continue(_event) -> None:
-        current_num_points = num_points_ref["value"]
-        if len(selected_indices) == current_num_points:
-            # Save final values
+        target = _effective_num_points()
+        if mode_state["mode"] == "back_extrap":
+            if len(selected_indices) != 4:
+                print("Back-extrap mode needs all 4 points selected.")
+                return
+            if not back_extrap_state["fit_succeeded"]:
+                print("Back-extrap fit hasn't succeeded yet.  Click Retry and re-pick.")
+                return
+            state["action"] = "continue"
+            plt.close(fig)
+            return
+        if len(selected_indices) == target:
             state["action"] = "continue"
             plt.close(fig)
         else:
-            print(f"Please select all {current_num_points} points before continuing.")
+            print(f"Please select all {target} points before continuing.")
 
     def on_retry(_event) -> None:
         selected_indices.clear()
         while selected_markers:
             marker = selected_markers.pop()
-            marker.remove()
+            try:
+                marker.remove()
+            except Exception:
+                pass
+        _clear_back_extrap_overlay()
+        # Remove any leftover legend artists from prior fits
+        leg = ax.get_legend()
+        if leg is not None:
+            leg.remove()
         state["action"] = None
         fig.canvas.draw_idle()
         update_title()
@@ -604,14 +1302,16 @@ def select_points(
             fig.canvas.draw_idle()
     
     fig.canvas.mpl_connect("button_press_event", on_button_press)
+    btn_mode_std.on_clicked(on_mode_standard)
+    btn_mode_be.on_clicked(on_mode_back_extrap)
+    tb_window.on_submit(on_window_submit)
 
-    # Add instructions text box
-    instructions_text = (
-        f"Click on the plot to select {num_points} calibration points. Use zoom/pan tools to "
-        "explore data (deselect them before clicking). Selected points appear as red circles. "
-        "Use 'Change calibration values' to edit values or change the number of points."
+    add_instruction_banner(
+        fig,
+        "Pick mode below; click on the plot to add calibration points; "
+        "edit Window ± and press Enter to apply.",
+        y=0.985, width=140,
     )
-    add_instruction_banner(fig, instructions_text)
     
     # Create buttons - adjust layout to fit "Change calibration values" button
     ax_change_cal = plt.axes([0.05, 0.11, 0.18, 0.04])
@@ -635,30 +1335,63 @@ def select_points(
     
     print(
         "\nCalibration point selection:\n"
-        "  • Use the toolbar zoom/pan buttons to explore the data.\n"
-        "  • When ready to select points, deselect zoom/pan tools.\n"
-        "  • Then left-click on the plot to select calibration points.\n"
-        "  • Selected points will be marked with red circles.\n"
-        f"  • Select {num_points} points total, then click 'Continue' or 'Retry'.\n"
-        "  • Use 'Change calibration values' to edit calibration values or change the number of points.\n"
-        "  • Use 'Go Back' to return to baseline selection.\n"
-        "  • Use 'Discard' to skip this file entirely."
+        "  • Standard mode: pick N points across a [H₂O₂] ladder.\n"
+        "  • Back-extrap mode (4-pt): pick zero / t-of-max / fit-start / fit-end;\n"
+        "    SensorFit fits an exponential between the last two and extrapolates\n"
+        "    BACK to the t-of-max click → use this when the run starts with H₂O₂\n"
+        "    injection and the deadtime keeps you from a clean max-[H₂O₂] point.\n"
+        "  • Window TextBox: type a new value and press Enter.\n"
+        "  • Buttons: Change values | Retry | Go Back | Discard | Continue.\n"
+        "  • Zoom: press z to toggle zoom-rectangle mode; drag to zoom; r to reset."
     )
 
+    install_zoom_keys(fig, ax)
     plt.show()
     plt.close(fig)
-    
+
     if state["discard"]:
         return "discard"
-    
+
     if state["go_back_to_baseline"]:
         return "go_back_to_baseline"
-    
+
+    if mode_state["mode"] == "back_extrap":
+        if state["action"] != "continue" or len(selected_indices) != 4 or not back_extrap_state["fit_succeeded"]:
+            raise RuntimeError("Back-extrap selection incomplete or fit failed.")
+        zero_idx = selected_indices[0]
+        max_t_idx = selected_indices[1]
+        # Two-point calibration anchors: (zero_avg_current, 0 µM) and
+        # (extrap_value, max_uM where max_uM = LAST entry of calibration_values).
+        cvals = state["calibration_values"]
+        if not cvals:
+            raise RuntimeError("Calibration values list is empty.")
+        zero_uM = float(cvals[0])
+        max_uM = float(cvals[-1])
+        zero_avg = float(average_window(signal_values, zero_idx, current_window["value"]))
+        extrap_value = float(back_extrap_state["extrap_value"])
+        # Return 3-tuple: caller detects the override and uses these mean_currents
+        # in place of computing from indices.
+        return (
+            [zero_idx, max_t_idx],
+            [zero_uM, max_uM],
+            [zero_avg, extrap_value],
+        )
+
     final_num_points = num_points_ref["value"]
     if state["action"] != "continue" or len(selected_indices) != final_num_points:
         raise RuntimeError(f"Selection incomplete or cancelled: {len(selected_indices)}/{final_num_points} points selected.")
-    
-    return selected_indices, state["calibration_values"]
+
+    # Compute the averaged currents HERE using the in-screen window the user
+    # actually set/edited (default ±40, see STANDARD_DEFAULT_WINDOW) — NOT the
+    # CLI --window.  Returned as the 3rd element so the caller uses these
+    # directly instead of recomputing with the wrong window.  This mirrors
+    # the back-extrap branch's 3-tuple shape, so the caller can treat both
+    # modes uniformly.
+    mean_currents = [
+        average_window(signal_values, idx, current_window["value"])
+        for idx in selected_indices
+    ]
+    return selected_indices, state["calibration_values"], mean_currents
 
 
 def build_calibration(mean_currents: Sequence[float], concentrations: Sequence[float]) -> CalibrationResult:
@@ -873,12 +1606,14 @@ def select_intervals(
     def on_key(event) -> None:
         if event.key == "enter":
             confirm_and_close()
-        elif event.key in {"escape", "r"}:
+        elif event.key == "escape":
             clear_intervals()
         elif event.key == "b":
             go_back_to_calibration()
         elif event.key == "u":
             remove_last_interval()
+        # NB: 'r' is reserved for the zoom-reset hotkey installed by
+        # install_zoom_keys.  Use the Reselect button or Escape to clear.
 
     fig.canvas.mpl_connect("button_press_event", on_button_press)
     fig.canvas.mpl_connect("key_press_event", on_key)
@@ -923,8 +1658,10 @@ def select_intervals(
         "  • The interval will be marked with an orange span.\n"
         "  • Repeat to select multiple intervals.\n"
         "  • Use buttons: 'Remove Last', 'Reselect', 'Go Back', 'Discard', 'Continue'.\n"
-        "  • Keyboard shortcuts: Enter = Continue, Escape/R = Reselect, B = Go Back, U = Remove Last."
+        "  • Keyboard shortcuts: Enter = Continue, Escape = Reselect, B = Go Back, U = Remove Last.\n"
+        "  • Zoom: z toggles zoom-rectangle mode; drag to zoom; r resets the view."
     )
+    install_zoom_keys(fig, ax)
     plt.show()
     plt.close(fig)
     
@@ -1039,6 +1776,14 @@ def append_fit_summary(
     end_time: float,
     fit_results: dict[str, dict] | None,
     turnover_uM: float | None = None,
+    control_subtracted: bool | None = None,
+    control_group: str | None = None,
+    control_n_averaged: int | None = None,
+    variant: str = "original",
+    calibration_skipped: bool | None = None,
+    fit_number: int = 0,
+    fit_record: object | None = None,
+    delta_max_record: object | None = None,
 ) -> None:
     """
     Append fit parameters to summary Excel file (creates if doesn't exist).
@@ -1062,16 +1807,63 @@ def append_fit_summary(
     import numpy as np
     from datetime import datetime
     
-    # Prepare row data
+    # Prepare row data.  Hierarchy is (source_file, interval_index,
+    # fit_number, variant): fit_number = 0 means "interval-only" (no fit
+    # data attached), fit_number = 1, 2, … is the per-fit row.
     row_data = {
         "source_file": source_file,
         "interval_index": interval_index,
+        "fit_number": int(fit_number),
+        "variant": variant,
         "start_time_s": start_time,
         "end_time_s": end_time,
         "duration_s": end_time - start_time,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    
+
+    # New per-fit columns (when fit_record is supplied from the
+    # interval_processor flow).  These coexist with the legacy
+    # fit_results dict-style columns below.
+    if fit_record is not None:
+        row_data["fit_model"] = str(getattr(fit_record, "model", ""))
+        row_data["fit_start_s"] = float(getattr(fit_record, "fit_start_s", float("nan")))
+        row_data["fit_end_s"] = float(getattr(fit_record, "fit_end_s", float("nan")))
+        row_data["fit_init_rate_uM_per_s"] = float(getattr(fit_record, "init_rate_uM_per_s", float("nan")))
+        row_data["fit_init_rate_at_t_s"] = float(getattr(fit_record, "init_rate_at_t_s", float("nan")))
+        row_data["fit_r2"] = float(getattr(fit_record, "r2", float("nan")))
+        row_data["fit_rss"] = float(getattr(fit_record, "rss", float("nan")))
+        # Per-fit back-extrap columns
+        if getattr(fit_record, "back_extrap_applied", False):
+            row_data["fit_back_extrap_applied"] = True
+            row_data["fit_back_extrap_deadtime_s"] = float(fit_record.back_extrap_deadtime_s or float("nan"))
+            row_data["fit_back_extrap_t0_s"] = float(fit_record.back_extrap_t0_s or float("nan"))
+            row_data["fit_back_extrap_rate_uM_per_s"] = float(fit_record.back_extrap_rate_uM_per_s or float("nan"))
+        # Flatten params (e.g. fit_param_a, fit_param_b, ...)
+        names = list(getattr(fit_record, "param_names", []) or [])
+        params = list(getattr(fit_record, "params", []) or [])
+        for n, v in zip(names, params):
+            row_data[f"fit_param_{n}"] = float(v)
+
+    # Δmax (one per interval; written on each fit row for ease of analysis).
+    if delta_max_record is not None:
+        row_data["delta_max_method"] = str(getattr(delta_max_record, "method", ""))
+        row_data["delta_max_t_zero_s"] = float(getattr(delta_max_record, "t_zero_s", float("nan")))
+        row_data["delta_max_uM"] = float(getattr(delta_max_record, "value_uM", float("nan")))
+        if getattr(delta_max_record, "linear_slope", None) is not None:
+            row_data["delta_max_linear_slope"] = float(delta_max_record.linear_slope)
+        if getattr(delta_max_record, "linear_intercept", None) is not None:
+            row_data["delta_max_linear_intercept"] = float(delta_max_record.linear_intercept)
+
+    # Control-subtraction provenance
+    if control_subtracted is not None:
+        row_data["control_subtracted"] = bool(control_subtracted)
+    if control_group is not None:
+        row_data["control_group"] = str(control_group)
+    if control_n_averaged is not None and control_n_averaged > 0:
+        row_data["control_n_averaged"] = int(control_n_averaged)
+    if calibration_skipped is not None:
+        row_data["calibration_skipped"] = bool(calibration_skipped)
+
     # Add fit parameters for each model
     if fit_results:
         # Find best model by AIC (skip LinearInitialRate for best model selection)
@@ -1167,15 +1959,63 @@ def append_fit_summary(
             df = pd.DataFrame()
     else:
         df = pd.DataFrame()
-    
+
+    # Idempotent upsert: if a row for the same
+    # (source_file, interval_index, fit_number, variant) already exists,
+    # drop it so the new row replaces it cleanly when a user redoes a file.
+    # fit_number = 0 is the interval-only row; > 0 is per-fit.
+    if not df.empty and "source_file" in df.columns and "interval_index" in df.columns:
+        if "variant" not in df.columns:
+            df["variant"] = "original"
+        if "fit_number" not in df.columns:
+            df["fit_number"] = 0
+        same_key = (
+            (df["source_file"] == source_file)
+            & (df["interval_index"] == interval_index)
+            & (df["fit_number"].fillna(0).astype(int) == int(fit_number))
+            & (df["variant"].fillna("original") == variant)
+        )
+        if same_key.any():
+            df = df.loc[~same_key].reset_index(drop=True)
+
     # Append new row
     new_row = pd.DataFrame([row_data])
     df = pd.concat([df, new_row], ignore_index=True)
     
     # Reorder columns to put important columns first (best_model, initial_rate, turnover)
     # Get the desired order: basic info, then best_model columns, then model-specific columns
-    basic_cols = ["source_file", "interval_index", "start_time_s", "end_time_s", "duration_s", "timestamp"]
-    important_cols = ["best_model", "best_model_initial_rate_uM_per_s", "turnover_before_inactivation_uM"]
+    basic_cols = [
+        "source_file", "interval_index", "fit_number", "variant",
+        "start_time_s", "end_time_s", "duration_s", "timestamp",
+    ]
+    important_cols = [
+        # Per-fit columns (new, from interval_processor)
+        "fit_model",
+        "fit_start_s",
+        "fit_end_s",
+        "fit_init_rate_uM_per_s",
+        "fit_init_rate_at_t_s",
+        "fit_back_extrap_applied",
+        "fit_back_extrap_deadtime_s",
+        "fit_back_extrap_t0_s",
+        "fit_back_extrap_rate_uM_per_s",
+        "fit_r2",
+        "fit_rss",
+        # Δmax columns (one per interval; denormalised onto each fit row)
+        "delta_max_method",
+        "delta_max_t_zero_s",
+        "delta_max_uM",
+        "delta_max_linear_slope",
+        "delta_max_linear_intercept",
+        # Legacy best-fit columns (still emitted when fit_results is supplied)
+        "best_model",
+        "best_model_initial_rate_uM_per_s",
+        "turnover_before_inactivation_uM",
+        "calibration_skipped",
+        "control_subtracted",
+        "control_group",
+        "control_n_averaged",
+    ]
     
     # Build ordered column list
     ordered_cols = []
@@ -1861,9 +2701,10 @@ def interactive_interval_fitting(
                 manual_linear_markers.clear()
                 manual_linear_points.clear()
                 apply_linear_fit_from_indices(start_idx, end_idx, "manual")
-        
+
         click_cid = fig.canvas.mpl_connect("button_press_event", handle_manual_click)
-        
+
+        install_zoom_keys(fig, [ax_data, ax_resid])
         plt.show()
         fig.canvas.mpl_disconnect(click_cid)
         plt.close(fig)
@@ -2331,9 +3172,10 @@ def calculate_turnover_before_inactivation(
                 manual_tail_markers.clear()
                 manual_tail_points.clear()
                 apply_manual_tail_fit(start_idx, end_idx)
-        
+
         click_cid = fig.canvas.mpl_connect("button_press_event", handle_manual_click)
-        
+
+        install_zoom_keys(fig, ax)
         plt.show()
         fig.canvas.mpl_disconnect(click_cid)
         plt.close(fig)
@@ -2385,10 +3227,27 @@ def review_results(
     all_fit_results: dict[int, dict[str, dict]],
     turnover_results: dict[int, float | None],
     filename: str | None = None,
+    skip_calibration: bool = False,
+    per_interval_mode: bool = False,
 ) -> str:
     """
     Display a summary of all fits and turnover results and let the user
     accept, redo any phase, or discard the file.
+
+    Parameters
+    ----------
+    skip_calibration : bool
+        When True, the "Redo baseline" and "Redo calibration" buttons are
+        hidden (those phases were never run because the input was already
+        calibrated [H₂O₂]).
+    per_interval_mode : bool
+        When True (the modern per-interval flow), the "Redo fitting" and
+        "Redo turnover" buttons are hidden — those phases no longer exist
+        as separate steps (fitting + Δmax happen inside the per-interval
+        loop).  "Redo intervals" re-runs the whole per-interval flow and is
+        relabelled accordingly.  Leaving these legacy buttons visible would
+        re-open the deprecated multi-model fitting UI (which still offers
+        GFI) and desync the per-fit data structures.
 
     Returns:
     --------
@@ -2448,15 +3307,25 @@ def review_results(
 
     # --- buttons (two rows) ---
     btn_w, btn_h, gap = 0.14, 0.05, 0.015
-    # Row 1: redo buttons
+    # Row 1: redo buttons.  Baseline + calibration are hidden in skip-
+    # calibration mode (those phases never ran).
     row1_y = 0.14
-    labels_row1 = [
+    intervals_label = "Redo intervals & fits" if per_interval_mode else "Redo intervals"
+    all_redo_labels = [
         ("Redo baseline",     "baseline",     "#d0d0ff", "#a8a8ff"),
         ("Redo calibration",  "calibration",  "#d0d0ff", "#a8a8ff"),
-        ("Redo intervals",    "intervals",    "#d0d0ff", "#a8a8ff"),
+        (intervals_label,     "intervals",    "#d0d0ff", "#a8a8ff"),
         ("Redo fitting",      "fitting",      "#d0d0ff", "#a8a8ff"),
         ("Redo turnover",     "turnover",     "#d0d0ff", "#a8a8ff"),
     ]
+    hidden_actions = set()
+    if skip_calibration:
+        hidden_actions |= {"baseline", "calibration"}
+    if per_interval_mode:
+        # Fitting + turnover happen inside the per-interval loop now; the
+        # legacy phase screens are deprecated.  Hide their redo buttons.
+        hidden_actions |= {"fitting", "turnover"}
+    labels_row1 = [t for t in all_redo_labels if t[1] not in hidden_actions]
     x = 0.05
     for label, action, col, hov in labels_row1:
         bax = fig.add_axes([x, row1_y, btn_w, btn_h])
