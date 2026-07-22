@@ -42,6 +42,27 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
+> **⚠️ If you use Anaconda / Miniconda, read this first.** The single most common install failure is having conda's `base` environment active at the same time as `sensorfit_env` — the two overlap and `pip install -e .` can land in the wrong place, so SensorFit later can't find `numpy`. If your terminal prompt starts with `(base)`, do this **before** the steps above:
+>
+> ```bash
+> conda deactivate          # repeat until (base) disappears from your prompt
+> ```
+>
+> Then create and activate `sensorfit_env` as shown, and **verify the venv is really the active Python before installing**:
+>
+> ```bash
+> which python              # Mac / Linux  → must contain .../sensorfit_env/bin/python
+> where python              # Windows      → must contain ...\sensorfit_env\Scripts\python.exe
+> ```
+>
+> Only run `pip install -e .` once that path points **inside `sensorfit_env`**. To stop conda auto-activating its base env in every new terminal (recommended):
+>
+> ```bash
+> conda config --set auto_activate_base false
+> ```
+>
+> After this, close and reopen the terminal so the prompt no longer shows `(base)`.
+
 **Run the calibration tool** (always include `--force`):
 
 ```bash
