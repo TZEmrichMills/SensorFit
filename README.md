@@ -42,6 +42,27 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
+> **⚠️ If you use Anaconda / Miniconda, read this first.** The single most common install failure is having conda's `base` environment active at the same time as `sensorfit_env` — the two overlap and `pip install -e .` can land in the wrong place, so SensorFit later can't find `numpy`. If your terminal prompt starts with `(base)`, do this **before** the steps above:
+>
+> ```bash
+> conda deactivate          # repeat until (base) disappears from your prompt
+> ```
+>
+> Then create and activate `sensorfit_env` as shown, and **verify the venv is really the active Python before installing**:
+>
+> ```bash
+> which python              # Mac / Linux  → must contain .../sensorfit_env/bin/python
+> where python              # Windows      → must contain ...\sensorfit_env\Scripts\python.exe
+> ```
+>
+> Only run `pip install -e .` once that path points **inside `sensorfit_env`**. To stop conda auto-activating its base env in every new terminal (recommended):
+>
+> ```bash
+> conda config --set auto_activate_base false
+> ```
+>
+> After this, close and reopen the terminal so the prompt no longer shows `(base)`.
+
 **Run the calibration tool** (always include `--force`):
 
 ```bash
@@ -329,6 +350,35 @@ Python is not installed or not in your PATH. [Install Python](https://www.python
 ### ModuleNotFoundError: No module named 'sensorfit'
 
 Make sure your virtual environment is activated (you should see `(sensorfit_env)` in your prompt) and that you ran `pip install -e .` from inside the SensorFit directory.
+
+### ModuleNotFoundError: No module named 'numpy' (or pandas / scipy / matplotlib)
+
+SensorFit's dependencies aren't installed in the environment you're actually running. The fix is to reinstall them into `sensorfit_env`:
+
+```bash
+# Mac / Linux
+source sensorfit_env/bin/activate
+pip install -e .
+
+# Windows
+sensorfit_env\Scripts\activate
+python -m pip install -e .
+```
+
+**Common cause — conda + venv both active.** If your prompt shows **both** `(sensorfit_env)` and `(base)`, Anaconda's `base` environment is active alongside the SensorFit venv, and the install may have landed in the wrong place. Check which Python you're really using:
+
+```bash
+which python     # Mac / Linux  → must contain .../sensorfit_env/bin/python
+where python     # Windows      → must contain ...\sensorfit_env\Scripts\python.exe
+```
+
+If it does **not** point inside `sensorfit_env`, deactivate conda first (`conda deactivate`, possibly twice until `(base)` disappears), re-activate the venv, and run `pip install -e .` again. To stop conda auto-activating its base env in every new terminal: `conda config --set auto_activate_base false`.
+
+Verify the fix with:
+
+```bash
+python -c "import numpy, pandas, scipy, matplotlib, openpyxl; print('all dependencies OK')"
+```
 
 ### Access is denied error (Windows)
 
