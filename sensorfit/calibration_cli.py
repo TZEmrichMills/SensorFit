@@ -728,6 +728,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Skip temporary Excel lock files (often start with "~$")
         if f.name.startswith("~$"):
             continue
+        # Skip hidden / macOS "AppleDouble" companion files (e.g.
+        # "._260721_sample.txt").  macOS creates one of these next to every
+        # real file on non-HFS volumes (USB sticks, network/SMB shares); they
+        # match "*.txt" but are tiny binary resource forks, not data.
+        if f.name.startswith("._") or f.name.startswith("."):
+            continue
         # Skip if filename already contains "_calibrated"
         if "_calibrated" in f.stem:
             continue
