@@ -122,38 +122,58 @@ def load_trace(path: Path, time_col_idx: int = 0, current_col_idx: int = 1) -> p
     if path.suffix.lower() in SUPPORTED_EXCEL_EXTS:
         frame = pd.read_excel(path)
     else:
-        # Text file - try to detect delimiter and handle European number format
-        # First, read a sample to detect delimiter
-        with open(path, 'r', encoding='utf-8') as f:
-            first_line = f.readline().strip()
-            # Count delimiters to determine which is the column separator
-            # Semicolon is common in European CSV files
-            semicolon_count = first_line.count(';')
-            comma_count = first_line.count(',')
-            tab_count = first_line.count('\t')
-            
-            # Choose delimiter based on count (prefer semicolon for European files)
-            if semicolon_count > 0 and semicolon_count >= comma_count:
-                delimiter = ';'
-                # If semicolon is delimiter, comma is likely decimal separator
-                decimal_sep = ','
-            elif tab_count > 0:
-                delimiter = '\t'
-                decimal_sep = '.'  # Tab-delimited usually uses dot
-            elif comma_count > 0:
-                delimiter = ','
-                decimal_sep = '.'  # Comma-delimited usually uses dot
+        # Text file - detect delimiter, skip any leading metadata lines, and
+        # handle European number format.  Read a sample of the first lines
+        # (utf-8-sig strips a leading BOM so the first column name is clean).
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            sample_lines = []
+            for _ in range(20):
+                line = f.readline()
+                if not line:
+                    break
+                sample_lines.append(line.rstrip('\n'))
+
+        # Choose the delimiter by the highest count across the sample lines,
+        # not just the first line — some instruments prepend a metadata line
+        # (e.g. a bare point-count "2000") that contains no delimiter at all.
+        # Preference on ties: semicolon (European) > tab > comma.
+        def _max_count(ch: str) -> int:
+            return max((ln.count(ch) for ln in sample_lines), default=0)
+
+        semicolon_count = _max_count(';')
+        tab_count = _max_count('\t')
+        comma_count = _max_count(',')
+
+        if semicolon_count > 0 and semicolon_count >= comma_count:
+            delimiter = ';'
+            decimal_sep = ','   # semicolon-delimited ⇒ comma is the decimal sep
+        elif tab_count > 0:
+            delimiter = '\t'
+            decimal_sep = '.'
+        elif comma_count > 0:
+            delimiter = ','
+            decimal_sep = '.'
+        else:
+            delimiter = '\t'    # default
+            decimal_sep = '.'
+
+        # Skip leading metadata lines that don't contain the delimiter (e.g. a
+        # bare "2000" point-count row above the real "Time\tCurrent" header).
+        skip_rows = 0
+        for ln in sample_lines:
+            if ln.strip() and ln.count(delimiter) == 0:
+                skip_rows += 1
             else:
-                delimiter = '\t'  # Default to tab
-                decimal_sep = '.'
-        
+                break
+
         # Read the file with detected settings
         try:
             frame = pd.read_csv(
                 path,
                 delimiter=delimiter,
-                encoding='utf-8',
+                encoding='utf-8-sig',
                 decimal=decimal_sep,
+                skiprows=skip_rows,
                 na_values=['', 'NA', 'N/A', 'nan', 'NaN'],
             )
         except Exception:
@@ -162,11 +182,12 @@ def load_trace(path: Path, time_col_idx: int = 0, current_col_idx: int = 1) -> p
             frame = pd.read_csv(
                 path,
                 delimiter=delimiter,
-                encoding='utf-8',
+                encoding='utf-8-sig',
                 decimal=alt_decimal,
+                skiprows=skip_rows,
                 na_values=['', 'NA', 'N/A', 'nan', 'NaN'],
             )
-    
+
     # Use column indices if provided, otherwise try to find by name
     if time_col_idx is not None and time_col_idx < len(frame.columns):
         time_col = frame.columns[time_col_idx]

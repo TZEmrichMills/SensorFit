@@ -315,6 +315,78 @@ def test_skip_calibration_loads_real_csv() -> bool:
     return True
 
 
+def test_load_trace_skips_metadata_preamble() -> bool:
+    """load_trace must handle instrument .txt exports that prepend a bare
+    metadata line (e.g. a point-count "2000") above the real header, and
+    still handle plain header-first files.  Regression for the Pc19407
+    substrate files that failed with 'index 1 out of range (1 column)'."""
+    _section("load_trace: skip leading metadata line + strip BOM")
+    from sensorfit.calibration import load_trace
+
+    with tempfile.TemporaryDirectory() as td:
+        # (a) metadata-preamble + BOM, tab-delimited, 3 columns
+        pre = Path(td) / "preamble.txt"
+        pre.write_text(
+            "﻿2000\n"
+            "Time (s)\tWE(1).Current (A)\tCorrected time (s)\n"
+            "0.10\t-4.9e-05\t0.0\n"
+            "0.20\t-1.5e-05\t0.1\n"
+            "0.30\t-8.5e-06\t0.2\n",
+            encoding="utf-8",
+        )
+        df = load_trace(pre, time_col_idx=0, current_col_idx=1)
+        assert list(df.columns) == ["Time (s)", "WE(1).Current (A)"], df.columns
+        assert df.shape == (3, 2), df.shape
+        assert abs(df["Time (s)"].iloc[0] - 0.10) < 1e-9
+        print(f"  ✓ preamble file: {df.shape[0]} rows, cols={list(df.columns)}")
+
+        # (b) plain header-first file still works (no rows skipped)
+        plain = Path(td) / "plain.txt"
+        plain.write_text(
+            "Potential applied (V)\tWE(1).Current (A)\n"
+            "-0.04\t1.6e-06\n-0.03\t2.7e-06\n",
+            encoding="utf-8",
+        )
+        df2 = load_trace(plain, time_col_idx=0, current_col_idx=1)
+        assert df2.shape == (2, 2), df2.shape
+        assert df2.columns[0] == "Potential applied (V)", df2.columns
+        print(f"  ✓ header-first file: {df2.shape[0]} rows, cols={list(df2.columns)}")
+    return True
+
+
+def test_dependency_preflight() -> bool:
+    """sensorfit._check_dependencies must use importlib.util correctly (it is
+    a submodule that must be imported explicitly) and raise an actionable
+    error listing the missing package."""
+    _section("Dependency preflight: friendly error, correct importlib.util use")
+    import importlib.util as _real_util
+    import sensorfit
+
+    # With everything present it must be a no-op (does not raise).
+    sensorfit._check_dependencies()
+
+    # Simulate numpy missing and confirm the message names it.
+    orig = _real_util.find_spec
+
+    def fake(name, *a, **k):
+        return None if name == "numpy" else orig(name, *a, **k)
+
+    _real_util.find_spec = fake
+    try:
+        raised = False
+        try:
+            sensorfit._check_dependencies()
+        except ModuleNotFoundError as exc:
+            raised = True
+            assert "numpy" in str(exc), str(exc)
+            assert "pip install -e ." in str(exc), str(exc)
+        assert raised, "expected ModuleNotFoundError when numpy is missing"
+    finally:
+        _real_util.find_spec = orig
+    print("  ✓ preflight is a no-op when deps present; names missing package otherwise")
+    return True
+
+
 def test_fit_baseline_polynomial() -> bool:
     _section("C3: _fit_baseline_polynomial reproduces clicks and chooses degree")
     import numpy as np
@@ -705,6 +777,8 @@ def main() -> int:
         test_zoom_hotkey_install,
         test_skip_calibration_provenance,
         test_skip_calibration_loads_real_csv,
+        test_load_trace_skips_metadata_preamble,
+        test_dependency_preflight,
         test_pad_fit_yhat_and_multifit_excel,
         test_review_per_interval_mode_hides_legacy_redo,
         test_average_controls_on_grid,

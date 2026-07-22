@@ -11,7 +11,7 @@ def _check_dependencies() -> None:
     ``pip install -e .`` never completed — often because conda's ``base`` env
     is active alongside ``sensorfit_env`` and the install landed elsewhere.
     """
-    import importlib
+    import importlib.util
 
     required = ["numpy", "pandas", "scipy", "matplotlib", "openpyxl"]
     missing = [m for m in required if importlib.util.find_spec(m) is None]
