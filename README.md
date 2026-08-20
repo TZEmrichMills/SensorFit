@@ -115,10 +115,10 @@ This is the heart of SensorFit. Instead of picking all intervals up-front then f
 For each interval (repeat until you click **Done with intervals**):
 
 1. **Pick the interval** — click START then END. Existing intervals are shown faintly in grey.
-2. **Optional control subtraction** — small dialog with four choices:
+2. **Optional control subtraction** — small dialog with four choices. **Only use subtraction if you have a matched control run** (e.g. no-enzyme, no-substrate) that spans a similar time to this interval; it removes electrode drift/background so what's left is the enzymatic signal. If you don't have such a control, choose **None** — that is the normal case.
    - **None** — use the interval as-is.
-   - **Subtract existing** — pick any control interval already in this session OR saved in `Calibrated/*_intervals/interval_*.xlsx` from a prior session.
-   - **Subtract new alongside** — a Qt file dialog opens; pick a control file; a modal mini-flow runs baseline → calibration → interval-selection on that file (no fitting), saves it as if processed independently, then returns you to a preview where you can re-anchor the control's t = 0 by clicking the upper plot.
+   - **Subtract existing** — pick any control interval already in this session OR saved in `Calibrated/*_intervals/interval_*.xlsx` from a prior session. You can add more than one; they will be averaged before subtraction.
+   - **Subtract new** — a Qt file dialog opens; pick a control file; a modal mini-flow runs baseline → calibration → interval-selection on that file (no fitting), saves it as if processed independently, then returns you to a preview where you can re-anchor the control's t = 0 by clicking the upper plot.
    - **Back** — return to the interval picker.
 3. **Optional fit(s) — multi-fit supported.** For each fit:
    1. **Pick a model**: Manual linear / Single exponential / Inactivation (IB).
