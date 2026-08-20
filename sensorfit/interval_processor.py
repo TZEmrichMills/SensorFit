@@ -223,19 +223,29 @@ def select_one_interval(
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("H2O2 (µM)")
 
-    title = f"Pick interval #{interval_number}: click START then END.  Click Done when finished."
-    if filename:
-        title = f"{truncate_filename(filename)}\n{title}"
-    fig.suptitle(title, fontsize=11)
-
-    add_instruction_banner(
-        fig,
-        "Click two points: the first sets the interval START, the second the END.  "
-        "Existing intervals are shown in grey.  Buttons below: Done (finish), "
-        "Back (return to calibration), Skip (this interval).",
-        y=0.985,
-        width=110,
+    # Banner is anchored left-of-centre and kept narrow so it stays clear of
+    # the top-right "Done with intervals" button (users have hit Done by
+    # mistake — spatial separation is the whole point).
+    import textwrap as _tw
+    banner_text = _tw.fill(
+        "An interval is one experimental run — a stretch of trace you want to fit "
+        "(e.g. from H₂O₂ addition to end of consumption).  "
+        "Click START then END; Accept to keep it, Retry to re-click, "
+        "Skip to move on without saving.",
+        width=90,
     )
+    fig.text(
+        0.42, 0.985, banner_text,
+        ha="center", va="top", fontsize=9,
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.9, pad=0.4),
+    )
+
+    title = f"Pick interval #{interval_number}"
+    if filename:
+        title = f"{truncate_filename(filename)} — {title}"
+    # Title sits just above the axes, left-aligned so it doesn't collide
+    # with the banner or the top-right Done button.
+    fig.text(0.10, 0.86, title, fontsize=11, fontweight="bold", ha="left", va="top")
 
     pending = {"start": None}
     marker = {"artist": None}
@@ -336,24 +346,33 @@ def select_one_interval(
         state["action"] = "remove_last"
         plt.close(fig)
 
-    # Buttons across the bottom in two columns:
-    # row 1: Accept | Retry | Done with intervals | Skip this one
-    # row 2: Remove last (enabled only if intervals exist) | Back to calibration
+    # Two rows of buttons, with "Done with intervals" deliberately placed
+    # in the top-right corner, well away from the frequently-clicked
+    # Accept / Retry / Skip cluster along the bottom — users kept hitting
+    # it by mistake when it sat between Retry and Skip and it would end the
+    # per-file interval flow entirely (no undo).
+    #
+    # Bottom row (per-interval actions):
+    #   Accept | Retry | Skip this one | Remove last | Back → calibration
+    # Top-right (whole-file action, spatially separated):
+    #   Done with intervals
     ax_accept = fig.add_axes([0.08, 0.03, 0.13, 0.05])
     ax_retry = fig.add_axes([0.22, 0.03, 0.10, 0.05])
-    ax_done = fig.add_axes([0.34, 0.03, 0.18, 0.05])
-    ax_skip = fig.add_axes([0.54, 0.03, 0.13, 0.05])
-    ax_remove = fig.add_axes([0.70, 0.03, 0.13, 0.05])
-    ax_back = fig.add_axes([0.84, 0.03, 0.13, 0.05])
+    ax_skip = fig.add_axes([0.33, 0.03, 0.13, 0.05])
+    ax_remove = fig.add_axes([0.47, 0.03, 0.13, 0.05])
+    ax_back = fig.add_axes([0.61, 0.03, 0.15, 0.05])
+    ax_done = fig.add_axes([0.83, 0.945, 0.15, 0.045])
     btn_accept = create_small_button(ax_accept, "Accept", "#90ee90", "#7cd47c")
     btn_retry = create_small_button(ax_retry, "Retry", "0.9", "0.8")
-    btn_done = create_small_button(ax_done, "Done with intervals", "#ddddff", "#bbbbff")
     btn_skip = create_small_button(ax_skip, "Skip this one", "#ffcc99", "#ffaa66")
     # Remove last is greyed out (slightly) when there are no accepted intervals.
     remove_colour = "#ffaaaa" if already_defined else "0.85"
     remove_hover = "#ff8888" if already_defined else "0.85"
     btn_remove = create_small_button(ax_remove, "Remove last", remove_colour, remove_hover)
     btn_back = create_small_button(ax_back, "Back → calibration", "#ddddff", "#bbbbff")
+    # Give "Done" a distinct muted-purple palette so it is visually as well
+    # as spatially separated from the green/orange per-interval buttons.
+    btn_done = create_small_button(ax_done, "✓ Done with intervals", "#c8b8e0", "#a898c8")
     btn_accept.on_clicked(on_accept)
     btn_retry.on_clicked(on_retry)
     btn_done.on_clicked(on_done)
@@ -383,24 +402,40 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     "Existing" and "new" both lead to the multi-control averaging hub,
     which lets the user accumulate one or more controls before accepting.
     """
-    fig, ax = plt.subplots(figsize=(8, 3.8))
+    fig, ax = plt.subplots(figsize=(9.2, 4.8))
     try:
         fig.canvas.manager.set_window_title("SensorFit — Subtraction choice")
     except Exception:
         pass
     ax.axis("off")
     ax.text(
-        0.5, 0.62,
-        f"{interval_summary}\n\n"
-        "Apply control subtraction?\n\n"
-        "• None — use this interval as-is.\n"
-        "• Subtract existing — start from an already-processed control interval\n"
-        "  (you can add more controls and they will be averaged).\n"
-        "• Subtract new — process a fresh control file first\n"
-        "  (you can add more controls and they will be averaged).",
-        ha="center", va="center", fontsize=10,
+        0.5, 0.88,
+        interval_summary,
+        ha="center", va="center", fontsize=10, style="italic", color="dimgrey",
     )
-    fig.suptitle("Per-interval control subtraction", fontsize=11, fontweight="bold")
+    ax.text(
+        0.5, 0.72,
+        "Only use control subtraction if you have a matched control run\n"
+        "(e.g. no-enzyme, no-substrate) that spans a similar time to this interval.\n"
+        "It removes electrode drift/background so what's left is the enzymatic signal.\n"
+        "If you don't have a control, choose 'None' — this is the normal case.",
+        ha="center", va="center", fontsize=10, color="#333333",
+    )
+    ax.text(
+        0.06, 0.40,
+        "• None — use this interval as-is (no control available or not needed).\n"
+        "• Subtract existing — pick a control interval already processed in this\n"
+        "   session or saved from a previous session.\n"
+        "• Subtract new — pick a control file from disk and process it now, then\n"
+        "   return here to subtract it.\n"
+        "Both 'existing' and 'new' let you add more than one control; they will be\n"
+        "averaged before subtraction.",
+        ha="left", va="center", fontsize=9.5,
+    )
+    fig.suptitle(
+        "Control subtraction — apply a no-enzyme (or similar) control to this interval?",
+        fontsize=11, fontweight="bold",
+    )
     choice = {"value": None}
 
     def _set(v):
@@ -409,10 +444,10 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
             plt.close(fig)
         return _f
 
-    ax_none = fig.add_axes([0.07, 0.10, 0.18, 0.16])
-    ax_existing = fig.add_axes([0.27, 0.10, 0.20, 0.16])
-    ax_new = fig.add_axes([0.49, 0.10, 0.18, 0.16])
-    ax_back = fig.add_axes([0.75, 0.10, 0.18, 0.16])
+    ax_none = fig.add_axes([0.07, 0.05, 0.18, 0.13])
+    ax_existing = fig.add_axes([0.27, 0.05, 0.20, 0.13])
+    ax_new = fig.add_axes([0.49, 0.05, 0.18, 0.13])
+    ax_back = fig.add_axes([0.75, 0.05, 0.18, 0.13])
     btn_none = create_small_button(ax_none, "None", "#90ee90", "#7cd47c")
     btn_existing = create_small_button(ax_existing, "Subtract existing", "#ffe680", "#ffcd55")
     btn_new = create_small_button(ax_new, "Subtract new", "#ffcc99", "#ffaa66")
