@@ -51,6 +51,7 @@ from .calibration import (
 from .controls import average_controls_on_grid, deviation_from_anchor, interpolate_control_to_grid
 from .fitting import fit_IB, fit_Exponential
 from .models import model_Exponential, model_IB
+from .window import get_window, finish_window
 from .zoom_hotkey import install_zoom_keys
 
 
@@ -208,7 +209,8 @@ def select_one_interval(
                  from the caller's perspective unless the caller wants to
                  distinguish).
     """
-    fig, ax = plt.subplots(figsize=(11, 6.5))
+    fig = get_window().reset(figsize=(11, 6.5))
+    ax = fig.add_subplot(111)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Pick an interval"
@@ -307,19 +309,19 @@ def select_one_interval(
             print("Please click two points to define the interval.")
             return
         state["action"] = "accept"
-        plt.close(fig)
+        get_window().stop()
 
     def on_done(_e=None):
         state["action"] = "done"
-        plt.close(fig)
+        get_window().stop()
 
     def on_back(_e=None):
         state["action"] = "back"
-        plt.close(fig)
+        get_window().stop()
 
     def on_skip(_e=None):
         state["action"] = "skip"
-        plt.close(fig)
+        get_window().stop()
 
     def on_retry(_e=None):
         pending["start"] = None
@@ -344,7 +346,7 @@ def select_one_interval(
             print("No previously-defined intervals to remove.")
             return
         state["action"] = "remove_last"
-        plt.close(fig)
+        get_window().stop()
 
     # Two rows of buttons, with "Done with intervals" deliberately placed
     # in the top-right corner, well away from the frequently-clicked
@@ -381,8 +383,7 @@ def select_one_interval(
     btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     if state["action"] == "accept" and state["interval"] is not None:
         return state["interval"]
@@ -402,7 +403,8 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     "Existing" and "new" both lead to the multi-control averaging hub,
     which lets the user accumulate one or more controls before accepting.
     """
-    fig, ax = plt.subplots(figsize=(9.2, 4.8))
+    fig = get_window().reset(figsize=(9.2, 4.8))
+    ax = fig.add_subplot(111)
     try:
         fig.canvas.manager.set_window_title("SensorFit — Subtraction choice")
     except Exception:
@@ -441,7 +443,7 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     def _set(v):
         def _f(_e=None):
             choice["value"] = v
-            plt.close(fig)
+            get_window().stop()
         return _f
 
     ax_none = fig.add_axes([0.07, 0.05, 0.18, 0.13])
@@ -457,8 +459,7 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     btn_new.on_clicked(_set("new"))
     btn_back.on_clicked(_set("back"))
 
-    plt.show()
-    plt.close(fig)
+    get_window().run()
     return choice["value"] or "none"
 
 
@@ -559,7 +560,9 @@ def preview_per_interval_subtraction(
     """
     anchor = {"t0": float(sample_t[0])}
 
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(11, 7.4), sharex=True)
+    fig = get_window().reset(figsize=(11, 7.4))
+    ax_top = fig.add_subplot(211)
+    ax_bot = fig.add_subplot(212, sharex=ax_top)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Subtraction preview"
@@ -626,15 +629,15 @@ def preview_per_interval_subtraction(
 
     def on_accept(_e=None):
         decision["value"] = "accept"
-        plt.close(fig)
+        get_window().stop()
 
     def on_skip(_e=None):
         decision["value"] = "skip"
-        plt.close(fig)
+        get_window().stop()
 
     def on_back(_e=None):
         decision["value"] = "back"
-        plt.close(fig)
+        get_window().stop()
 
     def on_reset(_e=None):
         anchor["t0"] = float(sample_t[0])
@@ -655,8 +658,7 @@ def preview_per_interval_subtraction(
 
     redraw()
     install_zoom_keys(fig, [ax_top, ax_bot])
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     if decision["value"] == "accept":
         shifted_t = control_t + anchor["t0"]
@@ -808,7 +810,9 @@ def averaging_hub(
     members: list[ControlMember] = list(initial_members)
     anchor = {"t0": float(sample_t[0])}
 
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(11, 7.8), sharex=True)
+    fig = get_window().reset(figsize=(11, 7.8))
+    ax_top = fig.add_subplot(211)
+    ax_bot = fig.add_subplot(212, sharex=ax_top)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Multi-control averaging"
@@ -915,7 +919,7 @@ def averaging_hub(
     def _close_with(v):
         def _f(_e=None):
             decision["value"] = v
-            plt.close(fig)
+            get_window().stop()
         return _f
 
     def _add_existing(_e=None):
@@ -973,8 +977,7 @@ def averaging_hub(
 
     redraw()
     install_zoom_keys(fig, [ax_top, ax_bot])
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     d = decision["value"] or "skip"
     return (d, members if d == "accept" else [])
@@ -1109,7 +1112,7 @@ def prompt_one_fit(
       "back"    — user wants to revisit the subtraction step.
     """
     # ── Figure layout: 2-row gridspec (data : residuals = 3 : 1) ──────
-    fig = plt.figure(figsize=(11.5, 8.6))
+    fig = get_window().reset(figsize=(11.5, 8.6))
     try:
         fig.canvas.manager.set_window_title(
             f"SensorFit — Fit #{fit_index}"
@@ -1456,7 +1459,7 @@ def prompt_one_fit(
             rec.back_extrap_t0_s = float(extrap_state["target_t"])
             rec.back_extrap_rate_uM_per_s = float(extrap_state["new_rate"])
         final["action"] = "accept"
-        plt.close(fig)
+        get_window().stop()
 
     def on_retry(_e=None):
         _clear_range()
@@ -1465,11 +1468,11 @@ def prompt_one_fit(
 
     def on_skip(_e=None):
         final["action"] = "skip"
-        plt.close(fig)
+        get_window().stop()
 
     def on_back(_e=None):
         final["action"] = "back"
-        plt.close(fig)
+        get_window().stop()
 
     ax_extrap = fig.add_axes([0.10, 0.04, 0.18, 0.05])
     ax_accept = fig.add_axes([0.30, 0.04, 0.14, 0.05])
@@ -1488,8 +1491,7 @@ def prompt_one_fit(
     btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, [ax_data, ax_resid])
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     if final["action"] == "accept" and fit_state["record"] is not None:
         return fit_state["record"]
@@ -1558,7 +1560,8 @@ def prompt_delta_max(
     has_usable_fit = any(f.model in ("Exponential", "IB") for f in fits)
     default_mode = "from-fit" if has_usable_fit else "linear"
 
-    fig, ax = plt.subplots(figsize=(11, 7.2))
+    fig = get_window().reset(figsize=(11, 7.2))
+    ax = fig.add_subplot(111)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Δ[H₂O₂]max"
@@ -2083,7 +2086,7 @@ def prompt_delta_max(
             _update_status("No Δmax computed yet.", "darkred")
             return
         state["action"] = "accept"
-        plt.close(fig)
+        get_window().stop()
 
     def on_retry_t0(_e=None):
         """Clear ONLY the t₀ marker + dashed line (and the From-fit
@@ -2132,11 +2135,11 @@ def prompt_delta_max(
 
     def on_skip(_e=None):
         state["action"] = "skip"
-        plt.close(fig)
+        get_window().stop()
 
     def on_back(_e=None):
         state["action"] = "back"
-        plt.close(fig)
+        get_window().stop()
 
     # Five buttons across the bottom:
     # Accept | Retry t₀ | Retry baseline | Skip | Back
@@ -2157,8 +2160,7 @@ def prompt_delta_max(
     btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     if state["action"] == "accept" and state["computed"] is not None:
         return state["computed"]
@@ -2429,7 +2431,8 @@ def run_per_interval_flow(
 
 def _ask_another(question: str) -> bool:
     """Small yes/no popup; returns True if user clicks Yes."""
-    fig, ax = plt.subplots(figsize=(7, 2.5))
+    fig = get_window().reset(figsize=(7, 2.5))
+    ax = fig.add_subplot(111)
     try:
         fig.canvas.manager.set_window_title("SensorFit — Continue?")
     except Exception:
@@ -2440,11 +2443,11 @@ def _ask_another(question: str) -> bool:
 
     def _yes(_e=None):
         state["choice"] = True
-        plt.close(fig)
+        get_window().stop()
 
     def _no(_e=None):
         state["choice"] = False
-        plt.close(fig)
+        get_window().stop()
 
     ax_yes = fig.add_axes([0.22, 0.10, 0.22, 0.18])
     ax_no = fig.add_axes([0.56, 0.10, 0.22, 0.18])
@@ -2452,6 +2455,5 @@ def _ask_another(question: str) -> bool:
     _btn_yes_18.on_clicked(_yes)
     _btn_no_19 = create_small_button(ax_no, "No", "0.9", "0.8")
     _btn_no_19.on_clicked(_no)
-    plt.show()
-    plt.close(fig)
+    get_window().run()
     return state["choice"]

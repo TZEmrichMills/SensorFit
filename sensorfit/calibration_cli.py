@@ -834,6 +834,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Summary Excel: {summary_path}")
     print(f"{'='*60}\n")
 
+    # Close the shared interactive window (WindowManager) now that the
+    # whole run is finished. Kept open across all steps and files to avoid
+    # window-recreation churn (DisplayLink driver crashes).
+    try:
+        from .window import finish_window
+        finish_window()
+    except Exception:
+        pass
+
     return 0
 
 

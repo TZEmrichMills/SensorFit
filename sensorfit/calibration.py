@@ -24,6 +24,7 @@ from matplotlib.widgets import Button, CheckButtons, TextBox
 import numpy as np
 import pandas as pd
 
+from .window import get_window
 from .zoom_hotkey import install_zoom_keys
 
 
@@ -323,9 +324,13 @@ class pane_role_context:
         self._figs: list = []
 
     def __enter__(self):
+        from .window import WindowManager
+
         self._orig_subplots = plt.subplots
         self._orig_figure = plt.figure
         self._orig_show = plt.show
+        self._orig_wm_reset = WindowManager.reset
+        self._orig_wm_run = WindowManager.run
         role = self.role
         figs = self._figs
 
@@ -350,15 +355,40 @@ class pane_role_context:
             figs.clear()
             return self._orig_show(*args, **kwargs)
 
+        # Patch WindowManager.reset so the shared window also picks up
+        # role chrome when it's reused inside a pane_role_context.
+        orig_reset = self._orig_wm_reset
+
+        def patched_reset(self_wm, *args, **kwargs):
+            fig = orig_reset(self_wm, *args, **kwargs)
+            fig.patch.set_edgecolor(_ROLE_STYLES[role]["edge"])
+            fig.patch.set_linewidth(_ROLE_STYLES[role]["lw"])
+            figs.append(fig)
+            return fig
+
+        orig_run = self._orig_wm_run
+
+        def patched_run(self_wm, *args, **kwargs):
+            for f in figs:
+                apply_pane_role_chrome(f, role)
+            figs.clear()
+            return orig_run(self_wm, *args, **kwargs)
+
         plt.subplots = patched_subplots
         plt.figure = patched_figure
         plt.show = patched_show
+        WindowManager.reset = patched_reset
+        WindowManager.run = patched_run
         return self
 
     def __exit__(self, *exc):
+        from .window import WindowManager
+
         plt.subplots = self._orig_subplots
         plt.figure = self._orig_figure
         plt.show = self._orig_show
+        WindowManager.reset = self._orig_wm_reset
+        WindowManager.run = self._orig_wm_run
         return False
 
 
@@ -393,7 +423,8 @@ def select_baseline(
 
     # Step 1: Select baseline points
     while True:
-        fig, ax = plt.subplots(figsize=(11, 6.8))
+        fig = get_window().reset(figsize=(11, 6.8))
+        ax = fig.add_subplot(111)
         try:
             fig.canvas.manager.set_window_title(
                 "SensorFit — Baseline selection"
@@ -589,15 +620,15 @@ def select_baseline(
                     print("Curve mode needs at least 2 points (≥3 recommended).")
                     return
             state["action"] = "continue"
-            plt.close(fig)
+            get_window().stop()
 
         def on_redraw(_event) -> None:
             state["action"] = "redraw"
-            plt.close(fig)
+            get_window().stop()
 
         def on_discard(_event) -> None:
             state["action"] = "discard"
-            plt.close(fig)
+            get_window().stop()
 
         def on_skip_baseline(_event) -> None:
             """
@@ -607,7 +638,7 @@ def select_baseline(
             baseline already looks acceptable.
             """
             state["action"] = "skip"
-            plt.close(fig)
+            get_window().stop()
 
         fig.canvas.mpl_connect("button_press_event", on_click)
 
@@ -634,8 +665,7 @@ def select_baseline(
         )
 
         install_zoom_keys(fig, ax)
-        plt.show()
-        plt.close(fig)
+        get_window().run()
 
         action = state["action"]
         if action == "discard":
@@ -691,7 +721,8 @@ def select_baseline(
     
     # Step 2: Show corrected data and get confirmation
     while True:
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig = get_window().reset(figsize=(10, 6))
+        ax = fig.add_subplot(111)
         plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.80)
         ax.plot(time_values, signal_values, "b-", lw=1, alpha=0.5, label="Raw data")
         ax.plot(time_values, corrected_signal, "g-", lw=1.5, label="Baseline-corrected data")
@@ -717,15 +748,15 @@ def select_baseline(
 
         def on_accept(_event) -> None:
             confirm_state["action"] = "accept"
-            plt.close(fig)
+            get_window().stop()
 
         def on_retry(_event) -> None:
             confirm_state["action"] = "retry"
-            plt.close(fig)
+            get_window().stop()
 
         def on_discard_confirm(_event) -> None:
             confirm_state["action"] = "discard"
-            plt.close(fig)
+            get_window().stop()
 
         ax_accept = fig.add_axes([0.35, 0.02, 0.12, 0.04])
         ax_retry = fig.add_axes([0.48, 0.02, 0.12, 0.04])
@@ -744,8 +775,7 @@ def select_baseline(
             "  • Use buttons: Accept (continue with corrected data), Retry (select baseline again), Discard (skip this file)."
         )
 
-        plt.show()
-        plt.close(fig)
+        get_window().run()
 
         confirm_action = confirm_state["action"]
         if confirm_action == "discard":
@@ -988,7 +1018,8 @@ def select_points(
     The ``window`` kwarg is retained for signature compatibility but is no
     longer used — the calibration screen uses mode-specific defaults.
     """
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig = get_window().reset(figsize=(14, 7))
+    ax = fig.add_subplot(111)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Calibration points"
@@ -1266,11 +1297,11 @@ def select_points(
                 print("Back-extrap fit hasn't succeeded yet.  Click Retry and re-pick.")
                 return
             state["action"] = "continue"
-            plt.close(fig)
+            get_window().stop()
             return
         if len(selected_indices) == target:
             state["action"] = "continue"
-            plt.close(fig)
+            get_window().stop()
         else:
             print(f"Please select all {target} points before continuing.")
 
@@ -1295,12 +1326,12 @@ def select_points(
     def on_go_back_to_baseline(_event) -> None:
         state["go_back_to_baseline"] = True
         state["action"] = "go_back"
-        plt.close(fig)
+        get_window().stop()
 
     def on_discard(_event) -> None:
         state["discard"] = True
         state["action"] = "discard"
-        plt.close(fig)
+        get_window().stop()
 
     def on_change_calibration(_event) -> None:
         """Open calibration values editor."""
@@ -1367,8 +1398,7 @@ def select_points(
     )
 
     install_zoom_keys(fig, ax)
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     if state["discard"]:
         return "discard"
@@ -1448,7 +1478,8 @@ def select_intervals(
     None if user wants to go back to calibration point selection
     [] if window is closed without confirming
     """
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig = get_window().reset(figsize=(10, 6))
+    ax = fig.add_subplot(111)
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.80)
     ax.plot(time_values, calibrated_values, color="tab:green", lw=1.25)
     ax.set_xlabel("Time (s)")
@@ -1618,11 +1649,11 @@ def select_intervals(
                 return
         
         accepted["confirmed"] = True
-        plt.close(fig)
+        get_window().stop()
 
     def go_back_to_calibration(_event=None) -> None:
         go_back["requested"] = True
-        plt.close(fig)
+        get_window().stop()
 
     def on_key(event) -> None:
         if event.key == "enter":
@@ -1644,7 +1675,7 @@ def select_intervals(
     def on_discard_interval(_event=None) -> None:
         discard_interval["requested"] = True
         accepted["confirmed"] = True  # Mark as confirmed so we exit
-        plt.close(fig)
+        get_window().stop()
 
     ax_remove_last = fig.add_axes([0.12, 0.02, 0.11, 0.04])
     ax_reselect = fig.add_axes([0.24, 0.02, 0.11, 0.04])
@@ -1683,8 +1714,7 @@ def select_intervals(
         "  • Zoom: z toggles zoom-rectangle mode; drag to zoom; r resets the view."
     )
     install_zoom_keys(fig, ax)
-    plt.show()
-    plt.close(fig)
+    get_window().run()
     
     if discard_interval["requested"]:
         return "discard"
@@ -2223,9 +2253,9 @@ def interactive_interval_fitting(
         manual_linear_markers: list = []  # Store markers for selected points
         navigation_state = {"action": None}  # "continue", "go_back", "discard", "go_back_phase", "discard_file"
         
-        fig, (ax_data, ax_resid) = plt.subplots(
-            2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [3, 1]}
-        )
+        fig = get_window().reset(figsize=(12, 8))
+        ax_data = fig.add_subplot(211)
+        ax_resid = fig.add_subplot(212, sharex=ax_data)
         plt.subplots_adjust(left=0.1, bottom=0.22, right=0.75, top=0.82)
         
         # Plot data - smaller dark gray dots
@@ -2556,16 +2586,16 @@ def interactive_interval_fitting(
                     return
                 # If "continue anyway" or window closed, proceed to close main figure
             navigation_state["action"] = "continue"
-            plt.close(fig)
+            get_window().stop()
         
         def on_go_back_interval(_event):
             """Go back to previous interval, or to previous phase if on first interval."""
             if current_idx > 0:
                 navigation_state["action"] = "go_back"
-                plt.close(fig)
+                get_window().stop()
             else:
                 navigation_state["action"] = "go_back_phase"
-                plt.close(fig)
+                get_window().stop()
         
         def on_discard_interval(_event):
             """Discard current interval without fitting."""
@@ -2573,12 +2603,12 @@ def interactive_interval_fitting(
             # Remove any fits for this interval
             if subset.index in all_fit_results:
                 del all_fit_results[subset.index]
-            plt.close(fig)
+            get_window().stop()
         
         def on_discard_file(_event):
             """Discard the entire file."""
             navigation_state["action"] = "discard_file"
-            plt.close(fig)
+            get_window().stop()
         
         # Add checkboxes for model selection with equations
         # Make checkbox area taller to accommodate equations
@@ -2726,10 +2756,9 @@ def interactive_interval_fitting(
         click_cid = fig.canvas.mpl_connect("button_press_event", handle_manual_click)
 
         install_zoom_keys(fig, [ax_data, ax_resid])
-        plt.show()
+        get_window().run()
         fig.canvas.mpl_disconnect(click_cid)
-        plt.close(fig)
-        
+
         # Handle navigation
         action = navigation_state.get("action")
         if action == "discard_file":
@@ -2821,7 +2850,8 @@ def calculate_turnover_before_inactivation(
         manual_tail_markers: list = []
         navigation_state = {"action": None}  # "continue", "go_back", "discard", "skip"
         
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig = get_window().reset(figsize=(12, 6))
+        ax = fig.add_subplot(111)
         plt.subplots_adjust(left=0.1, bottom=0.22, right=0.75, top=0.82)
         
         # Plot data
@@ -3034,7 +3064,7 @@ def calculate_turnover_before_inactivation(
         def on_skip(_event):
             """Skip this interval without calculating turnover."""
             navigation_state["action"] = "skip"
-            plt.close(fig)
+            get_window().stop()
         
         def on_continue(_event):
             """Continue to next interval."""
@@ -3078,26 +3108,26 @@ def calculate_turnover_before_inactivation(
                 if state["choice"] == "back":
                     return
             navigation_state["action"] = "continue"
-            plt.close(fig)
+            get_window().stop()
         
         def on_go_back(_event):
             """Go back to previous interval, or to previous phase if on first interval."""
             if current_idx > 0:
                 navigation_state["action"] = "go_back"
-                plt.close(fig)
+                get_window().stop()
             else:
                 navigation_state["action"] = "go_back_phase"
-                plt.close(fig)
+                get_window().stop()
         
         def on_discard(_event):
             """Discard this interval."""
             navigation_state["action"] = "discard"
-            plt.close(fig)
+            get_window().stop()
         
         def on_discard_file(_event):
             """Discard the entire file."""
             navigation_state["action"] = "discard_file"
-            plt.close(fig)
+            get_window().stop()
         
         # Add buttons
         btn_tailfit_auto_ax = fig.add_axes([0.78, 0.70, 0.2, 0.05])
@@ -3197,10 +3227,9 @@ def calculate_turnover_before_inactivation(
         click_cid = fig.canvas.mpl_connect("button_press_event", handle_manual_click)
 
         install_zoom_keys(fig, ax)
-        plt.show()
+        get_window().run()
         fig.canvas.mpl_disconnect(click_cid)
-        plt.close(fig)
-        
+
         # Handle navigation
         action = navigation_state.get("action")
         if action == "discard_file":
@@ -3277,7 +3306,8 @@ def review_results(
         — redo that phase.
     "discard" — discard the entire file.
     """
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig = get_window().reset(figsize=(10, 7))
+    ax = fig.add_subplot(111)
     plt.subplots_adjust(left=0.05, bottom=0.28, right=0.95, top=0.88)
     ax.axis("off")
 
@@ -3323,7 +3353,7 @@ def review_results(
     def _make_cb(action_name):
         def cb(_event):
             state["action"] = action_name
-            plt.close(fig)
+            get_window().stop()
         return cb
 
     # --- buttons (two rows) ---
@@ -3377,8 +3407,7 @@ def review_results(
         "  • 'Discard this file' skips the file entirely."
     )
 
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     return state.get("action") or "accept"
 
