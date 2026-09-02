@@ -121,13 +121,13 @@ For each interval (repeat until you click **Done with intervals**):
    - **Subtract new** — a Qt file dialog opens; pick a control file; a modal mini-flow runs baseline → calibration → interval-selection on that file (no fitting), saves it as if processed independently, then returns you to a preview where you can re-anchor the control's t = 0 by clicking the upper plot.
    - **Back** — return to the interval picker.
 3. **Optional fit(s) — multi-fit supported.** For each fit:
-   1. **Pick a model**: Manual linear / Single exponential / Inactivation (IB).
+   1. **Pick a model**: Manual linear / Single exponential / Bi-exponential.
    2. **Click fit start + fit end** inside the interval (these can be inside the interval; they don't have to use its whole range).
    3. **Preview** shows the fit + the **initial rate at your chosen start point**.
    4. **Optional back-extrapolation**: type a deadtime (default 1.5 s) in the TextBox, click **Extrapolate**; you see a red dashed line back to a red circle at the new, earlier t = 0, and the new initial rate at that point. Accept records both the fit and the back-extrap onto the same row.
    5. **"Another fit on this interval?"** — Yes loops back to model-pick; No goes to Δmax.
 4. **Optional Δ[H₂O₂]max** (one per interval). Three modes via top-of-window buttons:
-   - **From fit** — uses the last fit; Δmax at your chosen t=0 is the height of the y-axis intercept of the asymptote (analytically: `c·exp(-k·(t_zero−t0))` for Exponential; `H0·exp(-α(1-exp(-k·t_zero)))` for IB).
+   - **From fit** — uses the last fit; Δmax at your chosen t=0 is the height above the asymptote. Analytically: `c·exp(-k·(t_zero−t0))` for a single Exponential, `A1·exp(-k1·Δt) + A2·exp(-k2·Δt)` for a BiExponential (two decay time-scales sharing one offset).
    - **Linear** — click t = 0, then two more points to define a straight line; Δmax = line's y at t = 0 minus y at end of run.
    - **Point** — click ONE point; Δmax = its y-value minus y at end of run.
 
@@ -217,7 +217,7 @@ Use `--time-col` / `--current-col` to point at the right columns. The "current" 
 
 **What you still get:**
 
-- Interval selection, fitting (Manual linear / Single exponential / Inactivation), control subtraction, Δ[H₂O₂]max, and back-extrapolation all work as normal.
+- Interval selection, fitting (Manual linear / Single exponential / Bi-exponential), control subtraction, Δ[H₂O₂]max, and back-extrapolation all work as normal.
 - The Review screen hides the "Redo baseline" / "Redo calibration" buttons since they're not applicable.
 - `fit_summary.xlsx` rows carry a new `calibration_skipped = True` column for these files (NaN for normal files), so you can filter them in Excel.
 

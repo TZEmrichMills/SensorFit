@@ -8,7 +8,7 @@ older SensorFit flow with a per-interval state machine:
         2. optional control subtraction
              - none / existing-interval picker / new-control modal / back
         3. zero or more fits
-             - model: manual-linear | single-exp | IB
+             - model: manual-linear | single-exp | bi-exp
              - user-picked fit-range (start, end)
              - preview with initial rate at the chosen start
              - optional back-extrapolation prompt (deadtime TextBox)
@@ -56,8 +56,8 @@ from .controls import (
     interpolate_control_to_grid,
     suggest_anchor_time,
 )
-from .fitting import fit_IB, fit_Exponential
-from .models import model_Exponential, model_IB
+from .fitting import fit_Exponential, fit_BiExponential
+from .models import model_Exponential, model_BiExponential
 from .window import get_window, finish_window
 from .zoom_hotkey import install_zoom_keys
 
@@ -72,7 +72,7 @@ class FitRecord:
     """One fit applied to one interval.
 
     The model name is the SensorFit display name ("ManualLinear",
-    "Exponential", "IB").  Parameters / yhat are stored in absolute
+    "Exponential", "BiExponential").  Parameters / yhat are stored in absolute
     full-trace time so they overlay correctly on the calibrated trace.
     """
 
@@ -140,21 +140,21 @@ def delta_max_from_fit(fit: FitRecord, t_zero: float) -> float:
     the linear baseline ``a*t + b``; the "consumption" at ``t_zero`` is
     ``y(t_zero) − asymptote(t_zero) = c * exp(-k*(t_zero - t0))``.
 
-    For IB ``y(t) = C + H0*exp(...) - kslow*t``, the asymptote is
-    ``C - kslow*t``; ``Δmax = y(t_zero) − asymptote(t_zero) = H0*exp(...)``.
+    For BiExponential ``y(t) = c + A1*exp(-k1*(t-t0)) + A2*exp(-k2*(t-t0))``,
+    the asymptote is the constant offset ``c``; the consumption at
+    ``t_zero`` is the sum of both exponential terms.
 
     For ManualLinear, the asymptote IS the fit; Δmax is undefined and we
     return NaN (caller should fall back to a different method).
     """
     if fit.model == "Exponential" and len(fit.params) == 5:
         a, b, c, k_decay, t0 = fit.params
-        # Δ = y_at_t_zero - asymptote_at_t_zero = c * exp(-k*(t_zero - t0))
         return float(c * np.exp(-k_decay * (t_zero - t0)))
-    if fit.model == "IB" and len(fit.params) == 5:
-        # H(t) = C + H0*exp(-alpha*(1 - exp(-kinact*t))) - kslow*t
-        # Δ at t_zero = H0 * exp(-alpha*(1 - exp(-kinact*t_zero)))
-        _C, H0, alpha, kinact, _kslow = fit.params
-        return float(H0 * np.exp(-alpha * (1.0 - np.exp(-kinact * t_zero))))
+    if fit.model == "BiExponential" and len(fit.params) == 6:
+        _c, A1, k1, A2, k2, t0 = fit.params
+        return float(
+            A1 * np.exp(-k1 * (t_zero - t0)) + A2 * np.exp(-k2 * (t_zero - t0))
+        )
     return float("nan")
 
 
@@ -955,7 +955,8 @@ def _run_fit(
     return a ``FitRecord``.
 
     For ManualLinear, fits a degree-1 polynomial through the segment.  For
-    Exponential / IB, delegates to ``fit_Exponential`` / ``fit_IB`` from
+    Exponential / BiExponential, delegates to ``fit_Exponential`` /
+    ``fit_BiExponential`` from
     ``sensorfit.fitting``.
 
     ``init_rate_at_t`` is the user-chosen absolute time at which the
@@ -1004,19 +1005,18 @@ def _run_fit(
             rss=float(fr.get("rss", float("nan"))),
         )
 
-    if model == "IB":
-        fr = fit_IB(t, y)
-        # Derivative of IB model at t_start: H(t) = C + H0*exp(-alpha*(1-exp(-kinact*t))) - kslow*t
-        # dH/dt = -H0*alpha*kinact*exp(-kinact*t)*exp(-alpha*(1-exp(-kinact*t))) - kslow
-        _C, H0, alpha, kinact, kslow = fr["params"]
+    if model == "BiExponential":
+        fr = fit_BiExponential(t, y)
+        # Derivative at ti:
+        #   dy/dt = -A1*k1*exp(-k1*(t-t0)) - A2*k2*exp(-k2*(t-t0))
+        _c, A1, k1, A2, k2, t0 = fr["params"]
         ti = float(init_rate_at_t)
         rate_at_t = float(
-            -H0 * alpha * kinact * np.exp(-kinact * ti)
-            * np.exp(-alpha * (1.0 - np.exp(-kinact * ti)))
-            - kslow
+            -A1 * k1 * np.exp(-k1 * (ti - t0))
+            - A2 * k2 * np.exp(-k2 * (ti - t0))
         )
         return FitRecord(
-            model="IB",
+            model="BiExponential",
             fit_start_s=float(t[0]),
             fit_end_s=float(t[-1]),
             params=[float(x) for x in fr["params"]],
@@ -1045,7 +1045,7 @@ def prompt_one_fit(
 
     - the data plot (top, large) with the fitted curve overlaid in red
     - a residuals strip below
-    - mode buttons (Manual linear | Single exp | Inactivation) at the top
+    - mode buttons (Manual linear | Single exp | Bi exp) at the top
     - a "Fit" button + a stats line showing init_rate and R²
     - actions along the bottom: Extrapolate to… | Accept fit | Retry |
       Skip | Back
@@ -1109,7 +1109,7 @@ def prompt_one_fit(
     ax_mib = fig.add_axes([0.36, 0.845, 0.12, 0.04])
     btn_mlin = create_small_button(ax_mlin, "Manual linear", "0.85", "0.75")
     btn_mexp = create_small_button(ax_mexp, "Single exp", "0.85", "0.75")
-    btn_mib = create_small_button(ax_mib, "Inactivation", "0.85", "0.75")
+    btn_mib = create_small_button(ax_mib, "Bi exp", "0.85", "0.75")
 
     # Action buttons in the same row
     ax_fit = fig.add_axes([0.52, 0.845, 0.08, 0.04])
@@ -1143,7 +1143,7 @@ def prompt_one_fit(
         fig.canvas.draw_idle()
 
     def _update_model_buttons():
-        for m, btn in (("ManualLinear", btn_mlin), ("Exponential", btn_mexp), ("IB", btn_mib)):
+        for m, btn in (("ManualLinear", btn_mlin), ("Exponential", btn_mexp), ("BiExponential", btn_mib)):
             btn.color = "#ffe680" if mode_state["model"] == m else "0.85"
         fig.canvas.draw_idle()
 
@@ -1210,7 +1210,7 @@ def prompt_one_fit(
 
     def _run_and_draw_fit():
         if mode_state["model"] is None:
-            _set_stats("Pick a model first (Manual linear / Single exp / Inactivation).", "darkred")
+            _set_stats("Pick a model first (Manual linear / Single exp / Bi exp).", "darkred")
             return
         if len(range_state["clicks"]) != 2:
             _set_stats("Click two points on the plot to define the fit range.", "darkred")
@@ -1278,13 +1278,13 @@ def prompt_one_fit(
             y_at_target = float(model_Exponential(np.array([target_t]), *rec.params)[0])
             a, _b, c, k_decay, t0 = rec.params
             new_rate = float(a - c * k_decay * np.exp(-k_decay * (target_t - t0)))
-        elif rec.model == "IB":
-            y_at_target = float(model_IB(np.array([target_t]), *rec.params)[0])
-            _C, H0, alpha, kinact, kslow = rec.params
+        elif rec.model == "BiExponential":
+            y_at_target = float(model_BiExponential(np.array([target_t]), *rec.params)[0])
+            _c, A1, k1, A2, k2, t0 = rec.params
+            # dy/dt = -A1*k1*exp(-k1*(t-t0)) - A2*k2*exp(-k2*(t-t0))
             new_rate = float(
-                -H0 * alpha * kinact * np.exp(-kinact * target_t)
-                * np.exp(-alpha * (1.0 - np.exp(-kinact * target_t)))
-                - kslow
+                -A1 * k1 * np.exp(-k1 * (target_t - t0))
+                - A2 * k2 * np.exp(-k2 * (target_t - t0))
             )
         else:
             return
@@ -1304,8 +1304,8 @@ def prompt_one_fit(
             y_curve = slope * t_curve + intercept
         elif rec.model == "Exponential":
             y_curve = model_Exponential(t_curve, *rec.params)
-        elif rec.model == "IB":
-            y_curve = model_IB(t_curve, *rec.params)
+        elif rec.model == "BiExponential":
+            y_curve = model_BiExponential(t_curve, *rec.params)
         else:
             y_curve = np.full_like(t_curve, y_at_target, dtype=float)
 
@@ -1391,7 +1391,7 @@ def prompt_one_fit(
 
     btn_mlin.on_clicked(_set_model("ManualLinear"))
     btn_mexp.on_clicked(_set_model("Exponential"))
-    btn_mib.on_clicked(_set_model("IB"))
+    btn_mib.on_clicked(_set_model("BiExponential"))
     btn_fit.on_clicked(lambda _e=None: _run_and_draw_fit())
     btn_clear.on_clicked(lambda _e=None: _clear_range())
 
@@ -1465,16 +1465,16 @@ def _model_asymptote(rec: FitRecord, t: np.ndarray) -> np.ndarray:
     """Return the model's asymptote evaluated at ``t``.
 
     For Exponential ``y = a*t + b + c*exp(-k*(t-t0))`` the asymptote is the
-    linear background ``a*t + b``.  For IB ``y = C + H0*exp(...) - kslow*t``
-    it's ``C - kslow*t``.  For ManualLinear, the fit itself.
+    linear background ``a*t + b``.  For BiExponential ``y = c + A1*exp(-k1*(t-t0)) +
+    A2*exp(-k2*(t-t0))`` it is the constant ``c``.  For ManualLinear, the fit itself.
     """
     t = np.asarray(t, dtype=float)
     if rec.model == "Exponential" and len(rec.params) == 5:
         a, b, _c, _k, _t0 = rec.params
         return a * t + b
-    if rec.model == "IB" and len(rec.params) == 5:
-        C, _H0, _alpha, _kinact, kslow = rec.params
-        return C - kslow * t
+    if rec.model == "BiExponential" and len(rec.params) == 6:
+        c_off, _A1, _k1, _A2, _k2, _t0 = rec.params
+        return np.full_like(np.asarray(t, dtype=float), float(c_off))
     if rec.model == "ManualLinear" and len(rec.params) == 2:
         slope, intercept = rec.params
         return slope * t + intercept
@@ -1515,7 +1515,7 @@ def prompt_delta_max(
 
     ``cal_max_uM`` can be changed on-the-fly via the TextBox at top right.
     """
-    has_usable_fit = any(f.model in ("Exponential", "IB") for f in fits)
+    has_usable_fit = any(f.model in ("Exponential", "BiExponential") for f in fits)
     default_mode = "from-fit" if has_usable_fit else "linear"
 
     fig = get_window().reset(figsize=(11, 7.2))
@@ -1704,7 +1704,7 @@ def prompt_delta_max(
     def _set_mode(m):
         def _f(_e=None):
             if m == "from-fit" and not has_usable_fit:
-                _update_status("From-fit needs an Exponential or IB fit; pick Linear or Point.",
+                _update_status("From-fit needs an Exponential or BiExponential fit; pick Linear or Point.",
                               "darkred")
                 return
             if mode_state["mode"] == m:
@@ -1848,7 +1848,7 @@ def prompt_delta_max(
             if not has_usable_fit:
                 return
             rec_fit = next(
-                (f for f in reversed(fits) if f.model in ("Exponential", "IB")), None,
+                (f for f in reversed(fits) if f.model in ("Exponential", "BiExponential")), None,
             )
             if rec_fit is None:
                 return
@@ -1859,7 +1859,7 @@ def prompt_delta_max(
             if rec_fit.model == "Exponential":
                 y_fit_at_t = float(model_Exponential(np.array([t_zero]), *rec_fit.params)[0])
             else:
-                y_fit_at_t = float(model_IB(np.array([t_zero]), *rec_fit.params)[0])
+                y_fit_at_t = float(model_BiExponential(np.array([t_zero]), *rec_fit.params)[0])
             asym_at_t = float(_model_asymptote(rec_fit, np.array([t_zero]))[0])
             state["computed"] = DeltaMaxRecord(
                 method="from-fit", t_zero_s=t_zero, value_uM=float(delta),
@@ -1960,7 +1960,7 @@ def prompt_delta_max(
             return
         if mode_state["mode"] == "from-fit":
             rec_fit = next(
-                (f for f in reversed(fits) if f.model in ("Exponential", "IB")), None,
+                (f for f in reversed(fits) if f.model in ("Exponential", "BiExponential")), None,
             )
             if rec_fit is not None:
                 _highlight_fit(rec_fit)
@@ -1999,7 +1999,7 @@ def prompt_delta_max(
             _clear_preview()
             state["t_zero_idx"] = idx
             rec_fit = next(
-                (f for f in reversed(fits) if f.model in ("Exponential", "IB")), None,
+                (f for f in reversed(fits) if f.model in ("Exponential", "BiExponential")), None,
             )
             if rec_fit is not None:
                 _highlight_fit(rec_fit)
@@ -2149,23 +2149,55 @@ def _qt_pick_control_file(
             return None
 
     if QT_LIB == "PyQt5":
-        from PyQt5.QtWidgets import QApplication, QFileDialog
+        from PyQt5.QtWidgets import QApplication, QFileDialog, QLabel
     else:
-        from PySide6.QtWidgets import QApplication, QFileDialog
+        from PySide6.QtWidgets import QApplication, QFileDialog, QLabel
 
     import sys as _sys
     app = QApplication.instance() or QApplication(_sys.argv)
     start_dir = str(input_dir) if input_dir is not None else ""
-    caption = "SensorFit — pick a control file to process"
-    if subtracting_from:
-        caption += f"  —  to subtract FROM: {subtracting_from}"
-    selected, _ = QFileDialog.getOpenFileName(
+
+    # macOS/Windows use native file dialogs whose title bar/caption is
+    # tiny or hidden; users kept losing track of which run they were
+    # picking a control FOR.  Force Qt's own dialog (DontUseNativeDialog)
+    # so we can inject a bright banner label at the top of its layout.
+    dlg = QFileDialog(
         None,
-        caption,
+        "SensorFit — pick a control file to process",
         start_dir,
         "Excel / CSV (*.xlsx *.xls *.xlsm *.xlsb *.csv *.txt);;All files (*)",
     )
-    return Path(selected) if selected else None
+    dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+    dlg.setFileMode(QFileDialog.ExistingFile)
+    dlg.setAcceptMode(QFileDialog.AcceptOpen)
+
+    if subtracting_from:
+        banner = QLabel(f"Choosing a control to subtract FROM:\n{subtracting_from}")
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "QLabel {"
+            " background-color: #fff3cd;"
+            " border: 2px solid #d39e00;"
+            " border-radius: 4px;"
+            " padding: 8px;"
+            " font-size: 13px;"
+            " font-weight: bold;"
+            " color: #5c4400;"
+            "}"
+        )
+        # Insert the banner at the very top of the dialog's grid layout so
+        # it stays visible while the user navigates directories.
+        layout = dlg.layout()
+        if layout is not None:
+            try:
+                layout.addWidget(banner, 0, 0, 1, layout.columnCount() or 3)
+            except TypeError:
+                layout.addWidget(banner)
+
+    if dlg.exec_() != QFileDialog.Accepted:
+        return None
+    files = dlg.selectedFiles()
+    return Path(files[0]) if files else None
 
 
 # ────────────────────────────────────────────────────────────────────────

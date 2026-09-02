@@ -545,6 +545,88 @@ def test_delta_max_pure_helpers() -> bool:
     import math
     assert math.isnan(delta_max_from_fit(rec_lin, 0.0))
     print("  ✓ from_fit returns NaN for ManualLinear (caller falls back to Point/Linear mode)")
+
+    # ── from_fit on a BiExponential ──────────────────────────────────
+    # y(t) = c + A1*exp(-k1*(t-t0)) + A2*exp(-k2*(t-t0))
+    # Asymptote = c; Δ at t_zero = A1*exp(...) + A2*exp(...)
+    # c=50, A1=30, k1=0.1, A2=15, k2=0.01, t0=0
+    # Δ at t_zero=0 = 30 + 15 = 45.  At t_zero=10 = 30*exp(-1) + 15*exp(-0.1) ≈ 24.61
+    rec_biexp = FitRecord(
+        model="BiExponential",
+        fit_start_s=0.0, fit_end_s=100.0,
+        params=[50.0, 30.0, 0.1, 15.0, 0.01, 0.0],
+        param_names=["c", "A1", "k1", "A2", "k2", "t0"],
+        yhat=np.zeros(10), init_rate_uM_per_s=0.0, init_rate_at_t_s=0.0,
+    )
+    assert abs(delta_max_from_fit(rec_biexp, 0.0) - 45.0) < 1e-6
+    expected = 30.0 * np.exp(-0.1 * 10) + 15.0 * np.exp(-0.01 * 10)
+    assert abs(delta_max_from_fit(rec_biexp, 10.0) - expected) < 1e-6
+    print("  ✓ from_fit (BiExponential) recovers A1*exp(-k1*Δt) + A2*exp(-k2*Δt)")
+    return True
+
+
+def test_biexponential_fit() -> bool:
+    _section("BiExponential fitter recovers two time scales")
+    import numpy as np
+    from sensorfit.fitting import fit_BiExponential
+    from sensorfit.models import model_BiExponential
+
+    # Synthetic two-timescale decay
+    rng = np.random.default_rng(0)
+    t = np.linspace(0.0, 400.0, 4000)
+    c, A1, k1, A2, k2 = 55.0, 30.0, 0.08, 15.0, 0.005
+    y = c + A1 * np.exp(-k1 * t) + A2 * np.exp(-k2 * t) + rng.normal(0, 0.15, t.size)
+
+    r = fit_BiExponential(t, y)
+    assert r["model"] == "BiExponential"
+    assert r["r2"] > 0.99, f"r2={r['r2']}"
+    assert abs(r["biexp_offset"] - c) < 1.0
+    # Fitter canonicalises to fast-first ordering.
+    assert r["biexp_k_fast"] > r["biexp_k_slow"], "fast rate must be > slow rate"
+    assert abs(r["biexp_k_fast"] - k1) < 0.02
+    assert abs(r["biexp_k_slow"] - k2) < 0.005
+    print(f"  ✓ recovered offset={r['biexp_offset']:.2f} (true 55),"
+          f" fast k={r['biexp_k_fast']:.4f} (true 0.08),"
+          f" slow k={r['biexp_k_slow']:.4f} (true 0.005)")
+
+    # Initial rate = derivative at t=t_start: -A1*k1 - A2*k2 (since t0=t_start=0)
+    expected_init = -A1 * k1 - A2 * k2
+    assert abs(r["init_rate"] - expected_init) < 0.2, (
+        f"init_rate {r['init_rate']} vs expected {expected_init}"
+    )
+    print(f"  ✓ init_rate {r['init_rate']:+.4f} µM/s matches -A1*k1 - A2*k2 ({expected_init:+.4f})")
+
+    # Too-short input raises cleanly.
+    try:
+        fit_BiExponential(t[:3], y[:3])
+    except ValueError:
+        print("  ✓ rejects too-short inputs with ValueError")
+    else:
+        raise AssertionError("expected ValueError on ≤5-point input")
+
+    # Single-exponential data → BiExp still fits (A2 or k2 near-zero).
+    y_single = c + A1 * np.exp(-k1 * t) + rng.normal(0, 0.15, t.size)
+    r1 = fit_BiExponential(t, y_single)
+    assert r1["r2"] > 0.99, f"biexp on single-exp data: r2={r1['r2']}"
+    print(f"  ✓ single-exp data still fits (R²={r1['r2']:.4f}) — collapses to one component")
+    return True
+
+
+def test_parse_models_biexp_aliases() -> bool:
+    _section("parse_models: BiExponential aliases + legacy tags removed")
+    from sensorfit.utils import parse_models
+
+    assert parse_models("") == ["Exponential"]
+    assert parse_models("exp") == ["Exponential"]
+    assert parse_models("biexp") == ["BiExponential"]
+    assert parse_models("double_exp") == ["BiExponential"]
+    assert parse_models("linear") == ["ManualLinear"]
+    assert parse_models("exp,biexp") == ["Exponential", "BiExponential"]
+    assert parse_models("exp,exp,biexp") == ["Exponential", "BiExponential"]
+    # Legacy tags no longer accepted.
+    assert parse_models("IB") == ["Exponential"], "IB should no longer parse"
+    assert parse_models("GFI") == ["Exponential"], "GFI should no longer parse"
+    print("  ✓ aliases map to canonical tags; IB/GFI dropped as unknown")
     return True
 
 
@@ -853,6 +935,8 @@ def main() -> int:
         test_review_per_interval_mode_hides_legacy_redo,
         test_average_controls_on_grid,
         test_injection_alignment,
+        test_biexponential_fit,
+        test_parse_models_biexp_aliases,
         test_pane_role_chrome,
     ]
     failures = []

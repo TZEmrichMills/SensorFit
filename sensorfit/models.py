@@ -3,25 +3,12 @@
 import numpy as np
 
 
-def model_IB(t, C, H0, alpha, kinact, kslow):
-    """
-    IB model: Inactivation with linear background.
-    
-    H(t) = C + H0 * exp(-alpha*(1 - exp(-kinact*t))) - kslow*t
-    """
-    tt = np.asarray(t, dtype=float)
-    alpha = np.clip(alpha, 0, np.inf)
-    kinact = np.clip(kinact, 0, np.inf)
-    kslow = np.clip(kslow, 0, np.inf)
-    return C + H0 * np.exp(-alpha * (1.0 - np.exp(-kinact * tt))) - kslow * tt
-
-
 def model_Exponential(t, a, b, c, k, t0):
     """
     Robust single exponential fit with linear background.
-    
+
     y(t) = a * t + b + c * exp(-k * (t - t0))
-    
+
     Parameters:
     -----------
     a : float
@@ -36,28 +23,29 @@ def model_Exponential(t, a, b, c, k, t0):
         Time offset
     """
     tt = np.asarray(t, dtype=float)
-    a = np.clip(a, -np.inf, np.inf)  # Allow negative slope
     k = np.clip(k, 0, np.inf)  # Decay rate must be non-negative
-    c = np.clip(c, -np.inf, np.inf)  # Allow positive or negative amplitude
     return a * tt + b + c * np.exp(-k * (tt - t0))
 
 
-def model_GFI(t, C, A, B, alpha, kinact, kfast, k, t0):
+def model_BiExponential(t, c, A1, k1, A2, k2, t0):
     """
-    GFI model: Gompertz-gated inactivation.
-    
-    H(t) = C + A * exp(-alpha*(1 - exp(-kinact*t))) * exp(-exp(k*(t - t0))) + B * exp(-kfast*t)
+    Sum of two exponentials sharing a common offset.
+
+    y(t) = c + A1 * exp(-k1 * (t - t0)) + A2 * exp(-k2 * (t - t0))
+
+    Both decay rates are clipped to non-negative to keep the fit stable;
+    the two amplitudes can have either sign so the model can also
+    describe an overshoot-then-relax response.  Two exponentials with
+    different rate constants often outperform a single one on the
+    fast-then-slow kinetics we see after H2O2 injection.
     """
     tt = np.asarray(t, dtype=float)
-    inact = np.exp(-np.clip(alpha, 0, np.inf) * (1.0 - np.exp(-np.clip(kinact, 0, np.inf) * tt)))
-    gate = np.exp(-np.exp(np.clip(k, 0, np.inf) * (tt - t0)))
-    fast = np.clip(B, 0, np.inf) * np.exp(-np.clip(kfast, 0, np.inf) * tt)
-    return C + np.clip(A, 0, np.inf) * inact * gate + fast
+    k1 = np.clip(k1, 0, np.inf)
+    k2 = np.clip(k2, 0, np.inf)
+    return c + A1 * np.exp(-k1 * (tt - t0)) + A2 * np.exp(-k2 * (tt - t0))
 
 
 MODEL_FUNCS = {
-    "IB": (model_IB, ["C", "H0", "alpha", "kinact", "kslow"]),
     "Exponential": (model_Exponential, ["a", "b", "c", "k", "t0"]),
-    "GFI": (model_GFI, ["C", "A", "B", "alpha", "kinact", "kfast", "k", "t0"]),
+    "BiExponential": (model_BiExponential, ["c", "A1", "k1", "A2", "k2", "t0"]),
 }
-
