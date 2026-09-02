@@ -42,7 +42,11 @@ def _detect_screen_inches() -> Tuple[float, float]:
 
     Falls back to a safe 12 × 7.5 if detection fails.
     """
-    # Try Tk first — cross-platform and cheap.
+    # matplotlib's default figure DPI (used to convert figsize inches →
+    # window pixels). This is what actually determines window size.
+    fig_dpi = plt.rcParams.get("figure.dpi", 100)
+
+    # Try Tk to get screen pixel dimensions.
     try:
         import tkinter as tk
 
@@ -50,20 +54,21 @@ def _detect_screen_inches() -> Tuple[float, float]:
         root.withdraw()
         w_px = root.winfo_screenwidth()
         h_px = root.winfo_screenheight()
-        dpi = float(root.winfo_fpixels("1i"))
         root.destroy()
-        if dpi > 0 and w_px > 0 and h_px > 0:
-            w_in = w_px / dpi
-            h_in = h_px / dpi
-            # Leave ~1.0" side margins, ~1.6" vertical (menu bar + dock +
-            # matplotlib toolbar). Clamp to sane bounds.
-            usable_w = max(8.0, min(w_in - 1.0, 20.0))
-            usable_h = max(5.5, min(h_in - 1.6, 12.0))
+        if w_px > 0 and h_px > 0:
+            # Convert screen pixels to matplotlib figure-inches using the
+            # FIGURE DPI, not Tk's reported DPI (which is always 72 on
+            # macOS regardless of the actual display).
+            # Reserve pixels for OS chrome: ~100px horizontal (window
+            # frame), ~180px vertical (menu bar + dock + window title +
+            # matplotlib toolbar).
+            usable_w = max(8.0, (w_px - 100) / fig_dpi)
+            usable_h = max(5.5, (h_px - 180) / fig_dpi)
             return usable_w, usable_h
     except Exception:
         pass
 
-    # Fallback: assume a 13" MacBook-ish display.
+    # Fallback: assume a modest display.
     return 12.0, 7.5
 
 
@@ -93,6 +98,10 @@ class WindowManager:
     def __init__(self) -> None:
         self._fig: Optional[plt.Figure] = None
         self._screen_ceiling: Optional[Tuple[float, float]] = None
+        # Set of (signal, cid) pairs for matplotlib's own internal
+        # callbacks (toolbar, GCF), captured right after figure
+        # creation. reset() disconnects everything NOT in this set.
+        self._internal_cids: set = set()
 
     # -- lifecycle ------------------------------------------------------
 
@@ -119,7 +128,31 @@ class WindowManager:
             # Either first use, or the user closed the window with the OS
             # close button. Reopen fresh.
             self._fig = plt.figure(figsize=(w, h))
+            # Snapshot the IDs of matplotlib's own internal callbacks
+            # (toolbar, GCF bookkeeping). reset() will disconnect
+            # everything NOT in this set.
+            self._internal_cids = set()
+            for signal, cid_dict in self._fig.canvas.callbacks.callbacks.items():
+                for cid in cid_dict:
+                    self._internal_cids.add((signal, cid))
         else:
+            # Disconnect user-registered callbacks from the previous
+            # step, keeping matplotlib's internal ones. fig.clf() clears
+            # axes and artists but leaves canvas-level event connections
+            # alive — stale callbacks referencing destroyed axes cause
+            # ghost rendering artefacts and make the Z-key zoom toggle
+            # unreliable (multiple handlers compete).
+            try:
+                cbs = self._fig.canvas.callbacks.callbacks
+                to_remove = []
+                for signal, cid_dict in cbs.items():
+                    for cid in list(cid_dict):
+                        if (signal, cid) not in self._internal_cids:
+                            to_remove.append(cid)
+                for cid in to_remove:
+                    self._fig.canvas.mpl_disconnect(cid)
+            except Exception:
+                pass
             self._fig.clf()
             try:
                 self._fig.set_size_inches(w, h, forward=True)
