@@ -8,7 +8,7 @@ older SensorFit flow with a per-interval state machine:
         2. optional control subtraction
              - none / existing-interval picker / new-control modal / back
         3. zero or more fits
-             - model: manual-linear | single-exp | IB
+             - model: manual-linear | single-exp | bi-exp
              - user-picked fit-range (start, end)
              - preview with initial rate at the chosen start
              - optional back-extrapolation prompt (deadtime TextBox)
@@ -44,13 +44,21 @@ from .calibration import (
     CALIBRATED_COLUMN,
     IntervalSubset,
     add_instruction_banner,
+    apply_robust_ylim,
     average_window,
     create_small_button,
     truncate_filename,
 )
-from .controls import average_controls_on_grid, deviation_from_anchor, interpolate_control_to_grid
-from .fitting import fit_IB, fit_Exponential
-from .models import model_Exponential, model_IB
+from .controls import (
+    align_control_offset,
+    average_controls_on_grid,
+    deviation_from_anchor,
+    interpolate_control_to_grid,
+    suggest_anchor_time,
+)
+from .fitting import fit_Exponential, fit_BiExponential
+from .models import model_Exponential, model_BiExponential
+from .window import get_window, finish_window
 from .zoom_hotkey import install_zoom_keys
 
 
@@ -64,7 +72,7 @@ class FitRecord:
     """One fit applied to one interval.
 
     The model name is the SensorFit display name ("ManualLinear",
-    "Exponential", "IB").  Parameters / yhat are stored in absolute
+    "Exponential", "BiExponential").  Parameters / yhat are stored in absolute
     full-trace time so they overlay correctly on the calibrated trace.
     """
 
@@ -132,21 +140,21 @@ def delta_max_from_fit(fit: FitRecord, t_zero: float) -> float:
     the linear baseline ``a*t + b``; the "consumption" at ``t_zero`` is
     ``y(t_zero) − asymptote(t_zero) = c * exp(-k*(t_zero - t0))``.
 
-    For IB ``y(t) = C + H0*exp(...) - kslow*t``, the asymptote is
-    ``C - kslow*t``; ``Δmax = y(t_zero) − asymptote(t_zero) = H0*exp(...)``.
+    For BiExponential ``y(t) = c + A1*exp(-k1*(t-t0)) + A2*exp(-k2*(t-t0))``,
+    the asymptote is the constant offset ``c``; the consumption at
+    ``t_zero`` is the sum of both exponential terms.
 
     For ManualLinear, the asymptote IS the fit; Δmax is undefined and we
     return NaN (caller should fall back to a different method).
     """
     if fit.model == "Exponential" and len(fit.params) == 5:
         a, b, c, k_decay, t0 = fit.params
-        # Δ = y_at_t_zero - asymptote_at_t_zero = c * exp(-k*(t_zero - t0))
         return float(c * np.exp(-k_decay * (t_zero - t0)))
-    if fit.model == "IB" and len(fit.params) == 5:
-        # H(t) = C + H0*exp(-alpha*(1 - exp(-kinact*t))) - kslow*t
-        # Δ at t_zero = H0 * exp(-alpha*(1 - exp(-kinact*t_zero)))
-        _C, H0, alpha, kinact, _kslow = fit.params
-        return float(H0 * np.exp(-alpha * (1.0 - np.exp(-kinact * t_zero))))
+    if fit.model == "BiExponential" and len(fit.params) == 6:
+        _c, A1, k1, A2, k2, t0 = fit.params
+        return float(
+            A1 * np.exp(-k1 * (t_zero - t0)) + A2 * np.exp(-k2 * (t_zero - t0))
+        )
     return float("nan")
 
 
@@ -208,7 +216,8 @@ def select_one_interval(
                  from the caller's perspective unless the caller wants to
                  distinguish).
     """
-    fig, ax = plt.subplots(figsize=(11, 6.5))
+    fig = get_window().reset(figsize=(11, 6.5))
+    ax = fig.add_subplot(111)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Pick an interval"
@@ -218,6 +227,9 @@ def select_one_interval(
         pass
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.78)
     ax.plot(time_values, h2o2_values, color="tab:green", lw=1.2, label="Calibrated trace")
+    # Keep the injection transient from compressing the trace (see
+    # apply_robust_ylim); "r" restores this view, not the spike-wide one.
+    apply_robust_ylim(ax, h2o2_values)
     for (s_existing, e_existing) in already_defined:
         ax.axvspan(s_existing, e_existing, color="grey", alpha=0.18)
     ax.set_xlabel("Time (s)")
@@ -307,19 +319,19 @@ def select_one_interval(
             print("Please click two points to define the interval.")
             return
         state["action"] = "accept"
-        plt.close(fig)
+        get_window().stop()
 
     def on_done(_e=None):
         state["action"] = "done"
-        plt.close(fig)
+        get_window().stop()
 
     def on_back(_e=None):
         state["action"] = "back"
-        plt.close(fig)
+        get_window().stop()
 
     def on_skip(_e=None):
         state["action"] = "skip"
-        plt.close(fig)
+        get_window().stop()
 
     def on_retry(_e=None):
         pending["start"] = None
@@ -344,7 +356,7 @@ def select_one_interval(
             print("No previously-defined intervals to remove.")
             return
         state["action"] = "remove_last"
-        plt.close(fig)
+        get_window().stop()
 
     # Two rows of buttons, with "Done with intervals" deliberately placed
     # in the top-right corner, well away from the frequently-clicked
@@ -381,8 +393,7 @@ def select_one_interval(
     btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     if state["action"] == "accept" and state["interval"] is not None:
         return state["interval"]
@@ -402,7 +413,8 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     "Existing" and "new" both lead to the multi-control averaging hub,
     which lets the user accumulate one or more controls before accepting.
     """
-    fig, ax = plt.subplots(figsize=(9.2, 4.8))
+    fig = get_window().reset(figsize=(9.2, 4.8))
+    ax = fig.add_subplot(111)
     try:
         fig.canvas.manager.set_window_title("SensorFit — Subtraction choice")
     except Exception:
@@ -441,7 +453,7 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     def _set(v):
         def _f(_e=None):
             choice["value"] = v
-            plt.close(fig)
+            get_window().stop()
         return _f
 
     ax_none = fig.add_axes([0.07, 0.05, 0.18, 0.13])
@@ -457,8 +469,7 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     btn_new.on_clicked(_set("new"))
     btn_back.on_clicked(_set("back"))
 
-    plt.show()
-    plt.close(fig)
+    get_window().run()
     return choice["value"] or "none"
 
 
@@ -535,138 +546,6 @@ def _discover_existing_control_intervals(
     return out
 
 
-# ────────────────────────────────────────────────────────────────────────
-# UI: subtraction preview (used by the averaging hub's single-control
-# legacy path is gone; this is kept for potential direct use)
-# ────────────────────────────────────────────────────────────────────────
-
-
-def preview_per_interval_subtraction(
-    sample_t: np.ndarray,
-    sample_y: np.ndarray,
-    control_t: np.ndarray,
-    control_y: np.ndarray,
-    filename: str | None = None,
-    label: str = "Control",
-):
-    """Show before/after preview of the subtraction and let the user
-    accept / re-anchor / skip / back.
-
-    Returns one of:
-      np.ndarray — the corrected sample_y (sample − control aligned).
-      "skip" — user opted to skip subtraction.
-      "back" — user wants to revisit the subtraction-choice dialog.
-    """
-    anchor = {"t0": float(sample_t[0])}
-
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(11, 7.4), sharex=True)
-    try:
-        fig.canvas.manager.set_window_title(
-            "SensorFit — Subtraction preview"
-            + (f": {truncate_filename(filename)}" if filename else "")
-        )
-    except Exception:
-        pass
-    plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.78, hspace=0.25)
-
-    ax_top.plot(sample_t, sample_y, color="tab:green", lw=1.3, label="Sample interval")
-    line_ctrl, = ax_top.plot([], [], color="tab:red", lw=1.2, alpha=0.85, label=label)
-    anchor_line_top = ax_top.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9, label="Anchor (control t=0)")
-    anchor_line_bot = ax_bot.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9)
-    ax_top.set_ylabel("H2O2 (µM)")
-    ax_top.legend(loc="upper right", fontsize=9)
-
-    line_corr, = ax_bot.plot([], [], color="tab:blue", lw=1.3, label="Sample − Control")
-    ax_bot.axhline(0.0, color="grey", lw=0.6, ls=":")
-    ax_bot.set_xlabel("Time (s)")
-    ax_bot.set_ylabel("H2O2 (µM, corrected)")
-    ax_bot.legend(loc="upper right", fontsize=9)
-
-    add_instruction_banner(
-        fig,
-        f"{truncate_filename(filename) if filename else ''}  "
-        f"Top: sample (green) + control (red).  Bottom: sample − control.  "
-        "Click on the upper plot to re-anchor the control's t=0.  Accept records "
-        "the subtraction, Skip keeps the original, Back revisits the choice.",
-        y=0.985,
-        width=110,
-    )
-
-    # Autoscale only on the very first draw.  On subsequent re-anchors the
-    # user's current view (including any zoom they set to pick t carefully)
-    # is preserved — pressing 'r' resets the view if they want it back.
-    view = {"autoscaled": False}
-
-    def redraw():
-        shifted_t = control_t + anchor["t0"]
-        interp, _ = interpolate_control_to_grid(shifted_t, control_y, sample_t)
-        dev = deviation_from_anchor(interp, sample_t, anchor["t0"])
-        line_ctrl.set_data(sample_t, interp)
-        line_corr.set_data(sample_t, sample_y - dev)
-        anchor_line_top.set_xdata([anchor["t0"], anchor["t0"]])
-        anchor_line_bot.set_xdata([anchor["t0"], anchor["t0"]])
-        if not view["autoscaled"]:
-            for a in (ax_top, ax_bot):
-                a.relim()
-                a.autoscale_view()
-            view["autoscaled"] = True
-        fig.canvas.draw_idle()
-
-    def on_click(event):
-        if event.inaxes is not ax_top or event.button != 1 or event.xdata is None:
-            return
-        if getattr(fig.canvas.toolbar, "mode", "") in ("zoom rect", "pan/zoom", "zoom", "pan"):
-            return
-        anchor["t0"] = float(event.xdata)
-        redraw()
-
-    fig.canvas.mpl_connect("button_press_event", on_click)
-
-    decision = {"value": None}
-
-    def on_accept(_e=None):
-        decision["value"] = "accept"
-        plt.close(fig)
-
-    def on_skip(_e=None):
-        decision["value"] = "skip"
-        plt.close(fig)
-
-    def on_back(_e=None):
-        decision["value"] = "back"
-        plt.close(fig)
-
-    def on_reset(_e=None):
-        anchor["t0"] = float(sample_t[0])
-        redraw()
-
-    ax_accept = fig.add_axes([0.10, 0.03, 0.18, 0.06])
-    ax_reset = fig.add_axes([0.30, 0.03, 0.14, 0.06])
-    ax_skip = fig.add_axes([0.46, 0.03, 0.18, 0.06])
-    ax_back = fig.add_axes([0.66, 0.03, 0.14, 0.06])
-    _btn_accept_1 = create_small_button(ax_accept, "Accept & subtract", "#90ee90", "#7cd47c")
-    _btn_accept_1.on_clicked(on_accept)
-    _btn_reset_2 = create_small_button(ax_reset, "Reset anchor", "0.9", "0.8")
-    _btn_reset_2.on_clicked(on_reset)
-    _btn_skip_3 = create_small_button(ax_skip, "Skip subtraction", "#ffcc99", "#ffaa66")
-    _btn_skip_3.on_clicked(on_skip)
-    _btn_back_4 = create_small_button(ax_back, "Back", "#ddddff", "#bbbbff")
-    _btn_back_4.on_clicked(on_back)
-
-    redraw()
-    install_zoom_keys(fig, [ax_top, ax_bot])
-    plt.show()
-    plt.close(fig)
-
-    if decision["value"] == "accept":
-        shifted_t = control_t + anchor["t0"]
-        interp, _ = interpolate_control_to_grid(shifted_t, control_y, sample_t)
-        dev = deviation_from_anchor(interp, sample_t, anchor["t0"])
-        return sample_y - dev
-    if decision["value"] == "skip":
-        return "skip"
-    return "back"
-
 
 # ────────────────────────────────────────────────────────────────────────
 # UI: multi-select existing-interval picker
@@ -696,6 +575,7 @@ def pick_existing_intervals_multi(
             "Click to select (Ctrl/Cmd-click or Shift-click for multiple).  "
             "Accept adds all selected controls to the averaging set."
         ),
+        subtracting_from=filename,
     )
 
 
@@ -703,8 +583,14 @@ def _qt_multi_select_dialog(
     candidates: list[dict],
     title: str = "Select intervals",
     instructions: str = "",
+    subtracting_from: str | None = None,
 ) -> list[dict] | None:
-    """Scrollable multi-select dialog backed by Qt."""
+    """Scrollable multi-select dialog backed by Qt.
+
+    ``subtracting_from`` names the run these controls will be subtracted
+    from; it is shown as a prominent banner so the choice of control is
+    never made against a half-remembered sample.
+    """
     import sys as _sys
     try:
         from .calibration_editor import _try_import_qt, QT_AVAILABLE, QT_LIB
@@ -719,7 +605,7 @@ def _qt_multi_select_dialog(
             ok = False
         if not ok:
             print("Qt not available; falling back to console selection.")
-            return _console_multi_select(candidates)
+            return _console_multi_select(candidates, subtracting_from)
 
     if QT_LIB == "PyQt5":
         from PyQt5 import QtWidgets, QtCore
@@ -730,8 +616,26 @@ def _qt_multi_select_dialog(
 
     dlg = QtWidgets.QDialog()
     dlg.setWindowTitle(title)
-    dlg.resize(620, 420)
+    dlg.resize(620, 460)
     layout = QtWidgets.QVBoxLayout(dlg)
+
+    if subtracting_from:
+        banner = QtWidgets.QLabel(
+            f"Choosing a control to subtract FROM:\n{subtracting_from}"
+        )
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "QLabel {"
+            " background-color: #fff3cd;"
+            " border: 2px solid #d39e00;"
+            " border-radius: 4px;"
+            " padding: 8px;"
+            " font-size: 13px;"
+            " font-weight: bold;"
+            " color: #5c4400;"
+            "}"
+        )
+        layout.addWidget(banner)
 
     if instructions:
         lbl = QtWidgets.QLabel(instructions)
@@ -760,8 +664,13 @@ def _qt_multi_select_dialog(
     return None
 
 
-def _console_multi_select(candidates: list[dict]) -> list[dict] | None:
+def _console_multi_select(
+    candidates: list[dict],
+    subtracting_from: str | None = None,
+) -> list[dict] | None:
     """Fallback when Qt is unavailable: numbered console list."""
+    if subtracting_from:
+        print(f"\n>>> Choosing a control to subtract FROM: {subtracting_from}")
     print("\nAvailable intervals:")
     for i, c in enumerate(candidates):
         print(f"  [{i}] {c['label']}")
@@ -802,13 +711,33 @@ def averaging_hub(
     Buttons: Add existing / Add new / Remove last / Accept & subtract /
     Skip / Back.
 
-    Returns ``(decision, members)`` where decision is ``"accept"``,
-    ``"skip"``, or ``"back"``.
-    """
-    members: list[ControlMember] = list(initial_members)
-    anchor = {"t0": float(sample_t[0])}
+    Each control is time-shifted so its H₂O₂ injection coincides with the
+    sample's (see ``align_control_offset``); without that the anchor lands
+    in the control's pre-injection baseline and the whole injection step
+    is subtracted instead of just the drift.
 
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(11, 7.8), sharex=True)
+    Returns ``(decision, members, anchor_t)`` where decision is
+    ``"accept"``, ``"skip"``, or ``"back"``.  The returned members carry
+    their alignment shift baked into their time arrays, and ``anchor_t``
+    is the deviation reference the user settled on — callers must reuse
+    both so the applied subtraction matches this preview.
+    """
+
+    def _aligned(member: ControlMember) -> ControlMember:
+        """Shift a member's time base so its injection matches the sample's."""
+        label, ct, cy = member
+        try:
+            shift = align_control_offset(sample_t, sample_y, ct, cy)
+        except Exception:
+            shift = 0.0
+        return (label, np.asarray(ct, dtype=float) + shift, cy)
+
+    members: list[ControlMember] = [_aligned(m) for m in initial_members]
+    anchor = {"t0": suggest_anchor_time(sample_t, sample_y)}
+
+    fig = get_window().reset(figsize=(11, 7.8))
+    ax_top = fig.add_subplot(211)
+    ax_bot = fig.add_subplot(212, sharex=ax_top)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Multi-control averaging"
@@ -819,6 +748,7 @@ def averaging_hub(
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.78, hspace=0.25)
 
     ax_top.plot(sample_t, sample_y, color="tab:green", lw=1.3, label="Sample")
+    apply_robust_ylim(ax_top, sample_y)
     anchor_line_top = ax_top.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9, label="Anchor")
     anchor_line_bot = ax_bot.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9)
     ax_top.set_ylabel("H₂O₂ (µM)")
@@ -829,6 +759,9 @@ def averaging_hub(
     dynamic_lines: list = []
     line_avg = [None]
     line_corr = [None]
+    readout = [fig.text(
+        0.5, 0.845, "", ha="center", va="top", fontsize=9, color="#333333",
+    )]
 
     member_colours = [
         "#d4a0a0", "#a0a0d4", "#a0d4a0", "#d4d4a0", "#d4a0d4",
@@ -838,10 +771,11 @@ def averaging_hub(
     add_instruction_banner(
         fig,
         "Build your control-averaging set.  "
-        "Top: sample (green) + individual controls (faint) + average (red).  "
-        "Bottom: sample − average.  "
-        "Click upper plot to re-anchor.  "
-        "Add controls, then Accept.",
+        "Controls are auto-aligned to this run's H₂O₂ injection, and only "
+        "their drift away from the anchor is subtracted — so a 100 µM run "
+        "minus a 100 µM control stays near 100, not 0.  "
+        "Top: sample (green) + controls (faint) + average (red).  "
+        "Bottom: corrected sample.  Click upper plot to move the anchor.",
         y=0.985, width=110,
     )
 
@@ -870,7 +804,12 @@ def averaging_hub(
             return
 
         pairs = [(ct, cy) for (_label, ct, cy) in members]
-        averaged, interps = average_controls_on_grid(pairs, sample_t, anchor["t0"])
+        # Members are pre-aligned to the sample's injection, so they are
+        # always placed at the interval start; the anchor only chooses the
+        # zero-deviation reference time.
+        averaged, interps = average_controls_on_grid(
+            pairs, sample_t, float(sample_t[0])
+        )
 
         for i, (interp_y, (label, _ct, _cy)) in enumerate(zip(interps, members)):
             c = member_colours[i % len(member_colours)]
@@ -890,13 +829,32 @@ def averaging_hub(
         anchor_line_top.set_xdata([anchor["t0"], anchor["t0"]])
         anchor_line_bot.set_xdata([anchor["t0"], anchor["t0"]])
 
+        # Readout so a misplaced anchor is obvious rather than silent.
+        ctrl_at = float(np.interp(anchor["t0"], sample_t, averaged))
+        samp_at = float(np.interp(anchor["t0"], sample_t, sample_y))
+        drift = float(averaged[-1] - ctrl_at)
+        msg = (
+            f"At anchor t={anchor['t0']:.1f}s:  control={ctrl_at:.1f} µM   "
+            f"sample={samp_at:.1f} µM   |   control drift over run: "
+            f"{drift:+.1f} µM"
+        )
+        colour = "#333333"
+        span = float(np.nanmax(sample_y) - np.nanmin(sample_y))
+        if span > 0 and abs(samp_at - ctrl_at) > 0.25 * span:
+            msg += "\n⚠ Control and sample differ a lot here — the anchor may "
+            msg += "sit before an injection. Click the upper plot to move it."
+            colour = "#b00020"
+        readout[0].set_text(msg)
+        readout[0].set_color(colour)
+
         ax_top.legend(loc="upper right", fontsize=9)
         ax_bot.legend(loc="upper right", fontsize=9)
 
         if not view["autoscaled"]:
-            for a in (ax_top, ax_bot):
-                a.relim()
-                a.autoscale_view()
+            # Robust limits on both panes: the corrected trace inherits the
+            # sample's injection transient, which would otherwise squash it.
+            apply_robust_ylim(ax_top, sample_y, averaged)
+            apply_robust_ylim(ax_bot, sample_y - dev)
             view["autoscaled"] = True
         fig.canvas.draw_idle()
 
@@ -915,7 +873,7 @@ def averaging_hub(
     def _close_with(v):
         def _f(_e=None):
             decision["value"] = v
-            plt.close(fig)
+            get_window().stop()
         return _f
 
     def _add_existing(_e=None):
@@ -927,7 +885,7 @@ def averaging_hub(
             for p in picked:
                 ct, cy = p["load"]()
                 ct_zero = ct - ct[0]
-                members.append((p["label"], ct_zero, cy))
+                members.append(_aligned((p["label"], ct_zero, cy)))
             redraw()
 
     def _add_new(_e=None):
@@ -935,14 +893,17 @@ def averaging_hub(
             print("No callback for new-control processing.")
             return
         picked_path = _qt_pick_control_file(
-            calibrated_dir.parent if calibrated_dir is not None else None
+            calibrated_dir.parent if calibrated_dir is not None else None,
+            subtracting_from=filename,
         )
         if picked_path is not None:
             template = new_control_callback(picked_path)
             if template is not None:
                 ct, cy = template
                 ct_zero = ct - ct[0]
-                members.append((f"new: {picked_path.name}", ct_zero, cy))
+                members.append(
+                    _aligned((f"new: {picked_path.name}", ct_zero, cy))
+                )
                 redraw()
 
     def _remove_last(_e=None):
@@ -973,11 +934,10 @@ def averaging_hub(
 
     redraw()
     install_zoom_keys(fig, [ax_top, ax_bot])
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     d = decision["value"] or "skip"
-    return (d, members if d == "accept" else [])
+    return (d, members if d == "accept" else [], float(anchor["t0"]))
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -995,7 +955,8 @@ def _run_fit(
     return a ``FitRecord``.
 
     For ManualLinear, fits a degree-1 polynomial through the segment.  For
-    Exponential / IB, delegates to ``fit_Exponential`` / ``fit_IB`` from
+    Exponential / BiExponential, delegates to ``fit_Exponential`` /
+    ``fit_BiExponential`` from
     ``sensorfit.fitting``.
 
     ``init_rate_at_t`` is the user-chosen absolute time at which the
@@ -1044,19 +1005,18 @@ def _run_fit(
             rss=float(fr.get("rss", float("nan"))),
         )
 
-    if model == "IB":
-        fr = fit_IB(t, y)
-        # Derivative of IB model at t_start: H(t) = C + H0*exp(-alpha*(1-exp(-kinact*t))) - kslow*t
-        # dH/dt = -H0*alpha*kinact*exp(-kinact*t)*exp(-alpha*(1-exp(-kinact*t))) - kslow
-        _C, H0, alpha, kinact, kslow = fr["params"]
+    if model == "BiExponential":
+        fr = fit_BiExponential(t, y)
+        # Derivative at ti:
+        #   dy/dt = -A1*k1*exp(-k1*(t-t0)) - A2*k2*exp(-k2*(t-t0))
+        _c, A1, k1, A2, k2, t0 = fr["params"]
         ti = float(init_rate_at_t)
         rate_at_t = float(
-            -H0 * alpha * kinact * np.exp(-kinact * ti)
-            * np.exp(-alpha * (1.0 - np.exp(-kinact * ti)))
-            - kslow
+            -A1 * k1 * np.exp(-k1 * (ti - t0))
+            - A2 * k2 * np.exp(-k2 * (ti - t0))
         )
         return FitRecord(
-            model="IB",
+            model="BiExponential",
             fit_start_s=float(t[0]),
             fit_end_s=float(t[-1]),
             params=[float(x) for x in fr["params"]],
@@ -1085,7 +1045,7 @@ def prompt_one_fit(
 
     - the data plot (top, large) with the fitted curve overlaid in red
     - a residuals strip below
-    - mode buttons (Manual linear | Single exp | Inactivation) at the top
+    - mode buttons (Manual linear | Single exp | Bi exp) at the top
     - a "Fit" button + a stats line showing init_rate and R²
     - actions along the bottom: Extrapolate to… | Accept fit | Retry |
       Skip | Back
@@ -1109,7 +1069,7 @@ def prompt_one_fit(
       "back"    — user wants to revisit the subtraction step.
     """
     # ── Figure layout: 2-row gridspec (data : residuals = 3 : 1) ──────
-    fig = plt.figure(figsize=(11.5, 8.6))
+    fig = get_window().reset(figsize=(11.5, 7.6))
     try:
         fig.canvas.manager.set_window_title(
             f"SensorFit — Fit #{fit_index}"
@@ -1118,10 +1078,11 @@ def prompt_one_fit(
     except Exception:
         pass
     gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.10,
-                          left=0.10, right=0.97, top=0.66, bottom=0.16)
+                          left=0.10, right=0.97, top=0.76, bottom=0.155)
     ax_data = fig.add_subplot(gs[0])
     ax_resid = fig.add_subplot(gs[1], sharex=ax_data)
     ax_data.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
+    apply_robust_ylim(ax_data, interval_y)
     ax_data.set_ylabel("H2O2 (µM)")
     ax_resid.axhline(0.0, color="grey", lw=0.6, ls=":")
     ax_resid.set_ylabel("residual")
@@ -1137,28 +1098,28 @@ def prompt_one_fit(
     # ── Controls along the top (between banner and plot) ─────────────
     n_existing = len(existing_fits or [])
     fig.text(
-        0.10, 0.755,
+        0.10, 0.895,
         f"Fit #{fit_index}" + (f"  (previous fits on this interval: {n_existing})" if n_existing else ""),
         fontsize=10, fontweight="bold",
     )
 
     # Model picker buttons
-    ax_mlin = fig.add_axes([0.10, 0.71, 0.12, 0.04])
-    ax_mexp = fig.add_axes([0.23, 0.71, 0.12, 0.04])
-    ax_mib = fig.add_axes([0.36, 0.71, 0.12, 0.04])
+    ax_mlin = fig.add_axes([0.10, 0.845, 0.12, 0.04])
+    ax_mexp = fig.add_axes([0.23, 0.845, 0.12, 0.04])
+    ax_mib = fig.add_axes([0.36, 0.845, 0.12, 0.04])
     btn_mlin = create_small_button(ax_mlin, "Manual linear", "0.85", "0.75")
     btn_mexp = create_small_button(ax_mexp, "Single exp", "0.85", "0.75")
-    btn_mib = create_small_button(ax_mib, "Inactivation", "0.85", "0.75")
+    btn_mib = create_small_button(ax_mib, "Bi exp", "0.85", "0.75")
 
     # Action buttons in the same row
-    ax_fit = fig.add_axes([0.52, 0.71, 0.08, 0.04])
-    ax_clear = fig.add_axes([0.61, 0.71, 0.10, 0.04])
+    ax_fit = fig.add_axes([0.52, 0.845, 0.08, 0.04])
+    ax_clear = fig.add_axes([0.61, 0.845, 0.10, 0.04])
     btn_fit = create_small_button(ax_fit, "Fit", "#90ee90", "#7cd47c")
     btn_clear = create_small_button(ax_clear, "Clear range", "0.9", "0.8")
 
     # Stats line + status hint
     stats_text = fig.text(
-        0.10, 0.685,
+        0.10, 0.815,
         "Pick the fit range by clicking on the plot, then a model.",
         fontsize=9, color="dimgrey", style="italic",
     )
@@ -1182,7 +1143,7 @@ def prompt_one_fit(
         fig.canvas.draw_idle()
 
     def _update_model_buttons():
-        for m, btn in (("ManualLinear", btn_mlin), ("Exponential", btn_mexp), ("IB", btn_mib)):
+        for m, btn in (("ManualLinear", btn_mlin), ("Exponential", btn_mexp), ("BiExponential", btn_mib)):
             btn.color = "#ffe680" if mode_state["model"] == m else "0.85"
         fig.canvas.draw_idle()
 
@@ -1249,7 +1210,7 @@ def prompt_one_fit(
 
     def _run_and_draw_fit():
         if mode_state["model"] is None:
-            _set_stats("Pick a model first (Manual linear / Single exp / Inactivation).", "darkred")
+            _set_stats("Pick a model first (Manual linear / Single exp / Bi exp).", "darkred")
             return
         if len(range_state["clicks"]) != 2:
             _set_stats("Click two points on the plot to define the fit range.", "darkred")
@@ -1317,13 +1278,13 @@ def prompt_one_fit(
             y_at_target = float(model_Exponential(np.array([target_t]), *rec.params)[0])
             a, _b, c, k_decay, t0 = rec.params
             new_rate = float(a - c * k_decay * np.exp(-k_decay * (target_t - t0)))
-        elif rec.model == "IB":
-            y_at_target = float(model_IB(np.array([target_t]), *rec.params)[0])
-            _C, H0, alpha, kinact, kslow = rec.params
+        elif rec.model == "BiExponential":
+            y_at_target = float(model_BiExponential(np.array([target_t]), *rec.params)[0])
+            _c, A1, k1, A2, k2, t0 = rec.params
+            # dy/dt = -A1*k1*exp(-k1*(t-t0)) - A2*k2*exp(-k2*(t-t0))
             new_rate = float(
-                -H0 * alpha * kinact * np.exp(-kinact * target_t)
-                * np.exp(-alpha * (1.0 - np.exp(-kinact * target_t)))
-                - kslow
+                -A1 * k1 * np.exp(-k1 * (target_t - t0))
+                - A2 * k2 * np.exp(-k2 * (target_t - t0))
             )
         else:
             return
@@ -1343,8 +1304,8 @@ def prompt_one_fit(
             y_curve = slope * t_curve + intercept
         elif rec.model == "Exponential":
             y_curve = model_Exponential(t_curve, *rec.params)
-        elif rec.model == "IB":
-            y_curve = model_IB(t_curve, *rec.params)
+        elif rec.model == "BiExponential":
+            y_curve = model_BiExponential(t_curve, *rec.params)
         else:
             y_curve = np.full_like(t_curve, y_at_target, dtype=float)
 
@@ -1430,7 +1391,7 @@ def prompt_one_fit(
 
     btn_mlin.on_clicked(_set_model("ManualLinear"))
     btn_mexp.on_clicked(_set_model("Exponential"))
-    btn_mib.on_clicked(_set_model("IB"))
+    btn_mib.on_clicked(_set_model("BiExponential"))
     btn_fit.on_clicked(lambda _e=None: _run_and_draw_fit())
     btn_clear.on_clicked(lambda _e=None: _clear_range())
 
@@ -1456,7 +1417,7 @@ def prompt_one_fit(
             rec.back_extrap_t0_s = float(extrap_state["target_t"])
             rec.back_extrap_rate_uM_per_s = float(extrap_state["new_rate"])
         final["action"] = "accept"
-        plt.close(fig)
+        get_window().stop()
 
     def on_retry(_e=None):
         _clear_range()
@@ -1465,11 +1426,11 @@ def prompt_one_fit(
 
     def on_skip(_e=None):
         final["action"] = "skip"
-        plt.close(fig)
+        get_window().stop()
 
     def on_back(_e=None):
         final["action"] = "back"
-        plt.close(fig)
+        get_window().stop()
 
     ax_extrap = fig.add_axes([0.10, 0.04, 0.18, 0.05])
     ax_accept = fig.add_axes([0.30, 0.04, 0.14, 0.05])
@@ -1488,8 +1449,7 @@ def prompt_one_fit(
     btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, [ax_data, ax_resid])
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     if final["action"] == "accept" and fit_state["record"] is not None:
         return fit_state["record"]
@@ -1505,16 +1465,16 @@ def _model_asymptote(rec: FitRecord, t: np.ndarray) -> np.ndarray:
     """Return the model's asymptote evaluated at ``t``.
 
     For Exponential ``y = a*t + b + c*exp(-k*(t-t0))`` the asymptote is the
-    linear background ``a*t + b``.  For IB ``y = C + H0*exp(...) - kslow*t``
-    it's ``C - kslow*t``.  For ManualLinear, the fit itself.
+    linear background ``a*t + b``.  For BiExponential ``y = c + A1*exp(-k1*(t-t0)) +
+    A2*exp(-k2*(t-t0))`` it is the constant ``c``.  For ManualLinear, the fit itself.
     """
     t = np.asarray(t, dtype=float)
     if rec.model == "Exponential" and len(rec.params) == 5:
         a, b, _c, _k, _t0 = rec.params
         return a * t + b
-    if rec.model == "IB" and len(rec.params) == 5:
-        C, _H0, _alpha, _kinact, kslow = rec.params
-        return C - kslow * t
+    if rec.model == "BiExponential" and len(rec.params) == 6:
+        c_off, _A1, _k1, _A2, _k2, _t0 = rec.params
+        return np.full_like(np.asarray(t, dtype=float), float(c_off))
     if rec.model == "ManualLinear" and len(rec.params) == 2:
         slope, intercept = rec.params
         return slope * t + intercept
@@ -1555,10 +1515,11 @@ def prompt_delta_max(
 
     ``cal_max_uM`` can be changed on-the-fly via the TextBox at top right.
     """
-    has_usable_fit = any(f.model in ("Exponential", "IB") for f in fits)
+    has_usable_fit = any(f.model in ("Exponential", "BiExponential") for f in fits)
     default_mode = "from-fit" if has_usable_fit else "linear"
 
-    fig, ax = plt.subplots(figsize=(11, 7.2))
+    fig = get_window().reset(figsize=(11, 7.2))
+    ax = fig.add_subplot(111)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Δ[H₂O₂]max"
@@ -1568,6 +1529,7 @@ def prompt_delta_max(
         pass
     plt.subplots_adjust(left=0.10, bottom=0.20, right=0.98, top=0.66)
     ax.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
+    apply_robust_ylim(ax, interval_y)
     for i, f in enumerate(fits):
         t_seg = np.linspace(f.fit_start_s, f.fit_end_s, f.yhat.size)
         ax.plot(t_seg, f.yhat, "-", lw=1.0, alpha=0.6, label=f"fit#{i+1}:{f.model}")
@@ -1742,7 +1704,7 @@ def prompt_delta_max(
     def _set_mode(m):
         def _f(_e=None):
             if m == "from-fit" and not has_usable_fit:
-                _update_status("From-fit needs an Exponential or IB fit; pick Linear or Point.",
+                _update_status("From-fit needs an Exponential or BiExponential fit; pick Linear or Point.",
                               "darkred")
                 return
             if mode_state["mode"] == m:
@@ -1886,7 +1848,7 @@ def prompt_delta_max(
             if not has_usable_fit:
                 return
             rec_fit = next(
-                (f for f in reversed(fits) if f.model in ("Exponential", "IB")), None,
+                (f for f in reversed(fits) if f.model in ("Exponential", "BiExponential")), None,
             )
             if rec_fit is None:
                 return
@@ -1897,7 +1859,7 @@ def prompt_delta_max(
             if rec_fit.model == "Exponential":
                 y_fit_at_t = float(model_Exponential(np.array([t_zero]), *rec_fit.params)[0])
             else:
-                y_fit_at_t = float(model_IB(np.array([t_zero]), *rec_fit.params)[0])
+                y_fit_at_t = float(model_BiExponential(np.array([t_zero]), *rec_fit.params)[0])
             asym_at_t = float(_model_asymptote(rec_fit, np.array([t_zero]))[0])
             state["computed"] = DeltaMaxRecord(
                 method="from-fit", t_zero_s=t_zero, value_uM=float(delta),
@@ -1998,7 +1960,7 @@ def prompt_delta_max(
             return
         if mode_state["mode"] == "from-fit":
             rec_fit = next(
-                (f for f in reversed(fits) if f.model in ("Exponential", "IB")), None,
+                (f for f in reversed(fits) if f.model in ("Exponential", "BiExponential")), None,
             )
             if rec_fit is not None:
                 _highlight_fit(rec_fit)
@@ -2037,7 +1999,7 @@ def prompt_delta_max(
             _clear_preview()
             state["t_zero_idx"] = idx
             rec_fit = next(
-                (f for f in reversed(fits) if f.model in ("Exponential", "IB")), None,
+                (f for f in reversed(fits) if f.model in ("Exponential", "BiExponential")), None,
             )
             if rec_fit is not None:
                 _highlight_fit(rec_fit)
@@ -2083,7 +2045,7 @@ def prompt_delta_max(
             _update_status("No Δmax computed yet.", "darkred")
             return
         state["action"] = "accept"
-        plt.close(fig)
+        get_window().stop()
 
     def on_retry_t0(_e=None):
         """Clear ONLY the t₀ marker + dashed line (and the From-fit
@@ -2132,11 +2094,11 @@ def prompt_delta_max(
 
     def on_skip(_e=None):
         state["action"] = "skip"
-        plt.close(fig)
+        get_window().stop()
 
     def on_back(_e=None):
         state["action"] = "back"
-        plt.close(fig)
+        get_window().stop()
 
     # Five buttons across the bottom:
     # Accept | Retry t₀ | Retry baseline | Skip | Back
@@ -2157,8 +2119,7 @@ def prompt_delta_max(
     btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     if state["action"] == "accept" and state["computed"] is not None:
         return state["computed"]
@@ -2170,9 +2131,16 @@ def prompt_delta_max(
 # ────────────────────────────────────────────────────────────────────────
 
 
-def _qt_pick_control_file(input_dir: Path | None) -> Path | None:
+def _qt_pick_control_file(
+    input_dir: Path | None,
+    subtracting_from: str | None = None,
+) -> Path | None:
     """Open a Qt file dialog and let the user pick a control file.  Falls back
-    to None if Qt isn't available."""
+    to None if Qt isn't available.
+
+    ``subtracting_from`` names the run the control will be subtracted from
+    and is shown in the dialog title, so the sample is never out of sight
+    while choosing."""
     from .calibration_editor import _try_import_qt, QT_AVAILABLE, QT_LIB
     if not QT_AVAILABLE:
         ok, _, _ = _try_import_qt()
@@ -2181,20 +2149,55 @@ def _qt_pick_control_file(input_dir: Path | None) -> Path | None:
             return None
 
     if QT_LIB == "PyQt5":
-        from PyQt5.QtWidgets import QApplication, QFileDialog
+        from PyQt5.QtWidgets import QApplication, QFileDialog, QLabel
     else:
-        from PySide6.QtWidgets import QApplication, QFileDialog
+        from PySide6.QtWidgets import QApplication, QFileDialog, QLabel
 
     import sys as _sys
     app = QApplication.instance() or QApplication(_sys.argv)
     start_dir = str(input_dir) if input_dir is not None else ""
-    selected, _ = QFileDialog.getOpenFileName(
+
+    # macOS/Windows use native file dialogs whose title bar/caption is
+    # tiny or hidden; users kept losing track of which run they were
+    # picking a control FOR.  Force Qt's own dialog (DontUseNativeDialog)
+    # so we can inject a bright banner label at the top of its layout.
+    dlg = QFileDialog(
         None,
         "SensorFit — pick a control file to process",
         start_dir,
         "Excel / CSV (*.xlsx *.xls *.xlsm *.xlsb *.csv *.txt);;All files (*)",
     )
-    return Path(selected) if selected else None
+    dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+    dlg.setFileMode(QFileDialog.ExistingFile)
+    dlg.setAcceptMode(QFileDialog.AcceptOpen)
+
+    if subtracting_from:
+        banner = QLabel(f"Choosing a control to subtract FROM:\n{subtracting_from}")
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "QLabel {"
+            " background-color: #fff3cd;"
+            " border: 2px solid #d39e00;"
+            " border-radius: 4px;"
+            " padding: 8px;"
+            " font-size: 13px;"
+            " font-weight: bold;"
+            " color: #5c4400;"
+            "}"
+        )
+        # Insert the banner at the very top of the dialog's grid layout so
+        # it stays visible while the user navigates directories.
+        layout = dlg.layout()
+        if layout is not None:
+            try:
+                layout.addWidget(banner, 0, 0, 1, layout.columnCount() or 3)
+            except TypeError:
+                layout.addWidget(banner)
+
+    if dlg.exec_() != QFileDialog.Accepted:
+        return None
+    files = dlg.selectedFiles()
+    return Path(files[0]) if files else None
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -2325,7 +2328,8 @@ def run_per_interval_flow(
                             )
                         else:
                             picked_path = _qt_pick_control_file(
-                                calibrated_dir.parent if calibrated_dir is not None else None
+                                calibrated_dir.parent if calibrated_dir is not None else None,
+                                subtracting_from=filename,
                             )
                             if picked_path is not None:
                                 template = new_control_callback(picked_path)
@@ -2334,7 +2338,7 @@ def run_per_interval_flow(
                                     initial_members.append((f"new: {picked_path.name}", ct - ct[0], cy))
 
                     if initial_members:
-                        hub_decision, hub_members = averaging_hub(
+                        hub_decision, hub_members, hub_anchor = averaging_hub(
                             interval_t, interval_y, initial_members,
                             filename=filename,
                             existing_candidates=candidates,
@@ -2342,12 +2346,17 @@ def run_per_interval_flow(
                             calibrated_dir=calibrated_dir,
                         )
                         if hub_decision == "accept" and hub_members:
+                            # Reuse the hub's own alignment and anchor —
+                            # recomputing from interval_t[0] here would
+                            # silently apply a different subtraction from
+                            # the one the user just previewed.
                             pairs = [(ct, cy) for (_lbl, ct, cy) in hub_members]
-                            anchor_t = float(interval_t[0])
                             averaged, _ = average_controls_on_grid(
-                                pairs, interval_t, anchor_t
+                                pairs, interval_t, float(interval_t[0])
                             )
-                            dev = deviation_from_anchor(averaged, interval_t, anchor_t)
+                            dev = deviation_from_anchor(
+                                averaged, interval_t, hub_anchor
+                            )
                             interval_y = original_y - dev
                             interval_df[CALIBRATED_COLUMN] = interval_y
                             control_subtracted = True
@@ -2429,7 +2438,8 @@ def run_per_interval_flow(
 
 def _ask_another(question: str) -> bool:
     """Small yes/no popup; returns True if user clicks Yes."""
-    fig, ax = plt.subplots(figsize=(7, 2.5))
+    fig = get_window().reset(figsize=(7, 2.5))
+    ax = fig.add_subplot(111)
     try:
         fig.canvas.manager.set_window_title("SensorFit — Continue?")
     except Exception:
@@ -2440,11 +2450,11 @@ def _ask_another(question: str) -> bool:
 
     def _yes(_e=None):
         state["choice"] = True
-        plt.close(fig)
+        get_window().stop()
 
     def _no(_e=None):
         state["choice"] = False
-        plt.close(fig)
+        get_window().stop()
 
     ax_yes = fig.add_axes([0.22, 0.10, 0.22, 0.18])
     ax_no = fig.add_axes([0.56, 0.10, 0.22, 0.18])
@@ -2452,6 +2462,5 @@ def _ask_another(question: str) -> bool:
     _btn_yes_18.on_clicked(_yes)
     _btn_no_19 = create_small_button(ax_no, "No", "0.9", "0.8")
     _btn_no_19.on_clicked(_no)
-    plt.show()
-    plt.close(fig)
+    get_window().run()
     return state["choice"]

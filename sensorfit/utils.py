@@ -10,21 +10,32 @@ def fmt3(x):
 
 
 def parse_models(s: str):
-    """Parse model string into list of model names."""
-    allowed = {"IB", "EXPONENTIAL", "GFI"}
+    """Parse a comma-separated model string into canonical internal tags.
+
+    Accepts case-insensitive aliases (``exp``, ``biexp``, ``linear``) and
+    the canonical tags (``Exponential``, ``BiExponential``,
+    ``ManualLinear``).  Unknown tokens are dropped; an empty string
+    defaults to ``["Exponential"]``.
+    """
+    aliases = {
+        "EXP": "Exponential",
+        "EXPONENTIAL": "Exponential",
+        "SINGLE_EXP": "Exponential",
+        "BIEXP": "BiExponential",
+        "BIEXPONENTIAL": "BiExponential",
+        "DOUBLE_EXP": "BiExponential",
+        "LINEAR": "ManualLinear",
+        "MANUALLINEAR": "ManualLinear",
+        "MANUAL_LINEAR": "ManualLinear",
+    }
     if not s:
-        return ["IB"]
-    parts = []
+        return ["Exponential"]
+    parts: list[str] = []
     for token in s.replace(";", ",").split(","):
-        tok = token.strip().upper()
-        # Map "EXPONENTIAL" to "Exponential" for consistency
-        if tok == "EXPONENTIAL":
-            tok = "Exponential"
-        elif tok not in allowed and tok != "Exponential":
-            continue
-        if tok not in parts:
+        tok = aliases.get(token.strip().upper().replace(" ", "_"))
+        if tok and tok not in parts:
             parts.append(tok)
-    return parts if parts else ["IB"]
+    return parts if parts else ["Exponential"]
 
 
 def r2_score(y, yhat):

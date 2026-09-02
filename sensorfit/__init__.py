@@ -43,7 +43,7 @@ def _check_dependencies() -> None:
 _check_dependencies()
 
 from .models import MODEL_FUNCS
-from .fitting import fit_IB, fit_Exponential, fit_GFI
+from .fitting import fit_Exponential, fit_BiExponential
 from .utils import parse_models, r2_score, aic, bic
 from .calibration import (
     load_trace,
@@ -73,9 +73,8 @@ from .interval_processor import (
 
 __all__ = [
     "MODEL_FUNCS",
-    "fit_IB",
     "fit_Exponential",
-    "fit_GFI",
+    "fit_BiExponential",
     "parse_models",
     "r2_score",
     "aic",

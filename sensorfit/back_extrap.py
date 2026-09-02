@@ -74,7 +74,7 @@ def compute_back_extrap(
     else:
         # Linear fallback: use whatever init_rate we can find
         rate = None
-        for model in ("LinearInitialRate", "IB", "GFI"):
+        for model in ("LinearInitialRate", "ManualLinear", "BiExponential"):
             if model in fit_results_for_interval:
                 rate = float(
                     fit_results_for_interval[model].get("init_rate", float("nan"))

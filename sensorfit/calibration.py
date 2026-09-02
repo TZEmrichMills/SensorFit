@@ -24,6 +24,7 @@ from matplotlib.widgets import Button, CheckButtons, TextBox
 import numpy as np
 import pandas as pd
 
+from .window import get_window
 from .zoom_hotkey import install_zoom_keys
 
 
@@ -50,17 +51,15 @@ SUPPORTED_TEXT_EXTS = {".txt", ".csv"}
 SUPPORTED_FILE_EXTS = SUPPORTED_EXCEL_EXTS | SUPPORTED_TEXT_EXTS
 CALIBRATED_COLUMN = "H2O2_uM"
 
-# Mapping from internal model names to display names for outputs
-MODEL_DISPLAY_NAMES = {
-    "IB": "Inactivation",
-    "Exponential": "Exponential",
-    "GFI": "Gompertz-like",
-    "LinearInitialRate": "LinearInitialRate",
-}
-
 def get_model_display_name(model_name: str) -> str:
-    """Get display name for a model, or return the original if not found."""
-    return MODEL_DISPLAY_NAMES.get(model_name, model_name)
+    """Return a display name for an internal model tag.
+
+    Kept as a function (not a lookup) so both current and any future
+    aliases route through one place; today it is the identity function
+    because internal tags — ``ManualLinear``, ``Exponential``,
+    ``BiExponential`` — read fine in outputs as-is.
+    """
+    return model_name
 
 
 def create_small_button(ax, label, color, hovercolor):
@@ -304,6 +303,38 @@ def apply_pane_role_chrome(fig, role: str) -> None:
         fig.suptitle(title, fontsize=11, fontweight="bold", color=style["edge"])
 
 
+def apply_robust_ylim(ax, *series, pad: float = 0.08) -> None:
+    """Set y-limits from robust percentiles instead of min/max.
+
+    H₂O₂ injection produces a transient of several hundred µM lasting a
+    couple of samples.  Plain autoscaling therefore stretches the axis
+    over (say) −416 … +640 µM and squeezes the real 55–100 µM signal into
+    a tenth of the pane — the trace users actually need to click on.
+
+    Percentile limits ignore those few samples while still showing the
+    whole run.  The spike is not hidden: it is drawn, just off the top of
+    the pane, and pressing ``r`` (zoom reset) restores this same view
+    because ``install_zoom_keys`` captures limits after this call.
+    """
+    lows, highs = [], []
+    for y in series:
+        arr = np.asarray(y, dtype=float).ravel()
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            continue
+        lows.append(float(np.percentile(arr, 0.2)))
+        highs.append(float(np.percentile(arr, 99.8)))
+    if not lows:
+        return
+    lo, hi = min(lows), max(highs)
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return
+    if hi - lo < 1e-12:
+        lo, hi = lo - 1.0, hi + 1.0
+    margin = (hi - lo) * pad
+    ax.set_ylim(lo - margin, hi + margin)
+
+
 class pane_role_context:
     """Context manager that patches ``plt.subplots``, ``plt.figure``, and
     ``plt.show`` so every figure created and shown inside the block gets
@@ -323,9 +354,13 @@ class pane_role_context:
         self._figs: list = []
 
     def __enter__(self):
+        from .window import WindowManager
+
         self._orig_subplots = plt.subplots
         self._orig_figure = plt.figure
         self._orig_show = plt.show
+        self._orig_wm_reset = WindowManager.reset
+        self._orig_wm_run = WindowManager.run
         role = self.role
         figs = self._figs
 
@@ -350,15 +385,40 @@ class pane_role_context:
             figs.clear()
             return self._orig_show(*args, **kwargs)
 
+        # Patch WindowManager.reset so the shared window also picks up
+        # role chrome when it's reused inside a pane_role_context.
+        orig_reset = self._orig_wm_reset
+
+        def patched_reset(self_wm, *args, **kwargs):
+            fig = orig_reset(self_wm, *args, **kwargs)
+            fig.patch.set_edgecolor(_ROLE_STYLES[role]["edge"])
+            fig.patch.set_linewidth(_ROLE_STYLES[role]["lw"])
+            figs.append(fig)
+            return fig
+
+        orig_run = self._orig_wm_run
+
+        def patched_run(self_wm, *args, **kwargs):
+            for f in figs:
+                apply_pane_role_chrome(f, role)
+            figs.clear()
+            return orig_run(self_wm, *args, **kwargs)
+
         plt.subplots = patched_subplots
         plt.figure = patched_figure
         plt.show = patched_show
+        WindowManager.reset = patched_reset
+        WindowManager.run = patched_run
         return self
 
     def __exit__(self, *exc):
+        from .window import WindowManager
+
         plt.subplots = self._orig_subplots
         plt.figure = self._orig_figure
         plt.show = self._orig_show
+        WindowManager.reset = self._orig_wm_reset
+        WindowManager.run = self._orig_wm_run
         return False
 
 
@@ -393,7 +453,8 @@ def select_baseline(
 
     # Step 1: Select baseline points
     while True:
-        fig, ax = plt.subplots(figsize=(11, 6.8))
+        fig = get_window().reset(figsize=(11, 6.8))
+        ax = fig.add_subplot(111)
         try:
             fig.canvas.manager.set_window_title(
                 "SensorFit — Baseline selection"
@@ -405,6 +466,7 @@ def select_baseline(
         # overlapping the instruction banner.
         plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.66)
         ax.plot(time_values, signal_values, "b-", lw=1, label="Raw data")
+        apply_robust_ylim(ax, signal_values)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Current (A)")
         title = "Baseline selection — Line (2 clicks) or Curve (≥3 clicks)"
@@ -589,15 +651,15 @@ def select_baseline(
                     print("Curve mode needs at least 2 points (≥3 recommended).")
                     return
             state["action"] = "continue"
-            plt.close(fig)
+            get_window().stop()
 
         def on_redraw(_event) -> None:
             state["action"] = "redraw"
-            plt.close(fig)
+            get_window().stop()
 
         def on_discard(_event) -> None:
             state["action"] = "discard"
-            plt.close(fig)
+            get_window().stop()
 
         def on_skip_baseline(_event) -> None:
             """
@@ -607,7 +669,7 @@ def select_baseline(
             baseline already looks acceptable.
             """
             state["action"] = "skip"
-            plt.close(fig)
+            get_window().stop()
 
         fig.canvas.mpl_connect("button_press_event", on_click)
 
@@ -634,8 +696,7 @@ def select_baseline(
         )
 
         install_zoom_keys(fig, ax)
-        plt.show()
-        plt.close(fig)
+        get_window().run()
 
         action = state["action"]
         if action == "discard":
@@ -691,7 +752,8 @@ def select_baseline(
     
     # Step 2: Show corrected data and get confirmation
     while True:
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig = get_window().reset(figsize=(10, 6))
+        ax = fig.add_subplot(111)
         plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.80)
         ax.plot(time_values, signal_values, "b-", lw=1, alpha=0.5, label="Raw data")
         ax.plot(time_values, corrected_signal, "g-", lw=1.5, label="Baseline-corrected data")
@@ -717,15 +779,15 @@ def select_baseline(
 
         def on_accept(_event) -> None:
             confirm_state["action"] = "accept"
-            plt.close(fig)
+            get_window().stop()
 
         def on_retry(_event) -> None:
             confirm_state["action"] = "retry"
-            plt.close(fig)
+            get_window().stop()
 
         def on_discard_confirm(_event) -> None:
             confirm_state["action"] = "discard"
-            plt.close(fig)
+            get_window().stop()
 
         ax_accept = fig.add_axes([0.35, 0.02, 0.12, 0.04])
         ax_retry = fig.add_axes([0.48, 0.02, 0.12, 0.04])
@@ -744,8 +806,7 @@ def select_baseline(
             "  • Use buttons: Accept (continue with corrected data), Retry (select baseline again), Discard (skip this file)."
         )
 
-        plt.show()
-        plt.close(fig)
+        get_window().run()
 
         confirm_action = confirm_state["action"]
         if confirm_action == "discard":
@@ -988,7 +1049,8 @@ def select_points(
     The ``window`` kwarg is retained for signature compatibility but is no
     longer used — the calibration screen uses mode-specific defaults.
     """
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig = get_window().reset(figsize=(14, 7))
+    ax = fig.add_subplot(111)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Calibration points"
@@ -998,6 +1060,7 @@ def select_points(
         pass
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.95, top=0.74)
     line, = ax.plot(time_values, signal_values, lw=1)
+    apply_robust_ylim(ax, signal_values)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Current (A)")
 
@@ -1266,11 +1329,11 @@ def select_points(
                 print("Back-extrap fit hasn't succeeded yet.  Click Retry and re-pick.")
                 return
             state["action"] = "continue"
-            plt.close(fig)
+            get_window().stop()
             return
         if len(selected_indices) == target:
             state["action"] = "continue"
-            plt.close(fig)
+            get_window().stop()
         else:
             print(f"Please select all {target} points before continuing.")
 
@@ -1295,12 +1358,12 @@ def select_points(
     def on_go_back_to_baseline(_event) -> None:
         state["go_back_to_baseline"] = True
         state["action"] = "go_back"
-        plt.close(fig)
+        get_window().stop()
 
     def on_discard(_event) -> None:
         state["discard"] = True
         state["action"] = "discard"
-        plt.close(fig)
+        get_window().stop()
 
     def on_change_calibration(_event) -> None:
         """Open calibration values editor."""
@@ -1367,8 +1430,7 @@ def select_points(
     )
 
     install_zoom_keys(fig, ax)
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     if state["discard"]:
         return "discard"
@@ -1448,9 +1510,11 @@ def select_intervals(
     None if user wants to go back to calibration point selection
     [] if window is closed without confirming
     """
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig = get_window().reset(figsize=(10, 6))
+    ax = fig.add_subplot(111)
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.80)
     ax.plot(time_values, calibrated_values, color="tab:green", lw=1.25)
+    apply_robust_ylim(ax, calibrated_values)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("H2O2 (µM)")
     
@@ -1618,11 +1682,11 @@ def select_intervals(
                 return
         
         accepted["confirmed"] = True
-        plt.close(fig)
+        get_window().stop()
 
     def go_back_to_calibration(_event=None) -> None:
         go_back["requested"] = True
-        plt.close(fig)
+        get_window().stop()
 
     def on_key(event) -> None:
         if event.key == "enter":
@@ -1644,7 +1708,7 @@ def select_intervals(
     def on_discard_interval(_event=None) -> None:
         discard_interval["requested"] = True
         accepted["confirmed"] = True  # Mark as confirmed so we exit
-        plt.close(fig)
+        get_window().stop()
 
     ax_remove_last = fig.add_axes([0.12, 0.02, 0.11, 0.04])
     ax_reselect = fig.add_axes([0.24, 0.02, 0.11, 0.04])
@@ -1683,8 +1747,7 @@ def select_intervals(
         "  • Zoom: z toggles zoom-rectangle mode; drag to zoom; r resets the view."
     )
     install_zoom_keys(fig, ax)
-    plt.show()
-    plt.close(fig)
+    get_window().run()
     
     if discard_interval["requested"]:
         return "discard"
@@ -1956,13 +2019,19 @@ def append_fit_summary(
                     row_data[f"{prefix}linear_slope"] = fit_result.get("linear_slope", float("nan"))
                     row_data[f"{prefix}intercept"] = fit_result.get("intercept", float("nan"))
                     row_data[f"{prefix}t0"] = fit_result.get("t0", float("nan"))
-                
-                # Add GFI-specific metrics
-                if model_name == "GFI":
-                    row_data[f"{prefix}fast_B"] = fit_result.get("fast_B", float("nan"))
-                    row_data[f"{prefix}fast_k"] = fit_result.get("fast_k", float("nan"))
-                    row_data[f"{prefix}init_rate_fast"] = fit_result.get("init_rate_fast", float("nan"))
-                    row_data[f"{prefix}init_rate_IB"] = fit_result.get("init_rate_IB", float("nan"))
+
+                # Add BiExponential-specific metrics (two decay time-scales
+                # sharing one offset).  Column names mirror the fit_result
+                # keys emitted by ``fit_BiExponential``.
+                if model_name == "BiExponential":
+                    row_data[f"{prefix}biexp_offset"] = fit_result.get("biexp_offset", float("nan"))
+                    row_data[f"{prefix}biexp_A_fast"] = fit_result.get("biexp_A_fast", float("nan"))
+                    row_data[f"{prefix}biexp_k_fast"] = fit_result.get("biexp_k_fast", float("nan"))
+                    row_data[f"{prefix}biexp_t_half_fast"] = fit_result.get("biexp_t_half_fast", float("nan"))
+                    row_data[f"{prefix}biexp_A_slow"] = fit_result.get("biexp_A_slow", float("nan"))
+                    row_data[f"{prefix}biexp_k_slow"] = fit_result.get("biexp_k_slow", float("nan"))
+                    row_data[f"{prefix}biexp_t_half_slow"] = fit_result.get("biexp_t_half_slow", float("nan"))
+                    row_data[f"{prefix}t0"] = fit_result.get("t0", float("nan"))
     else:
         row_data["best_model"] = "none"
         row_data["best_model_initial_rate_uM_per_s"] = float("nan")
@@ -2061,1186 +2130,6 @@ def append_fit_summary(
     df.to_excel(summary_path, index=False, engine="openpyxl")
 
 
-def turnover_tailfit(tt: np.ndarray, yhat: np.ndarray, H0_val: float, window_frac: float = 0.25) -> float:
-    """
-    Tail-line method: fit a line to the last window_frac of the fitted curve 
-    and subtract its extrapolated value at the start of the interval from H(0).
-    
-    Parameters:
-    -----------
-    tt : np.ndarray
-        Time array
-    yhat : np.ndarray
-        Fitted values array
-    H0_val : float
-        Initial H2O2 value (H(0))
-    window_frac : float
-        Fraction of data to use for tail fit (default 0.25 = last 25%)
-    
-    Returns:
-    --------
-    float
-        Turnover value (H0 - tail_value_at_start), or NaN if calculation fails
-    """
-    n = len(tt)
-    if n < 3:
-        return float("nan")
-    w = max(3, int(n * window_frac))
-    t_tail = tt[-w:]
-    y_tail = yhat[-w:]
-    # simple least-squares line fit
-    p = np.polyfit(t_tail, y_tail, 1)  # slope m, intercept b
-    m, b = p[0], p[1]
-    # Calculate the y-value of the tail fit line at the start time of the interval
-    y_at_start = m * tt[0] + b
-    return float(max(0.0, H0_val - y_at_start))
-
-
-def fit_linear_initial_rate(
-    time_values: np.ndarray,
-    signal_values: np.ndarray,
-    start_idx: int,
-    end_idx: int,
-) -> dict:
-    """
-    Fit a straight line to a subset of data points.
-    
-    Parameters:
-    -----------
-    time_values : np.ndarray
-        Full time array
-    signal_values : np.ndarray
-        Full signal array
-    start_idx : int
-        Start index for linear fit
-    end_idx : int
-        End index for linear fit
-    
-    Returns:
-    --------
-    dict with fit results including initial_rate
-    """
-    t_fit = time_values[start_idx:end_idx+1]
-    y_fit = signal_values[start_idx:end_idx+1]
-    
-    # Fit line: y = slope * t + intercept
-    coeffs = np.polyfit(t_fit, y_fit, 1)
-    slope = float(coeffs[0])
-    intercept = float(coeffs[1])
-    
-    # Generate fitted values for full time range
-    yhat = slope * time_values + intercept
-    
-    # Calculate metrics
-    residuals = signal_values - yhat
-    rss = float(np.sum(residuals ** 2))
-    n = len(time_values)
-    
-    # R² for the full dataset
-    from .utils import r2_score
-    r2 = r2_score(signal_values, yhat)
-    
-    # Initial rate is the slope (negative because H2O2 is consumed)
-    initial_rate = -slope  # Negative because consumption means decreasing
-    
-    return {
-        "model": "LinearInitialRate",
-        "params": [intercept, slope],
-        "names": ["intercept", "slope"],
-        "yhat": yhat,
-        "rss": rss,
-        "r2": r2,
-        "aic": float("nan"),  # Not applicable for linear fit
-        "bic": float("nan"),  # Not applicable for linear fit
-        "init_rate": initial_rate,
-        "H0_fit": float(intercept),  # Value at t=0
-        "slope": slope,
-        "intercept": intercept,
-        "fit_start_idx": start_idx,
-        "fit_end_idx": end_idx,
-        "fit_start_time": float(time_values[start_idx]),
-        "fit_end_time": float(time_values[end_idx]),
-    }
-
-
-def interactive_interval_fitting(
-    subsets: Sequence[IntervalSubset],
-    time_col: str,
-    calibrated_col: str,
-    filename: str | None = None,
-) -> dict[int, dict[str, dict]] | str:
-    """
-    Interactive fitting interface for intervals.
-    
-    Allows user to fit one or more models (Inactivation, Exponential, Gompertz-like) to each interval
-    and visually compare the fits.
-    
-    Note: Internal model names (IB, GFI) are mapped to display names (Inactivation, Gompertz-like) in outputs.
-    
-    Parameters:
-    -----------
-    subsets : Sequence[IntervalSubset]
-        List of interval subsets to fit
-    time_col : str
-        Name of time column
-    calibrated_col : str
-        Name of calibrated H2O2 column
-    
-    Returns:
-    --------
-    dict mapping interval index to dict of model results, OR
-    "go_back_phase" if user wants to return to interval selection, OR
-    "discard_file" if user wants to discard the entire file.
-    """
-    from .fitting import fit_IB, fit_Exponential, fit_GFI
-    from .models import MODEL_FUNCS
-    
-    if not subsets:
-        return {}
-    
-    # Store fit results for all intervals
-    all_fit_results: dict[int, dict[str, dict]] = {}
-    
-    # Process each interval with navigation support
-    current_idx = 0
-    while current_idx < len(subsets):
-        subset = subsets[current_idx]
-        time_values = subset.data[time_col].to_numpy(dtype=float)
-        signal_values = subset.data[calibrated_col].to_numpy(dtype=float)
-        
-        # State for this interval — restore previous fits if navigating back
-        if subset.index in all_fit_results:
-            interval_fits: dict[str, dict] = dict(all_fit_results[subset.index])
-        else:
-            interval_fits: dict[str, dict] = {}
-        selected_models = {"IB": False, "Exponential": False, "GFI": False, "LinearInitialRate": False}
-        # Pre-check models that already have fits (so they show on the plot)
-        for model_name in interval_fits:
-            if model_name in selected_models:
-                selected_models[model_name] = True
-        manual_linear_active = False
-        manual_linear_points: list[int] = []
-        manual_linear_markers: list = []  # Store markers for selected points
-        navigation_state = {"action": None}  # "continue", "go_back", "discard", "go_back_phase", "discard_file"
-        
-        fig, (ax_data, ax_resid) = plt.subplots(
-            2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [3, 1]}
-        )
-        plt.subplots_adjust(left=0.1, bottom=0.22, right=0.75, top=0.82)
-        
-        # Plot data - smaller dark gray dots
-        data_line, = ax_data.plot(time_values, signal_values, "o", ms=3, color="#404040", label="Data", alpha=0.8)
-        ax_data.set_ylabel("H₂O₂ (µM)", fontsize=11)
-        title = f"Interval #{subset.index}: {subset.start_time:.3f}–{subset.end_time:.3f} s"
-        if filename:
-            display_name = truncate_filename(filename)
-            title = f"{display_name} - {title}"
-        ax_data.set_title(title, fontsize=12, fontweight="bold")
-        ax_data.grid(True, alpha=0.3)
-        ax_data.legend(loc="upper right")
-        
-        # Residuals plot
-        ax_resid.axhline(0, color="gray", linestyle="--", alpha=0.5)
-        ax_resid.set_xlabel("Time (s)", fontsize=11)
-        ax_resid.set_ylabel("Residuals (µM)", fontsize=11)
-        ax_resid.grid(True, alpha=0.3)
-        
-        # Store plot lines for fits
-        fit_lines: dict[str, tuple] = {}  # model_name -> (data_line, resid_line)
-        resid_lines: dict[str, tuple] = {}
-        
-        # Model colors - bright, vibrant colors
-        model_colors = {
-            "IB": "#0066FF",      # Bright blue
-            "Exponential": "#00CC00",  # Bright green
-            "GFI": "#FF3300",     # Bright red
-            "LinearInitialRate": "#FF9900",  # Bright orange
-        }
-        
-        def update_plot():
-            """Update the plot with current fits."""
-            # Check if figure is still valid by trying to access canvas
-            try:
-                _ = fig.canvas
-            except (AttributeError, RuntimeError):
-                return  # Figure has been closed or is invalid
-            
-            # Clear existing fit lines safely
-            for model_name in list(fit_lines.keys()):
-                try:
-                    if model_name in fit_lines and fit_lines[model_name]:
-                        fit_line = fit_lines[model_name][0]
-                        if fit_line and hasattr(fit_line, 'axes') and fit_line.axes is not None:
-                            fit_line.remove()
-                except (AttributeError, ValueError, RuntimeError):
-                    pass  # Line may have already been removed or figure closed
-                
-                try:
-                    if model_name in resid_lines and resid_lines[model_name]:
-                        resid_line = resid_lines[model_name][0]
-                        if resid_line and hasattr(resid_line, 'axes') and resid_line.axes is not None:
-                            resid_line.remove()
-                except (AttributeError, ValueError, RuntimeError):
-                    pass  # Line may have already been removed or figure closed
-                
-                if model_name in fit_lines:
-                    del fit_lines[model_name]
-                if model_name in resid_lines:
-                    del resid_lines[model_name]
-            
-            # Plot selected fits
-            try:
-                for model_name, fit_result in interval_fits.items():
-                    if model_name not in selected_models or not selected_models[model_name]:
-                        continue
-                    
-                    # Safely extract yhat and validate
-                    yhat = fit_result.get("yhat", None)
-                    if yhat is None:
-                        continue
-                    
-                    yhat = np.asarray(yhat, dtype=float)
-                    if len(yhat) != len(signal_values) or np.any(~np.isfinite(yhat)):
-                        continue
-                    
-                    residuals = signal_values - yhat
-                    
-                    # Plot fit with appropriate label
-                    if model_name == "LinearInitialRate":
-                        label = f"Linear Initial Rate (rate = {fit_result['init_rate']:.3f} µM/s)"
-                    else:
-                        label = f"{model_name} (R²={fit_result['r2']:.4f}, AIC={fit_result['aic']:.2f})"
-                    
-                    fit_line, = ax_data.plot(
-                        time_values, yhat, "-", lw=1.5, color=model_colors[model_name], 
-                        label=label
-                    )
-                    fit_lines[model_name] = (fit_line,)
-                    
-                    # Plot residuals
-                    resid_line, = ax_resid.plot(
-                        time_values, residuals, "-", lw=1.2, color=model_colors[model_name], alpha=0.8
-                    )
-                    resid_lines[model_name] = (resid_line,)
-                
-                ax_data.legend(loc="upper right", fontsize=9)
-                fig.canvas.draw_idle()
-            except (RuntimeError, AttributeError, ValueError):
-                # Figure may have been closed during update
-                pass
-        
-        def on_model_select(label):
-            """Handle model checkbox selection."""
-            model_name = label_to_model.get(label, label)
-            if model_name not in selected_models:
-                return
-            selected_models[model_name] = not selected_models[model_name]
-            # Don't auto-fit on checkbox click, user should click "Fit Selected"
-            update_plot()
-        
-        def on_fit_all(_event):
-            """Fit all selected models."""
-            for model_name in ["IB", "Exponential", "GFI"]:
-                if selected_models[model_name]:
-                    # Always remove existing fit before re-fitting to ensure fresh fit
-                    if model_name in interval_fits:
-                        del interval_fits[model_name]
-                    
-                    try:
-                        if model_name == "IB":
-                            result = fit_IB(time_values, signal_values)
-                        elif model_name == "Exponential":
-                            result = fit_Exponential(time_values, signal_values)
-                        elif model_name == "GFI":
-                            result = fit_GFI(time_values, signal_values)
-                        else:
-                            continue
-                        
-                        # Validate fit quality - check for reasonable R² and non-NaN values
-                        if not np.isfinite(result.get('r2', np.nan)) or result.get('r2', -1) < -10:
-                            display_name = get_model_display_name(model_name)
-                            print(f"  ✗ {display_name} fit produced invalid R²={result.get('r2', 'nan')}, rejecting fit")
-                            selected_models[model_name] = False
-                            # Update checkbox state
-                            checkbox_label = model_to_label.get(model_name)
-                            if checkbox_label in label_index:
-                                idx = label_index[checkbox_label]
-                                current_status = check_buttons.get_status()
-                                if current_status[idx]:
-                                    check_buttons.set_active(idx)
-                            continue
-                        
-                        # Check for NaN or Inf in fitted values
-                        yhat = result.get('yhat', None)
-                        if yhat is not None:
-                            yhat_array = np.asarray(yhat, dtype=float)
-                            if len(yhat_array) > 0 and np.any(~np.isfinite(yhat_array)):
-                                display_name = get_model_display_name(model_name)
-                                print(f"  ✗ {display_name} fit produced invalid values (NaN/Inf), rejecting fit")
-                                selected_models[model_name] = False
-                                # Update checkbox state
-                                checkbox_names = ["IB", "Exponential", "GFI"]
-                                if model_name in checkbox_names:
-                                    idx = checkbox_names.index(model_name)
-                                    current_status = check_buttons.get_status()
-                                    if current_status[idx]:
-                                        check_buttons.set_active(idx)
-                                continue
-                        
-                        # Store result (yhat is on original time scale)
-                        interval_fits[model_name] = result
-                        display_name = get_model_display_name(model_name)
-                        print(f"  ✓ {display_name} fit complete: R²={result['r2']:.4f}, AIC={result['aic']:.2f}")
-                    except Exception as e:
-                        display_name = get_model_display_name(model_name)
-                        print(f"  ✗ {display_name} fit failed: {e}")
-                        # Ensure fit is removed if it was partially created
-                        if model_name in interval_fits:
-                            del interval_fits[model_name]
-                        selected_models[model_name] = False
-                        # Update checkbox state (set to unchecked if it was checked)
-                        checkbox_label = model_to_label.get(model_name)
-                        if checkbox_label in label_index:
-                            idx = label_index[checkbox_label]
-                            current_status = check_buttons.get_status()
-                            if current_status[idx]:
-                                check_buttons.set_active(idx)
-                        checkbox_label = model_to_label.get(model_name)
-                        if checkbox_label in label_index:
-                            idx = label_index[checkbox_label]
-                            current_status = check_buttons.get_status()
-                            if current_status[idx]:
-                                check_buttons.set_active(idx)
-            
-            update_plot()
-        
-        def apply_linear_fit_from_indices(start_idx: int, end_idx: int, mode: str) -> None:
-            """Apply linear fit using data between start_idx and end_idx."""
-            if end_idx <= start_idx:
-                end_idx = min(start_idx + 1, len(time_values) - 1)
-                if end_idx == start_idx:
-                    print("  Unable to perform linear fit: need at least two distinct points.")
-                    return
-            result = fit_linear_initial_rate(time_values, signal_values, start_idx, end_idx)
-            interval_fits["LinearInitialRate"] = result
-            selected_models["LinearInitialRate"] = True
-            print(
-                f"  ✓ Linear Initial Rate ({mode}) fit complete: "
-                f"rate = {result['init_rate']:.3f} µM/s "
-                f"({result['fit_start_time']:.3f}-{result['fit_end_time']:.3f} s)"
-            )
-            update_plot()
-        
-        def on_linear_auto(_event):
-            """Overlay automatic linear fit (first 10% of points or first 3 seconds, whichever is shorter)."""
-            # Ensure we have at least 2 points for a linear fit
-            if len(time_values) < 2:
-                print("  Unable to perform linear fit: need at least 2 data points.")
-                return
-            
-            # Calculate index based on 10% of points (ensure at least 2 points)
-            num_points_10pct = max(2, int(len(time_values) * 0.1))
-            idx_10pct = num_points_10pct - 1
-            idx_10pct = min(idx_10pct, len(time_values) - 1)
-            
-            # Calculate index based on first 3 seconds
-            auto_end_time = time_values[0] + 3.0
-            idx_3sec = int(np.searchsorted(time_values, auto_end_time))
-            idx_3sec = min(max(idx_3sec, 1), len(time_values) - 1)
-            
-            # Use whichever is shorter (smaller index), but ensure at least index 1 (2 points total)
-            auto_end_idx = min(idx_10pct, idx_3sec)
-            auto_end_idx = max(1, min(auto_end_idx, len(time_values) - 1))
-            
-            # Ensure we have at least 2 points (start_idx=0, end_idx>=1)
-            if auto_end_idx < 1:
-                auto_end_idx = 1
-            
-            apply_linear_fit_from_indices(0, auto_end_idx, "auto")
-        
-        def on_linear_manual(_event):
-            """Enable manual selection of two points for linear fit."""
-            nonlocal manual_linear_active, manual_linear_points, manual_linear_markers
-            # Clear any existing linear fit first
-            if "LinearInitialRate" in interval_fits:
-                del interval_fits["LinearInitialRate"]
-            selected_models["LinearInitialRate"] = False
-            manual_linear_active = True
-            manual_linear_points = []
-            # Clear existing markers
-            for marker in manual_linear_markers:
-                try:
-                    marker.remove()
-                except (AttributeError, ValueError):
-                    pass
-            manual_linear_markers.clear()
-            update_plot()  # Update to remove existing linear fit
-            print(
-                "  Manual linear fit: click two points on the data to define the fit window."
-                " Use zoom/pan if needed; clicks while zoom/pan is active are ignored."
-            )
-        
-        def on_clear_fits(_event):
-            """Clear all fits and delete fit data."""
-            nonlocal manual_linear_active, manual_linear_points, manual_linear_markers
-            # Explicitly delete all fit data
-            for model_name in list(interval_fits.keys()):
-                del interval_fits[model_name]
-            interval_fits.clear()  # Double-check: ensure dictionary is completely empty
-            
-            # Uncheck all model checkboxes
-            current_status = check_buttons.get_status()
-            for label, model_name in model_label_map:
-                selected_models[model_name] = False
-                idx = label_index[label]
-                if current_status[idx]:
-                    check_buttons.set_active(idx)
-            
-            # Clear linear initial rate fit
-            selected_models["LinearInitialRate"] = False
-            manual_linear_active = False
-            manual_linear_points.clear()
-            
-            # Clear markers
-            for marker in manual_linear_markers:
-                try:
-                    marker.remove()
-                except (AttributeError, ValueError):
-                    pass
-            manual_linear_markers.clear()
-            
-            update_plot()
-            print("All fits cleared and deleted.")
-        
-        def on_continue(_event):
-            """Continue to next interval or finish."""
-            # Check if any fits have been performed
-            if not interval_fits:
-                # Show warning dialog
-                warning_fig = plt.figure(figsize=(6, 3))
-                warning_fig.canvas.manager.set_window_title("Warning: No Fits Applied")
-                ax_warning = warning_fig.add_axes([0.1, 0.4, 0.8, 0.3])
-                ax_warning.axis('off')
-                ax_warning.text(
-                    0.5, 0.5,
-                    "No fits have been applied to this interval.\n"
-                    "Do you want to continue without fitting?",
-                    ha="center", va="center", fontsize=11, fontweight="bold",
-                    transform=ax_warning.transAxes, wrap=True
-                )
-                
-                state = {"choice": None}
-                
-                def on_go_back(_event):
-                    state["choice"] = "back"
-                    plt.close(warning_fig)
-                
-                def on_continue_anyway(_event):
-                    state["choice"] = "continue"
-                    plt.close(warning_fig)
-                
-                ax_back = warning_fig.add_axes([0.2, 0.1, 0.25, 0.12])
-                ax_continue_anyway = warning_fig.add_axes([0.55, 0.1, 0.25, 0.12])
-                
-                btn_back = create_small_button(ax_back, "Go Back", "#90ee90", "#7cd47c")
-                btn_continue_anyway = create_small_button(ax_continue_anyway, "Continue Anyway", "#ff9999", "#ff6666")
-                
-                btn_back.on_clicked(on_go_back)
-                btn_continue_anyway.on_clicked(on_continue_anyway)
-                
-                plt.show()
-                plt.close(warning_fig)
-                
-                if state["choice"] == "back":
-                    # User wants to go back, don't close the main figure
-                    return
-                # If "continue anyway" or window closed, proceed to close main figure
-            navigation_state["action"] = "continue"
-            plt.close(fig)
-        
-        def on_go_back_interval(_event):
-            """Go back to previous interval, or to previous phase if on first interval."""
-            if current_idx > 0:
-                navigation_state["action"] = "go_back"
-                plt.close(fig)
-            else:
-                navigation_state["action"] = "go_back_phase"
-                plt.close(fig)
-        
-        def on_discard_interval(_event):
-            """Discard current interval without fitting."""
-            navigation_state["action"] = "discard"
-            # Remove any fits for this interval
-            if subset.index in all_fit_results:
-                del all_fit_results[subset.index]
-            plt.close(fig)
-        
-        def on_discard_file(_event):
-            """Discard the entire file."""
-            navigation_state["action"] = "discard_file"
-            plt.close(fig)
-        
-        # Add checkboxes for model selection with equations
-        # Make checkbox area taller to accommodate equations
-        check_ax = fig.add_axes([0.78, 0.58, 0.2, 0.28], facecolor="0.95")
-        model_label_map = [
-            ("Inactivation", "IB"),
-            ("Exponential", "Exponential"),
-            ("Gompertz-like", "GFI"),
-        ]
-        checkbox_labels = [label for label, _ in model_label_map]
-        label_to_model = {label: model_name for label, model_name in model_label_map}
-        model_to_label = {model_name: label for label, model_name in model_label_map}
-        label_index = {label: idx for idx, label in enumerate(checkbox_labels)}
-        check_buttons = CheckButtons(
-            check_ax,
-            checkbox_labels,
-            [False] * len(model_label_map),
-        )
-        check_buttons.on_clicked(on_model_select)
-        check_ax.set_title("Select Models", fontsize=10, fontweight="bold")
-        
-        # Add equation text next to checkboxes using LaTeX math rendering
-        # Equations are displayed below each checkbox label in mathematical notation
-        model_equations = {
-            "Inactivation": r"$H(t) = C + H_0 e^{-\alpha(1-e^{-k_i t})} - k_s t$",
-            "Exponential": r"$y(t) = at + b + ce^{-k(t-t_0)}$",
-            "Gompertz-like": r"$H(t) = C + A e^{-\alpha(1-e^{-k_i t})} e^{-e^{k(t-t_0)}} + B e^{-k_f t}$",
-        }
-        
-        # Position equations below checkboxes (small font, mathematical notation)
-        y_positions = [0.75, 0.50, 0.25]  # Vertical positions for each checkbox
-        
-        for i, (label, y_pos) in enumerate(zip(checkbox_labels, y_positions)):
-            equation = model_equations[label]
-            # Add equation text below checkbox using LaTeX math rendering
-            check_ax.text(
-                0.05,
-                y_pos - 0.08,  # Position slightly below checkbox
-                equation,
-                fontsize=8,
-                verticalalignment='top',
-                horizontalalignment='left',
-                transform=check_ax.transAxes
-            )
-        
-        # Add buttons (adjusted positions to avoid overlap with checkboxes)
-        btn_linear_auto_ax = fig.add_axes([0.78, 0.56, 0.2, 0.05])
-        btn_linear_manual_ax = fig.add_axes([0.78, 0.50, 0.2, 0.05])
-        btn_fit_all_ax = fig.add_axes([0.78, 0.44, 0.2, 0.05])
-        btn_clear_ax = fig.add_axes([0.78, 0.38, 0.2, 0.05])
-        btn_goback_ax = fig.add_axes([0.78, 0.28, 0.2, 0.05])
-        btn_discard_ax = fig.add_axes([0.78, 0.22, 0.2, 0.05])
-        btn_discard_file_ax = fig.add_axes([0.78, 0.16, 0.2, 0.05])
-        btn_continue_ax = fig.add_axes([0.78, 0.10, 0.2, 0.05])
-        
-        btn_linear_auto = create_small_button(btn_linear_auto_ax, "Linear Auto", "#ffb347", "#ffa135")
-        btn_linear_manual = create_small_button(btn_linear_manual_ax, "Linear Manual", "#ff7f0e", "#ff9500")
-        btn_fit_all = create_small_button(btn_fit_all_ax, "Fit Selected", "#90ee90", "#7cd47c")
-        btn_clear = create_small_button(btn_clear_ax, "Clear All", "#ffcc99", "#ffaa66")
-        goback_label = "Go Back" if current_idx > 0 else "Back to intervals"
-        btn_goback = create_small_button(btn_goback_ax, goback_label, "#ffcc99", "#ffaa66")
-        btn_discard = create_small_button(btn_discard_ax, "Discard this interval", "#ff6666", "#ff4444")
-        btn_discard_file = create_small_button(btn_discard_file_ax, "Discard this file", "#ff3333", "#cc0000")
-        btn_continue = create_small_button(btn_continue_ax, "Continue", "#1f77b4", "#1e6ba8")
-        
-        btn_linear_auto.on_clicked(on_linear_auto)
-        btn_linear_manual.on_clicked(on_linear_manual)
-        btn_fit_all.on_clicked(on_fit_all)
-        btn_clear.on_clicked(on_clear_fits)
-        btn_goback.on_clicked(on_go_back_interval)
-        btn_discard.on_clicked(on_discard_interval)
-        btn_discard_file.on_clicked(on_discard_file)
-        btn_continue.on_clicked(on_continue)
-        
-        # Instructions banner
-        instructions_text = (
-            "Check one or more models, then click 'Fit Selected'. 'Linear Auto' overlays the "
-            "automatic initial-rate line. 'Linear Manual' lets you click two points to define a "
-            "fit range. Multiple models can be displayed simultaneously."
-        )
-        add_instruction_banner(fig, instructions_text)
-        
-        print(f"\nFitting interface for Interval #{subset.index} ({current_idx + 1}/{len(subsets)})")
-        print("  • Check models to fit (Inactivation, Exponential, Gompertz-like), then click 'Fit Selected'")
-        print("  • 'Linear Auto' overlays the automatic initial-rate fit (first few seconds)")
-        print("  • 'Linear Manual' lets you click two points to define the linear fit window")
-        print("  • Fits will be displayed overlaid for comparison")
-        print("  • Use 'Go Back' to return to previous interval")
-        print("  • Use 'Discard' to skip this interval without fitting")
-        print("  • Click 'Continue' when satisfied with fits")
-        
-        def handle_manual_click(event):
-            nonlocal manual_linear_active, manual_linear_points, manual_linear_markers
-            if not manual_linear_active or event.inaxes != ax_data or event.button != 1:
-                return
-            
-            toolbar = fig.canvas.toolbar
-            if toolbar is not None:
-                mode = getattr(toolbar, "mode", "")
-                active = getattr(toolbar, "_active", None)
-                if mode in ("zoom rect", "pan/zoom", "zoom", "pan"):
-                    return
-                if active and active not in ("", None):
-                    active_str = str(active).upper()
-                    if "ZOOM" in active_str or "PAN" in active_str:
-                        return
-            
-            click_time = float(event.xdata)
-            nearest_idx = int(np.abs(time_values - click_time).argmin())
-            manual_linear_points.append(nearest_idx)
-            
-            # Add visual marker for selected point
-            try:
-                marker, = ax_data.plot(
-                    time_values[nearest_idx],
-                    signal_values[nearest_idx],
-                    "o",
-                    ms=10,
-                    color="#ff7f0e",
-                    markeredgecolor="yellow",
-                    markeredgewidth=2,
-                    zorder=10,
-                    label="Selected point" if len(manual_linear_points) == 1 else None
-                )
-                manual_linear_markers.append(marker)
-                fig.canvas.draw_idle()
-            except (AttributeError, RuntimeError):
-                pass  # Figure may have been closed
-            
-            print(f"    • Selected point {len(manual_linear_points)}/2 at t={time_values[nearest_idx]:.3f} s")
-            
-            if len(manual_linear_points) == 2:
-                start_idx, end_idx = sorted(manual_linear_points)
-                manual_linear_active = False
-                # Clear markers (they'll be replaced by the fit line)
-                for marker in manual_linear_markers:
-                    try:
-                        marker.remove()
-                    except (AttributeError, ValueError):
-                        pass
-                manual_linear_markers.clear()
-                manual_linear_points.clear()
-                apply_linear_fit_from_indices(start_idx, end_idx, "manual")
-
-        click_cid = fig.canvas.mpl_connect("button_press_event", handle_manual_click)
-
-        install_zoom_keys(fig, [ax_data, ax_resid])
-        plt.show()
-        fig.canvas.mpl_disconnect(click_cid)
-        plt.close(fig)
-        
-        # Handle navigation
-        action = navigation_state.get("action")
-        if action == "discard_file":
-            print("  File discarded by user during fitting.")
-            return "discard_file"
-        elif action == "go_back_phase":
-            print("  Returning to interval selection.")
-            return "go_back_phase"
-        elif action == "discard":
-            # Discard this interval - remove any fits and move to next
-            if subset.index in all_fit_results:
-                del all_fit_results[subset.index]
-            print(f"  Interval #{subset.index} discarded.")
-            current_idx += 1
-            continue
-        elif action == "go_back":
-            # Go back to previous interval (only reachable when current_idx > 0)
-            current_idx -= 1
-            print(f"  Going back to interval #{subsets[current_idx].index}.")
-            continue
-        elif action == "continue":
-            # Store results for this interval and move to next
-            if interval_fits:
-                all_fit_results[subset.index] = interval_fits
-            current_idx += 1
-        else:
-            # Default: continue to next
-            if interval_fits:
-                all_fit_results[subset.index] = interval_fits
-            current_idx += 1
-    
-    return all_fit_results
-
-
-def calculate_turnover_before_inactivation(
-    subsets: Sequence[IntervalSubset],
-    all_fit_results: dict[int, dict[str, dict]],
-    time_col: str,
-    calibrated_col: str,
-    filename: str | None = None,
-) -> dict[int, float | None] | str:
-    """
-    Calculate maximum H2O2 turnover before inactivation for each interval.
-    
-    This function presents a GUI for each interval allowing the user to:
-    - Attempt an automatic tailfit using a fitted model
-    - Manually fit a linear line to the tail of the data
-    - Skip the calculation for this interval
-    
-    Parameters:
-    -----------
-    subsets : Sequence[IntervalSubset]
-        List of interval subsets
-    all_fit_results : dict[int, dict[str, dict]]
-        Dictionary mapping interval index to fit results from interactive_interval_fitting
-    time_col : str
-        Name of time column
-    calibrated_col : str
-        Name of calibrated H2O2 column
-    filename : str | None
-        Optional filename for display
-    
-    Returns:
-    --------
-    dict[int, float | None]
-        Dictionary mapping interval index to turnover value (µM), or None if skipped.
-    OR "go_back_phase" if user wants to return to the fitting phase.
-    OR "discard_file" if user wants to discard the entire file.
-    """
-    if not subsets:
-        return {}
-    
-    turnover_results: dict[int, float | None] = {}
-    
-    # Process each interval with navigation support
-    current_idx = 0
-    while current_idx < len(subsets):
-        subset = subsets[current_idx]
-        time_values = subset.data[time_col].to_numpy(dtype=float)
-        signal_values = subset.data[calibrated_col].to_numpy(dtype=float)
-        
-        # Get fit results for this interval (if any)
-        interval_fits = all_fit_results.get(subset.index, {})
-        
-        # State for this interval
-        tail_fit_result: dict | None = None
-        manual_tail_active = False
-        manual_tail_points: list[int] = []
-        manual_tail_markers: list = []
-        navigation_state = {"action": None}  # "continue", "go_back", "discard", "skip"
-        
-        fig, ax = plt.subplots(figsize=(12, 6))
-        plt.subplots_adjust(left=0.1, bottom=0.22, right=0.75, top=0.82)
-        
-        # Plot data
-        ax.plot(time_values, signal_values, "o", ms=3, color="#404040", label="Data", alpha=0.8)
-        ax.set_xlabel("Time (s)", fontsize=11)
-        ax.set_ylabel("H₂O₂ (µM)", fontsize=11)
-        title = f"Calculate maximum H₂O₂ turnover before inactivation\nInterval #{subset.index}: {subset.start_time:.3f}–{subset.end_time:.3f} s"
-        if filename:
-            display_name = truncate_filename(filename)
-            title = f"{display_name} - {title}"
-        ax.set_title(title, fontsize=12, fontweight="bold")
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="upper right")
-        
-        # Store plot lines for tail fit
-        tail_fit_line = None
-        turnover_text = None
-        
-        def update_plot():
-            """Update the plot with current tail fit."""
-            nonlocal tail_fit_line, turnover_text
-            try:
-                _ = fig.canvas
-            except (AttributeError, RuntimeError):
-                return
-            
-            # Clear existing tail fit line
-            if tail_fit_line is not None:
-                try:
-                    if hasattr(tail_fit_line, 'axes') and tail_fit_line.axes is not None:
-                        tail_fit_line.remove()
-                except (AttributeError, ValueError, RuntimeError):
-                    pass
-                tail_fit_line = None
-            
-            # Clear existing turnover text
-            if turnover_text is not None:
-                try:
-                    if hasattr(turnover_text, 'axes') and turnover_text.axes is not None:
-                        turnover_text.remove()
-                except (AttributeError, ValueError, RuntimeError):
-                    pass
-                turnover_text = None
-            
-            # Plot tail fit if available
-            if tail_fit_result is not None:
-                try:
-                    yhat = tail_fit_result.get("yhat", None)
-                    if yhat is not None:
-                        yhat = np.asarray(yhat, dtype=float)
-                        if len(yhat) == len(time_values) and np.all(np.isfinite(yhat)):
-                            tail_fit_line, = ax.plot(
-                                time_values, yhat, "-", lw=2, color="#FF3300", 
-                                label=f"Tail fit (turnover = {tail_fit_result.get('turnover', 0):.3f} µM)"
-                            )
-                            
-                            # Display turnover value as text
-                            turnover_val = tail_fit_result.get('turnover', 0)
-                            turnover_text = ax.text(
-                                0.02, 0.98,
-                                f"Turnover: {turnover_val:.3f} µM",
-                                transform=ax.transAxes,
-                                fontsize=12,
-                                fontweight="bold",
-                                verticalalignment='top',
-                                bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8)
-                            )
-                except (AttributeError, ValueError, RuntimeError):
-                    pass
-            
-            ax.legend(loc="upper right", fontsize=9)
-            fig.canvas.draw_idle()
-        
-        def on_tailfit_auto(_event):
-            """Attempt automatic tailfit using best fitted model."""
-            nonlocal tail_fit_result
-            
-            # Find best model (prefer Inactivation, Exponential, or Gompertz-like)
-            best_model = None
-            best_fit = None
-            for model_name in ["IB", "Exponential", "GFI"]:
-                if model_name in interval_fits:
-                    best_model = model_name
-                    best_fit = interval_fits[model_name]
-                    break
-            
-            if best_fit is None:
-                print("  ✗ No fitted model available for automatic tailfit. Please fit a model first in the fitting screen.")
-                return
-            
-            try:
-                yhat = best_fit.get("yhat", None)
-                if yhat is None:
-                    print("  ✗ Fitted model has no yhat values.")
-                    return
-                
-                yhat = np.asarray(yhat, dtype=float)
-                if len(yhat) != len(time_values) or np.any(~np.isfinite(yhat)):
-                    print("  ✗ Fitted model has invalid yhat values.")
-                    return
-                
-                # Get H0 value (initial H2O2 concentration)
-                H0_val = signal_values[0]  # Use first data point as H0
-                
-                # Calculate turnover using tailfit
-                turnover = turnover_tailfit(time_values, yhat, H0_val, window_frac=0.25)
-                
-                if np.isnan(turnover):
-                    print("  ✗ Automatic tailfit calculation failed.")
-                    return
-                
-                # Get tail fit line parameters for display
-                n = len(time_values)
-                w = max(3, int(n * 0.25))
-                t_tail = time_values[-w:]
-                y_tail = yhat[-w:]
-                p = np.polyfit(t_tail, y_tail, 1)
-                slope, intercept = p[0], p[1]
-                
-                # Create full tail fit line for display
-                tail_yhat = slope * time_values + intercept
-                
-                tail_fit_result = {
-                    "yhat": tail_yhat,
-                    "turnover": turnover,
-                    "slope": slope,
-                    "intercept": intercept,
-                    "method": "auto",
-                    "model_used": best_model,
-                }
-                
-                print(f"  ✓ Automatic tailfit complete: turnover = {turnover:.3f} µM (using {best_model} model)")
-                update_plot()
-            except Exception as e:
-                print(f"  ✗ Automatic tailfit failed: {e}")
-        
-        def apply_manual_tail_fit(start_idx: int, end_idx: int) -> None:
-            """Apply manual linear fit to tail region."""
-            nonlocal tail_fit_result, manual_tail_active, manual_tail_points, manual_tail_markers
-            
-            if end_idx <= start_idx:
-                end_idx = min(start_idx + 1, len(time_values) - 1)
-                if end_idx == start_idx:
-                    print("  Unable to perform tail fit: need at least two distinct points.")
-                    return
-            
-            try:
-                # Fit line to tail region
-                t_tail = time_values[start_idx:end_idx+1]
-                y_tail = signal_values[start_idx:end_idx+1]
-                p = np.polyfit(t_tail, y_tail, 1)
-                slope, intercept = p[0], p[1]
-                
-                # Create full tail fit line for display
-                tail_yhat = slope * time_values + intercept
-                
-                # Calculate turnover: H0 - y_value_at_interval_start
-                H0_val = signal_values[0]
-                y_at_start = slope * time_values[0] + intercept
-                turnover = max(0.0, H0_val - y_at_start)
-                
-                tail_fit_result = {
-                    "yhat": tail_yhat,
-                    "turnover": turnover,
-                    "slope": slope,
-                    "intercept": intercept,
-                    "method": "manual",
-                    "fit_start_time": float(time_values[start_idx]),
-                    "fit_end_time": float(time_values[end_idx]),
-                }
-                
-                print(f"  ✓ Manual tail fit complete: turnover = {turnover:.3f} µM")
-                update_plot()
-            except Exception as e:
-                print(f"  ✗ Manual tail fit failed: {e}")
-        
-        def on_tailfit_manual(_event):
-            """Enable manual selection of two points for tail fit."""
-            nonlocal manual_tail_active, manual_tail_points, manual_tail_markers, tail_fit_result
-            # Clear any existing tail fit first
-            tail_fit_result = None
-            manual_tail_active = True
-            manual_tail_points = []
-            # Clear existing markers
-            for marker in manual_tail_markers:
-                try:
-                    marker.remove()
-                except (AttributeError, ValueError):
-                    pass
-            manual_tail_markers.clear()
-            update_plot()  # Update to remove existing tail fit
-            print("  Manual tail fit: click two points on the data to define the tail fit window.")
-        
-        def on_clear_fit(_event):
-            """Clear tail fit."""
-            nonlocal tail_fit_result, manual_tail_active, manual_tail_points, manual_tail_markers
-            tail_fit_result = None
-            manual_tail_active = False
-            manual_tail_points.clear()
-            # Clear markers
-            for marker in manual_tail_markers:
-                try:
-                    marker.remove()
-                except (AttributeError, ValueError):
-                    pass
-            manual_tail_markers.clear()
-            update_plot()
-            print("Tail fit cleared.")
-        
-        def on_skip(_event):
-            """Skip this interval without calculating turnover."""
-            navigation_state["action"] = "skip"
-            plt.close(fig)
-        
-        def on_continue(_event):
-            """Continue to next interval."""
-            # Check if tail fit has been performed
-            if tail_fit_result is None:
-                # Show warning dialog
-                warning_fig = plt.figure(figsize=(6, 3))
-                warning_fig.canvas.manager.set_window_title("Warning: No Tail Fit Applied")
-                ax_warning = warning_fig.add_axes([0.1, 0.4, 0.8, 0.3])
-                ax_warning.axis('off')
-                ax_warning.text(
-                    0.5, 0.5,
-                    "No tail fit has been applied to this interval.\n"
-                    "Do you want to continue without calculating turnover?",
-                    ha="center", va="center", fontsize=11, fontweight="bold",
-                    transform=ax_warning.transAxes, wrap=True
-                )
-                
-                state = {"choice": None}
-                
-                def on_go_back(_event):
-                    state["choice"] = "back"
-                    plt.close(warning_fig)
-                
-                def on_continue_anyway(_event):
-                    state["choice"] = "continue"
-                    plt.close(warning_fig)
-                
-                ax_back = warning_fig.add_axes([0.2, 0.1, 0.25, 0.12])
-                ax_continue_anyway = warning_fig.add_axes([0.55, 0.1, 0.25, 0.12])
-                
-                btn_back = create_small_button(ax_back, "Go Back", "#90ee90", "#7cd47c")
-                btn_continue_anyway = create_small_button(ax_continue_anyway, "Continue Anyway", "#ff9999", "#ff6666")
-                
-                btn_back.on_clicked(on_go_back)
-                btn_continue_anyway.on_clicked(on_continue_anyway)
-                
-                plt.show()
-                plt.close(warning_fig)
-                
-                if state["choice"] == "back":
-                    return
-            navigation_state["action"] = "continue"
-            plt.close(fig)
-        
-        def on_go_back(_event):
-            """Go back to previous interval, or to previous phase if on first interval."""
-            if current_idx > 0:
-                navigation_state["action"] = "go_back"
-                plt.close(fig)
-            else:
-                navigation_state["action"] = "go_back_phase"
-                plt.close(fig)
-        
-        def on_discard(_event):
-            """Discard this interval."""
-            navigation_state["action"] = "discard"
-            plt.close(fig)
-        
-        def on_discard_file(_event):
-            """Discard the entire file."""
-            navigation_state["action"] = "discard_file"
-            plt.close(fig)
-        
-        # Add buttons
-        btn_tailfit_auto_ax = fig.add_axes([0.78, 0.70, 0.2, 0.05])
-        btn_tailfit_manual_ax = fig.add_axes([0.78, 0.64, 0.2, 0.05])
-        btn_clear_ax = fig.add_axes([0.78, 0.58, 0.2, 0.05])
-        btn_skip_ax = fig.add_axes([0.78, 0.50, 0.2, 0.05])
-        btn_goback_ax = fig.add_axes([0.78, 0.44, 0.2, 0.05])
-        btn_discard_ax = fig.add_axes([0.78, 0.38, 0.2, 0.05])
-        btn_discard_file_ax = fig.add_axes([0.78, 0.32, 0.2, 0.05])
-        btn_continue_ax = fig.add_axes([0.78, 0.26, 0.2, 0.05])
-        
-        btn_tailfit_auto = create_small_button(btn_tailfit_auto_ax, "Auto Tailfit", "#ffb347", "#ffa135")
-        btn_tailfit_manual = create_small_button(btn_tailfit_manual_ax, "Manual Tail Fit", "#ff7f0e", "#ff9500")
-        btn_clear = create_small_button(btn_clear_ax, "Clear Fit", "#ffcc99", "#ffaa66")
-        btn_skip = create_small_button(btn_skip_ax, "Skip", "#cccccc", "#aaaaaa")
-        goback_label = "Go Back" if current_idx > 0 else "Back to fitting"
-        btn_goback = create_small_button(btn_goback_ax, goback_label, "#ffcc99", "#ffaa66")
-        btn_discard = create_small_button(btn_discard_ax, "Discard this interval", "#ff6666", "#ff4444")
-        btn_discard_file = create_small_button(btn_discard_file_ax, "Discard this file", "#ff3333", "#cc0000")
-        btn_continue = create_small_button(btn_continue_ax, "Continue", "#1f77b4", "#1e6ba8")
-        
-        btn_tailfit_auto.on_clicked(on_tailfit_auto)
-        btn_tailfit_manual.on_clicked(on_tailfit_manual)
-        btn_clear.on_clicked(on_clear_fit)
-        btn_skip.on_clicked(on_skip)
-        btn_goback.on_clicked(on_go_back)
-        btn_discard.on_clicked(on_discard)
-        btn_discard_file.on_clicked(on_discard_file)
-        btn_continue.on_clicked(on_continue)
-        
-        # Instructions banner
-        instructions_text = (
-            "Calculate maximum H₂O₂ turnover before inactivation. 'Auto Tailfit' uses the best fitted "
-            "model to automatically fit the tail. 'Manual Tail Fit' lets you click two points to define "
-            "the tail region. Turnover = H₀ - tail_intercept."
-        )
-        add_instruction_banner(fig, instructions_text)
-        
-        print(f"\nTurnover calculation for Interval #{subset.index} ({current_idx + 1}/{len(subsets)})")
-        print("  • 'Auto Tailfit' attempts automatic calculation using fitted model")
-        print("  • 'Manual Tail Fit' lets you select the tail region manually")
-        print("  • 'Skip' to skip this interval")
-        print("  • 'Continue' when satisfied with the calculation")
-        
-        def handle_manual_click(event):
-            nonlocal manual_tail_active, manual_tail_points, manual_tail_markers
-            if not manual_tail_active or event.inaxes != ax or event.button != 1:
-                return
-            
-            toolbar = fig.canvas.toolbar
-            if toolbar is not None:
-                mode = getattr(toolbar, "mode", "")
-                active = getattr(toolbar, "_active", None)
-                if mode in ("zoom rect", "pan/zoom", "zoom", "pan"):
-                    return
-                if active is not None and str(active).upper() in ("ZOOM", "PAN"):
-                    return
-            
-            nearest_idx = int(np.abs(time_values - event.xdata).argmin())
-            if nearest_idx < 0 or nearest_idx >= len(time_values):
-                return
-            
-            manual_tail_points.append(nearest_idx)
-            
-            try:
-                marker = ax.plot(
-                    time_values[nearest_idx],
-                    signal_values[nearest_idx],
-                    "o",
-                    ms=8,
-                    color="#FF3300",
-                    markeredgecolor="black",
-                    markeredgewidth=2,
-                    zorder=10,
-                    label="Selected point" if len(manual_tail_points) == 1 else None
-                )[0]
-                manual_tail_markers.append(marker)
-                fig.canvas.draw_idle()
-            except (AttributeError, RuntimeError):
-                pass
-            
-            print(f"    • Selected point {len(manual_tail_points)}/2 at t={time_values[nearest_idx]:.3f} s")
-            
-            if len(manual_tail_points) == 2:
-                start_idx, end_idx = sorted(manual_tail_points)
-                manual_tail_active = False
-                # Clear markers (they'll be replaced by the fit line)
-                for marker in manual_tail_markers:
-                    try:
-                        marker.remove()
-                    except (AttributeError, ValueError):
-                        pass
-                manual_tail_markers.clear()
-                manual_tail_points.clear()
-                apply_manual_tail_fit(start_idx, end_idx)
-
-        click_cid = fig.canvas.mpl_connect("button_press_event", handle_manual_click)
-
-        install_zoom_keys(fig, ax)
-        plt.show()
-        fig.canvas.mpl_disconnect(click_cid)
-        plt.close(fig)
-        
-        # Handle navigation
-        action = navigation_state.get("action")
-        if action == "discard_file":
-            print("  File discarded by user during turnover calculation.")
-            return "discard_file"
-        elif action == "go_back_phase":
-            print("  Returning to fitting phase.")
-            return "go_back_phase"
-        elif action == "discard":
-            # Discard this interval — store None for consistency with skip
-            turnover_results[subset.index] = None
-            print(f"  Interval #{subset.index} discarded (no turnover calculated).")
-            current_idx += 1
-            continue
-        elif action == "go_back":
-            # Go back to previous interval (only reachable when current_idx > 0)
-            current_idx -= 1
-            print(f"  Going back to interval #{subsets[current_idx].index}.")
-            continue
-        elif action == "skip":
-            # Skip this interval
-            turnover_results[subset.index] = None
-            print(f"  Interval #{subset.index} skipped (no turnover calculated).")
-            current_idx += 1
-        elif action == "continue":
-            # Store result and move to next
-            if tail_fit_result is not None:
-                turnover = tail_fit_result.get("turnover", None)
-                turnover_results[subset.index] = turnover
-                print(f"  Interval #{subset.index}: turnover = {turnover:.3f} µM")
-            else:
-                turnover_results[subset.index] = None
-                print(f"  Interval #{subset.index}: no turnover calculated.")
-            current_idx += 1
-        else:
-            # Default: skip
-            turnover_results[subset.index] = None
-            current_idx += 1
-    
-    return turnover_results
 
 
 def review_results(
@@ -3266,9 +2155,8 @@ def review_results(
         "Redo turnover" buttons are hidden — those phases no longer exist
         as separate steps (fitting + Δmax happen inside the per-interval
         loop).  "Redo intervals" re-runs the whole per-interval flow and is
-        relabelled accordingly.  Leaving these legacy buttons visible would
-        re-open the deprecated multi-model fitting UI (which still offers
-        GFI) and desync the per-fit data structures.
+        relabelled accordingly.  The old multi-model fitting UI has been
+        deleted; these buttons remain hidden as a defensive belt-and-braces.
 
     Returns:
     --------
@@ -3277,7 +2165,8 @@ def review_results(
         — redo that phase.
     "discard" — discard the entire file.
     """
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig = get_window().reset(figsize=(10, 7))
+    ax = fig.add_subplot(111)
     plt.subplots_adjust(left=0.05, bottom=0.28, right=0.95, top=0.88)
     ax.axis("off")
 
@@ -3323,7 +2212,7 @@ def review_results(
     def _make_cb(action_name):
         def cb(_event):
             state["action"] = action_name
-            plt.close(fig)
+            get_window().stop()
         return cb
 
     # --- buttons (two rows) ---
@@ -3377,8 +2266,7 @@ def review_results(
         "  • 'Discard this file' skips the file entirely."
     )
 
-    plt.show()
-    plt.close(fig)
+    get_window().run()
 
     return state.get("action") or "accept"
 
