@@ -177,6 +177,125 @@ def average_controls_on_grid(
     return averaged, interps
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Injection-time detection and alignment
+# ──────────────────────────────────────────────────────────────────────────
+
+def detect_injection_time(
+    time_values: np.ndarray,
+    h2o2_values: np.ndarray,
+) -> float | None:
+    """Estimate the time of the H₂O₂ injection step in a calibrated trace.
+
+    Sample and control runs rarely have their injection at the same offset
+    within their selected intervals.  Aligning them at their interval
+    *starts* therefore lines up a post-injection sample against a
+    pre-injection control, and the whole injection step (~100 µM) gets
+    subtracted instead of just the electrode drift.
+
+    The estimate is the **half-height crossing** of the injection rise:
+    a point that corresponds between two traces even when their rise
+    times differ.  Injection transients (single-sample spikes of several
+    hundred µM) are removed with a ~1 s median filter first, and the
+    plateau / baseline levels are taken as medians either side of the
+    steepest rise rather than as global min/max — a lone overshoot spike
+    would otherwise put the "plateau" far above the real one.
+
+    Returns ``None`` when no rising step can be identified (e.g. a trace
+    that only decays), in which case callers should fall back to
+    start-of-interval alignment.
+    """
+    t = np.asarray(time_values, dtype=float)
+    y = np.asarray(h2o2_values, dtype=float)
+    if t.size < 10 or y.size != t.size:
+        return None
+
+    dt = float(np.median(np.diff(t)))
+    if not np.isfinite(dt) or dt <= 0:
+        return None
+
+    # ~1 s median filter kills injection spikes without shifting the edge.
+    k = max(3, int(round(1.0 / dt)) | 1)
+    k = min(k, max(3, (y.size // 2) * 2 - 1))
+    try:
+        from scipy.ndimage import median_filter
+
+        ys = median_filter(y, size=k, mode="nearest")
+    except Exception:
+        ys = y
+
+    with np.errstate(invalid="ignore"):
+        grad = np.gradient(ys, t)
+    if not np.any(np.isfinite(grad)):
+        return None
+    i = int(np.nanargmax(grad))
+    if not np.isfinite(grad[i]) or grad[i] <= 0:
+        return None
+
+    # Plateau / baseline as medians either side of the steepest rise.
+    w = max(5, int(round(max(5.0, 0.05 * (t[-1] - t[0])) / dt)))
+    plateau = float(np.nanmedian(ys[i:min(i + w, ys.size)]))
+    base = float(np.nanmedian(ys[max(0, i - w):i + 1]))
+    if not np.isfinite(plateau) or not np.isfinite(base) or (plateau - base) <= 0:
+        return None
+
+    half = base + 0.5 * (plateau - base)
+    ahead = np.nonzero(ys[i:] >= half)[0]
+    if ahead.size:
+        return float(t[i + int(ahead[0])])
+    behind = np.nonzero(ys[:i + 1] >= half)[0]
+    if behind.size:
+        return float(t[int(behind[0])])
+    return float(t[i])
+
+
+def suggest_anchor_time(
+    sample_t: np.ndarray,
+    sample_y: np.ndarray,
+) -> float:
+    """Default deviation-reference time for control subtraction.
+
+    Placed a short settle margin after the sample's injection so the
+    control (aligned to the same injection) is read on its settled
+    plateau rather than mid-rise or on an overshoot transient.
+    """
+    t = np.asarray(sample_t, dtype=float)
+    if t.size == 0:
+        return 0.0
+    duration = float(t[-1] - t[0])
+    settle = max(3.0, 0.01 * duration)
+    inj = detect_injection_time(t, sample_y)
+    base = inj if inj is not None else float(t[0])
+    # Never push the anchor past the first third of the interval.
+    return float(min(base + settle, t[0] + max(settle, duration / 3.0)))
+
+
+def align_control_offset(
+    sample_t: np.ndarray,
+    sample_y: np.ndarray,
+    control_t_zero: np.ndarray,
+    control_y: np.ndarray,
+) -> float:
+    """Return the shift to add to a control's zero-based time so its
+    injection coincides with the sample's.
+
+    Returns ``0.0`` (start-of-interval alignment, the old behaviour) when
+    the injection cannot be located in either trace.
+    """
+    sample_inj = detect_injection_time(sample_t, sample_y)
+    ctrl_inj = detect_injection_time(control_t_zero, control_y)
+    if sample_inj is None or ctrl_inj is None:
+        return 0.0
+    st = np.asarray(sample_t, dtype=float)
+    ct = np.asarray(control_t_zero, dtype=float)
+    if st.size == 0 or ct.size == 0:
+        return 0.0
+    # sample_inj is absolute; the control's zero-based injection offset is
+    # ctrl_inj - ct[0].  Placing the control's t=0 at sample_t[0] + shift
+    # makes the two injections coincide.
+    return float((sample_inj - st[0]) - (ctrl_inj - ct[0]))
+
+
 def deviation_from_anchor(
     control_on_grid: np.ndarray,
     sample_t: np.ndarray,

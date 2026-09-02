@@ -158,6 +158,18 @@ class WindowManager:
                 self._fig.set_size_inches(w, h, forward=True)
             except Exception:
                 pass
+            # Reset the figure patch. fig.clf() clears axes but leaves the
+            # figure's own facecolor/edgecolor alone, so pane-role chrome
+            # (the coloured border applied inside pane_role_context) would
+            # otherwise persist into every later step.
+            try:
+                self._fig.patch.set_edgecolor("none")
+                self._fig.patch.set_linewidth(0.0)
+                self._fig.patch.set_facecolor(
+                    plt.rcParams.get("figure.facecolor", "white")
+                )
+            except Exception:
+                pass
 
         fig = self._fig
         try:

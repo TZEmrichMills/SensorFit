@@ -48,16 +48,9 @@ from .calibration import (
     create_small_button,
     truncate_filename,
 )
-from .controls import (
-    align_control_offset,
-    average_controls_on_grid,
-    deviation_from_anchor,
-    interpolate_control_to_grid,
-    suggest_anchor_time,
-)
+from .controls import average_controls_on_grid, interpolate_control_to_grid
 from .fitting import fit_IB, fit_Exponential
 from .models import model_Exponential, model_IB
-from .window import get_window, finish_window
 from .zoom_hotkey import install_zoom_keys
 
 
@@ -215,8 +208,7 @@ def select_one_interval(
                  from the caller's perspective unless the caller wants to
                  distinguish).
     """
-    fig = get_window().reset(figsize=(11, 6.5))
-    ax = fig.add_subplot(111)
+    fig, ax = plt.subplots(figsize=(11, 6.5))
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Pick an interval"
@@ -231,29 +223,19 @@ def select_one_interval(
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("H2O2 (µM)")
 
-    # Banner is anchored left-of-centre and kept narrow so it stays clear of
-    # the top-right "Done with intervals" button (users have hit Done by
-    # mistake — spatial separation is the whole point).
-    import textwrap as _tw
-    banner_text = _tw.fill(
-        "An interval is one experimental run — a stretch of trace you want to fit "
-        "(e.g. from H₂O₂ addition to end of consumption).  "
-        "Click START then END; Accept to keep it, Retry to re-click, "
-        "Skip to move on without saving.",
-        width=90,
-    )
-    fig.text(
-        0.42, 0.985, banner_text,
-        ha="center", va="top", fontsize=9,
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.9, pad=0.4),
-    )
-
-    title = f"Pick interval #{interval_number}"
+    title = f"Pick interval #{interval_number}: click START then END.  Click Done when finished."
     if filename:
-        title = f"{truncate_filename(filename)} — {title}"
-    # Title sits just above the axes, left-aligned so it doesn't collide
-    # with the banner or the top-right Done button.
-    fig.text(0.10, 0.86, title, fontsize=11, fontweight="bold", ha="left", va="top")
+        title = f"{truncate_filename(filename)}\n{title}"
+    fig.suptitle(title, fontsize=11)
+
+    add_instruction_banner(
+        fig,
+        "Click two points: the first sets the interval START, the second the END.  "
+        "Existing intervals are shown in grey.  Buttons below: Done (finish), "
+        "Back (return to calibration), Skip (this interval).",
+        y=0.985,
+        width=110,
+    )
 
     pending = {"start": None}
     marker = {"artist": None}
@@ -315,19 +297,19 @@ def select_one_interval(
             print("Please click two points to define the interval.")
             return
         state["action"] = "accept"
-        get_window().stop()
+        plt.close(fig)
 
     def on_done(_e=None):
         state["action"] = "done"
-        get_window().stop()
+        plt.close(fig)
 
     def on_back(_e=None):
         state["action"] = "back"
-        get_window().stop()
+        plt.close(fig)
 
     def on_skip(_e=None):
         state["action"] = "skip"
-        get_window().stop()
+        plt.close(fig)
 
     def on_retry(_e=None):
         pending["start"] = None
@@ -352,35 +334,26 @@ def select_one_interval(
             print("No previously-defined intervals to remove.")
             return
         state["action"] = "remove_last"
-        get_window().stop()
+        plt.close(fig)
 
-    # Two rows of buttons, with "Done with intervals" deliberately placed
-    # in the top-right corner, well away from the frequently-clicked
-    # Accept / Retry / Skip cluster along the bottom — users kept hitting
-    # it by mistake when it sat between Retry and Skip and it would end the
-    # per-file interval flow entirely (no undo).
-    #
-    # Bottom row (per-interval actions):
-    #   Accept | Retry | Skip this one | Remove last | Back → calibration
-    # Top-right (whole-file action, spatially separated):
-    #   Done with intervals
+    # Buttons across the bottom in two columns:
+    # row 1: Accept | Retry | Done with intervals | Skip this one
+    # row 2: Remove last (enabled only if intervals exist) | Back to calibration
     ax_accept = fig.add_axes([0.08, 0.03, 0.13, 0.05])
     ax_retry = fig.add_axes([0.22, 0.03, 0.10, 0.05])
-    ax_skip = fig.add_axes([0.33, 0.03, 0.13, 0.05])
-    ax_remove = fig.add_axes([0.47, 0.03, 0.13, 0.05])
-    ax_back = fig.add_axes([0.61, 0.03, 0.15, 0.05])
-    ax_done = fig.add_axes([0.83, 0.945, 0.15, 0.045])
+    ax_done = fig.add_axes([0.34, 0.03, 0.18, 0.05])
+    ax_skip = fig.add_axes([0.54, 0.03, 0.13, 0.05])
+    ax_remove = fig.add_axes([0.70, 0.03, 0.13, 0.05])
+    ax_back = fig.add_axes([0.84, 0.03, 0.13, 0.05])
     btn_accept = create_small_button(ax_accept, "Accept", "#90ee90", "#7cd47c")
     btn_retry = create_small_button(ax_retry, "Retry", "0.9", "0.8")
+    btn_done = create_small_button(ax_done, "Done with intervals", "#ddddff", "#bbbbff")
     btn_skip = create_small_button(ax_skip, "Skip this one", "#ffcc99", "#ffaa66")
     # Remove last is greyed out (slightly) when there are no accepted intervals.
     remove_colour = "#ffaaaa" if already_defined else "0.85"
     remove_hover = "#ff8888" if already_defined else "0.85"
     btn_remove = create_small_button(ax_remove, "Remove last", remove_colour, remove_hover)
     btn_back = create_small_button(ax_back, "Back → calibration", "#ddddff", "#bbbbff")
-    # Give "Done" a distinct muted-purple palette so it is visually as well
-    # as spatially separated from the green/orange per-interval buttons.
-    btn_done = create_small_button(ax_done, "✓ Done with intervals", "#c8b8e0", "#a898c8")
     btn_accept.on_clicked(on_accept)
     btn_retry.on_clicked(on_retry)
     btn_done.on_clicked(on_done)
@@ -389,7 +362,8 @@ def select_one_interval(
     btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
-    get_window().run()
+    plt.show()
+    plt.close(fig)
 
     if state["action"] == "accept" and state["interval"] is not None:
         return state["interval"]
@@ -409,53 +383,36 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     "Existing" and "new" both lead to the multi-control averaging hub,
     which lets the user accumulate one or more controls before accepting.
     """
-    fig = get_window().reset(figsize=(9.2, 4.8))
-    ax = fig.add_subplot(111)
+    fig, ax = plt.subplots(figsize=(8, 3.8))
     try:
         fig.canvas.manager.set_window_title("SensorFit — Subtraction choice")
     except Exception:
         pass
     ax.axis("off")
     ax.text(
-        0.5, 0.88,
-        interval_summary,
-        ha="center", va="center", fontsize=10, style="italic", color="dimgrey",
+        0.5, 0.62,
+        f"{interval_summary}\n\n"
+        "Apply control subtraction?\n\n"
+        "• None — use this interval as-is.\n"
+        "• Subtract existing — start from an already-processed control interval\n"
+        "  (you can add more controls and they will be averaged).\n"
+        "• Subtract new — process a fresh control file first\n"
+        "  (you can add more controls and they will be averaged).",
+        ha="center", va="center", fontsize=10,
     )
-    ax.text(
-        0.5, 0.72,
-        "Only use control subtraction if you have a matched control run\n"
-        "(e.g. no-enzyme, no-substrate) that spans a similar time to this interval.\n"
-        "It removes electrode drift/background so what's left is the enzymatic signal.\n"
-        "If you don't have a control, choose 'None' — this is the normal case.",
-        ha="center", va="center", fontsize=10, color="#333333",
-    )
-    ax.text(
-        0.06, 0.40,
-        "• None — use this interval as-is (no control available or not needed).\n"
-        "• Subtract existing — pick a control interval already processed in this\n"
-        "   session or saved from a previous session.\n"
-        "• Subtract new — pick a control file from disk and process it now, then\n"
-        "   return here to subtract it.\n"
-        "Both 'existing' and 'new' let you add more than one control; they will be\n"
-        "averaged before subtraction.",
-        ha="left", va="center", fontsize=9.5,
-    )
-    fig.suptitle(
-        "Control subtraction — apply a no-enzyme (or similar) control to this interval?",
-        fontsize=11, fontweight="bold",
-    )
+    fig.suptitle("Per-interval control subtraction", fontsize=11, fontweight="bold")
     choice = {"value": None}
 
     def _set(v):
         def _f(_e=None):
             choice["value"] = v
-            get_window().stop()
+            plt.close(fig)
         return _f
 
-    ax_none = fig.add_axes([0.07, 0.05, 0.18, 0.13])
-    ax_existing = fig.add_axes([0.27, 0.05, 0.20, 0.13])
-    ax_new = fig.add_axes([0.49, 0.05, 0.18, 0.13])
-    ax_back = fig.add_axes([0.75, 0.05, 0.18, 0.13])
+    ax_none = fig.add_axes([0.07, 0.10, 0.18, 0.16])
+    ax_existing = fig.add_axes([0.27, 0.10, 0.20, 0.16])
+    ax_new = fig.add_axes([0.49, 0.10, 0.18, 0.16])
+    ax_back = fig.add_axes([0.75, 0.10, 0.18, 0.16])
     btn_none = create_small_button(ax_none, "None", "#90ee90", "#7cd47c")
     btn_existing = create_small_button(ax_existing, "Subtract existing", "#ffe680", "#ffcd55")
     btn_new = create_small_button(ax_new, "Subtract new", "#ffcc99", "#ffaa66")
@@ -465,7 +422,8 @@ def prompt_subtraction_choice(interval_summary: str) -> str:
     btn_new.on_clicked(_set("new"))
     btn_back.on_clicked(_set("back"))
 
-    get_window().run()
+    plt.show()
+    plt.close(fig)
     return choice["value"] or "none"
 
 
@@ -542,9 +500,69 @@ def _discover_existing_control_intervals(
     return out
 
 
+def pick_existing_interval(
+    candidates: list[dict],
+    filename: str | None = None,
+):
+    """Open a small dialog letting the user pick one of the discovered
+    intervals.  Returns the chosen dict (with ``load`` callable) or None
+    if cancelled / no candidates.
+    """
+    if not candidates:
+        print("No existing intervals available for subtraction.")
+        return None
+
+    n = len(candidates)
+    fig_h = 0.7 + 0.30 * max(3, n) + 1.0
+    fig = plt.figure(figsize=(9, fig_h))
+    fig.suptitle(
+        f"Pick a control interval to subtract"
+        + (f" from {truncate_filename(filename)}" if filename else ""),
+        fontsize=11,
+    )
+    add_instruction_banner(
+        fig,
+        "Click a button to pick that interval as the control.  Cancel returns "
+        "to the subtraction-choice dialog.",
+        y=0.985,
+        width=110,
+    )
+
+    chosen = {"idx": None}
+    btns = []
+
+    def make_picker(i):
+        def _f(_e=None):
+            chosen["idx"] = i
+            plt.close(fig)
+        return _f
+
+    # Each row is a button labelled with the candidate's text
+    btn_h = 0.06
+    spacing = 0.015
+    available_h = 0.78
+    btn_w = 0.85
+    if n * (btn_h + spacing) > available_h:
+        btn_h = max(0.03, (available_h - n * spacing) / n)
+
+    for i, c in enumerate(candidates):
+        y = 0.85 - (i + 1) * (btn_h + spacing)
+        ax_btn = fig.add_axes([0.075, y, btn_w, btn_h])
+        b = create_small_button(ax_btn, c["label"], "#ffe680", "#ffcd55")
+        b.on_clicked(make_picker(i))
+        btns.append(b)
+
+    ax_cancel = fig.add_axes([0.35, 0.03, 0.30, 0.06])
+    btn_cancel = create_small_button(ax_cancel, "Cancel", "#ddddff", "#bbbbff")
+    btn_cancel.on_clicked(lambda _e=None: plt.close(fig))
+
+    plt.show()
+    plt.close(fig)
+    return candidates[chosen["idx"]] if chosen["idx"] is not None else None
+
+
 # ────────────────────────────────────────────────────────────────────────
-# UI: subtraction preview (used by the averaging hub's single-control
-# legacy path is gone; this is kept for potential direct use)
+# UI: subtraction preview
 # ────────────────────────────────────────────────────────────────────────
 
 
@@ -564,21 +582,9 @@ def preview_per_interval_subtraction(
       "skip" — user opted to skip subtraction.
       "back" — user wants to revisit the subtraction-choice dialog.
     """
-    # Shift the control so its H₂O₂ injection lines up with the sample's,
-    # then anchor a little after that injection.  Aligning at the interval
-    # starts instead would read the control on its pre-injection baseline
-    # and subtract the whole injection step rather than the drift.
-    try:
-        _shift = align_control_offset(sample_t, sample_y, control_t, control_y)
-    except Exception:
-        _shift = 0.0
-    control_t = np.asarray(control_t, dtype=float) + _shift
-    anchor = {"t0": suggest_anchor_time(sample_t, sample_y)}
-    place_t0 = float(sample_t[0])
+    anchor = {"t0": float(sample_t[0])}
 
-    fig = get_window().reset(figsize=(11, 7.4))
-    ax_top = fig.add_subplot(211)
-    ax_bot = fig.add_subplot(212, sharex=ax_top)
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(11, 7.4), sharex=True)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Subtraction preview"
@@ -617,11 +623,10 @@ def preview_per_interval_subtraction(
     view = {"autoscaled": False}
 
     def redraw():
-        shifted_t = control_t + place_t0
+        shifted_t = control_t + anchor["t0"]
         interp, _ = interpolate_control_to_grid(shifted_t, control_y, sample_t)
-        dev = deviation_from_anchor(interp, sample_t, anchor["t0"])
         line_ctrl.set_data(sample_t, interp)
-        line_corr.set_data(sample_t, sample_y - dev)
+        line_corr.set_data(sample_t, sample_y - interp)
         anchor_line_top.set_xdata([anchor["t0"], anchor["t0"]])
         anchor_line_bot.set_xdata([anchor["t0"], anchor["t0"]])
         if not view["autoscaled"]:
@@ -645,18 +650,18 @@ def preview_per_interval_subtraction(
 
     def on_accept(_e=None):
         decision["value"] = "accept"
-        get_window().stop()
+        plt.close(fig)
 
     def on_skip(_e=None):
         decision["value"] = "skip"
-        get_window().stop()
+        plt.close(fig)
 
     def on_back(_e=None):
         decision["value"] = "back"
-        get_window().stop()
+        plt.close(fig)
 
     def on_reset(_e=None):
-        anchor["t0"] = suggest_anchor_time(sample_t, sample_y)
+        anchor["t0"] = float(sample_t[0])
         redraw()
 
     ax_accept = fig.add_axes([0.10, 0.03, 0.18, 0.06])
@@ -674,13 +679,13 @@ def preview_per_interval_subtraction(
 
     redraw()
     install_zoom_keys(fig, [ax_top, ax_bot])
-    get_window().run()
+    plt.show()
+    plt.close(fig)
 
     if decision["value"] == "accept":
-        shifted_t = control_t + place_t0
+        shifted_t = control_t + anchor["t0"]
         interp, _ = interpolate_control_to_grid(shifted_t, control_y, sample_t)
-        dev = deviation_from_anchor(interp, sample_t, anchor["t0"])
-        return sample_y - dev
+        return sample_y - interp
     if decision["value"] == "skip":
         return "skip"
     return "back"
@@ -694,142 +699,91 @@ def pick_existing_intervals_multi(
     candidates: list[dict],
     filename: str | None = None,
 ) -> list[dict] | None:
-    """Let the user pick one or more existing intervals from a scrollable list.
+    """Let the user pick one or more existing intervals via toggle buttons.
 
-    Uses a Qt ``QListWidget`` dialog (natively scrollable, handles hundreds
-    of items).  Returns a list of chosen candidate dicts, or None if
-    cancelled / no candidates.
+    Returns a list of chosen candidate dicts, or None if cancelled.
     """
     if not candidates:
         print("No existing intervals available for subtraction.")
         return None
 
-    return _qt_multi_select_dialog(
-        candidates,
-        title=(
-            "Select one or more control intervals"
-            + (f" for {truncate_filename(filename)}" if filename else "")
-        ),
-        instructions=(
-            "Click to select (Ctrl/Cmd-click or Shift-click for multiple).  "
-            "Accept adds all selected controls to the averaging set."
-        ),
-        subtracting_from=filename,
+    n = len(candidates)
+    fig_h = 1.0 + 0.30 * max(3, n) + 1.2
+    fig = plt.figure(figsize=(9, fig_h))
+    fig.suptitle(
+        "Select one or more control intervals"
+        + (f" for {truncate_filename(filename)}" if filename else ""),
+        fontsize=11,
+    )
+    add_instruction_banner(
+        fig,
+        "Click to toggle selection (highlighted = selected).  "
+        "Accept adds all selected controls to the averaging set.",
+        y=0.985, width=110,
     )
 
+    selected = set()
+    btn_objs = []
+    btn_axes = []
+    result = {"accepted": False}
 
-def _qt_multi_select_dialog(
-    candidates: list[dict],
-    title: str = "Select intervals",
-    instructions: str = "",
-    subtracting_from: str | None = None,
-) -> list[dict] | None:
-    """Scrollable multi-select dialog backed by Qt.
+    def _toggle(i):
+        def _f(_e=None):
+            if i in selected:
+                selected.discard(i)
+            else:
+                selected.add(i)
+            _update_colours()
+        return _f
 
-    ``subtracting_from`` names the run these controls will be subtracted
-    from; it is shown as a prominent banner so the choice of control is
-    never made against a half-remembered sample.
-    """
-    import sys as _sys
-    try:
-        from .calibration_editor import _try_import_qt, QT_AVAILABLE, QT_LIB
-    except Exception:
-        QT_AVAILABLE = False
-        QT_LIB = None
+    def _update_colours():
+        for j, (ax_b, _) in enumerate(zip(btn_axes, btn_objs)):
+            if j in selected:
+                ax_b.set_facecolor("#90ee90")
+            else:
+                ax_b.set_facecolor("#ffe680")
+        fig.canvas.draw_idle()
 
-    if not QT_AVAILABLE:
-        try:
-            ok, _, QT_LIB = _try_import_qt()
-        except Exception:
-            ok = False
-        if not ok:
-            print("Qt not available; falling back to console selection.")
-            return _console_multi_select(candidates, subtracting_from)
+    btn_h = 0.055
+    spacing = 0.012
+    available_h = 0.76
+    btn_w = 0.85
+    if n * (btn_h + spacing) > available_h:
+        btn_h = max(0.028, (available_h - n * spacing) / n)
 
-    if QT_LIB == "PyQt5":
-        from PyQt5 import QtWidgets, QtCore
-    else:
-        from PySide6 import QtWidgets, QtCore
-
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(_sys.argv)
-
-    dlg = QtWidgets.QDialog()
-    dlg.setWindowTitle(title)
-    dlg.resize(620, 460)
-    layout = QtWidgets.QVBoxLayout(dlg)
-
-    if subtracting_from:
-        banner = QtWidgets.QLabel(
-            f"Choosing a control to subtract FROM:\n{subtracting_from}"
-        )
-        banner.setWordWrap(True)
-        banner.setStyleSheet(
-            "QLabel {"
-            " background-color: #fff3cd;"
-            " border: 2px solid #d39e00;"
-            " border-radius: 4px;"
-            " padding: 8px;"
-            " font-size: 13px;"
-            " font-weight: bold;"
-            " color: #5c4400;"
-            "}"
-        )
-        layout.addWidget(banner)
-
-    if instructions:
-        lbl = QtWidgets.QLabel(instructions)
-        lbl.setWordWrap(True)
-        layout.addWidget(lbl)
-
-    lw = QtWidgets.QListWidget()
-    lw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-    for c in candidates:
-        lw.addItem(c["label"])
-    layout.addWidget(lw)
-
-    btn_box = QtWidgets.QHBoxLayout()
-    btn_accept = QtWidgets.QPushButton("Accept selection")
-    btn_cancel = QtWidgets.QPushButton("Cancel")
-    btn_accept.clicked.connect(dlg.accept)
-    btn_cancel.clicked.connect(dlg.reject)
-    btn_box.addWidget(btn_accept)
-    btn_box.addWidget(btn_cancel)
-    layout.addLayout(btn_box)
-
-    if dlg.exec_() == QtWidgets.QDialog.Accepted:
-        indices = sorted(idx.row() for idx in lw.selectedIndexes())
-        if indices:
-            return [candidates[i] for i in indices]
-    return None
-
-
-def _console_multi_select(
-    candidates: list[dict],
-    subtracting_from: str | None = None,
-) -> list[dict] | None:
-    """Fallback when Qt is unavailable: numbered console list."""
-    if subtracting_from:
-        print(f"\n>>> Choosing a control to subtract FROM: {subtracting_from}")
-    print("\nAvailable intervals:")
     for i, c in enumerate(candidates):
-        print(f"  [{i}] {c['label']}")
-    raw = input("Enter indices (comma-separated) or 'c' to cancel: ").strip()
-    if raw.lower() == "c":
-        return None
-    try:
-        indices = [int(x.strip()) for x in raw.split(",")]
-        chosen = [candidates[i] for i in indices if 0 <= i < len(candidates)]
-        return chosen if chosen else None
-    except (ValueError, IndexError):
-        print("Invalid input; cancelling.")
-        return None
+        y = 0.84 - (i + 1) * (btn_h + spacing)
+        ax_btn = fig.add_axes([0.075, y, btn_w, btn_h])
+        b = create_small_button(ax_btn, c["label"], "#ffe680", "#ffcd55")
+        b.on_clicked(_toggle(i))
+        btn_objs.append(b)
+        btn_axes.append(ax_btn)
+
+    def _accept(_e=None):
+        result["accepted"] = True
+        plt.close(fig)
+
+    ax_accept = fig.add_axes([0.25, 0.025, 0.22, 0.055])
+    ax_cancel = fig.add_axes([0.53, 0.025, 0.22, 0.055])
+    _btn_accept = create_small_button(ax_accept, "Accept selection", "#90ee90", "#7cd47c")
+    _btn_accept.on_clicked(_accept)
+    _btn_cancel = create_small_button(ax_cancel, "Cancel", "#ddddff", "#bbbbff")
+    _btn_cancel.on_clicked(lambda _e=None: plt.close(fig))
+
+    plt.show()
+    plt.close(fig)
+
+    if result["accepted"] and selected:
+        return [candidates[i] for i in sorted(selected)]
+    return None
 
 
 # ────────────────────────────────────────────────────────────────────────
 # UI: multi-control averaging hub (live preview)
 # ────────────────────────────────────────────────────────────────────────
 
-ControlMember = tuple  # (label: str, t_zero_based: ndarray, y: ndarray)
+# A "member" in the averaging set is (label: str, t_zero_based: ndarray, y: ndarray).
+ControlMember = tuple  # (str, np.ndarray, np.ndarray)
 
 
 def averaging_hub(
@@ -844,39 +798,22 @@ def averaging_hub(
 ) -> tuple[str, list[ControlMember]]:
     """Show a live-preview hub where the user builds an averaging set.
 
-    Top pane: sample (green), each member control faint, averaged control
-    bold red, anchor line.  Bottom pane: sample − averaged control (blue).
+    The hub shows:
+      - Top pane: sample (green), each member control faint, averaged
+        control bold red, anchor line.
+      - Bottom pane: sample − averaged control (blue).
 
-    Buttons: Add existing / Add new / Remove last / Accept & subtract /
+    Buttons: Add existing… / Add new… / Remove last / Accept & subtract /
     Skip / Back.
 
-    Each control is time-shifted so its H₂O₂ injection coincides with the
-    sample's (see ``align_control_offset``); without that the anchor lands
-    in the control's pre-injection baseline and the whole injection step
-    is subtracted instead of just the drift.
-
-    Returns ``(decision, members, anchor_t)`` where decision is
-    ``"accept"``, ``"skip"``, or ``"back"``.  The returned members carry
-    their alignment shift baked into their time arrays, and ``anchor_t``
-    is the deviation reference the user settled on — callers must reuse
-    both so the applied subtraction matches this preview.
+    Returns ``(decision, members)`` where decision is one of ``"accept"``,
+    ``"skip"``, ``"back"`` and *members* is the final list (may be empty
+    for skip/back).
     """
+    members: list[ControlMember] = list(initial_members)
+    anchor = {"t0": float(sample_t[0])}
 
-    def _aligned(member: ControlMember) -> ControlMember:
-        """Shift a member's time base so its injection matches the sample's."""
-        label, ct, cy = member
-        try:
-            shift = align_control_offset(sample_t, sample_y, ct, cy)
-        except Exception:
-            shift = 0.0
-        return (label, np.asarray(ct, dtype=float) + shift, cy)
-
-    members: list[ControlMember] = [_aligned(m) for m in initial_members]
-    anchor = {"t0": suggest_anchor_time(sample_t, sample_y)}
-
-    fig = get_window().reset(figsize=(11, 7.8))
-    ax_top = fig.add_subplot(211)
-    ax_bot = fig.add_subplot(212, sharex=ax_top)
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(11, 7.8), sharex=True)
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Multi-control averaging"
@@ -886,6 +823,7 @@ def averaging_hub(
         pass
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.78, hspace=0.25)
 
+    # Static sample trace
     ax_top.plot(sample_t, sample_y, color="tab:green", lw=1.3, label="Sample")
     anchor_line_top = ax_top.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9, label="Anchor")
     anchor_line_bot = ax_bot.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9)
@@ -894,12 +832,10 @@ def averaging_hub(
     ax_bot.set_xlabel("Time (s)")
     ax_bot.set_ylabel("H₂O₂ (µM, corrected)")
 
+    # Dynamic artists — rebuilt on every redraw
     dynamic_lines: list = []
     line_avg = [None]
     line_corr = [None]
-    readout = [fig.text(
-        0.5, 0.845, "", ha="center", va="top", fontsize=9, color="#333333",
-    )]
 
     member_colours = [
         "#d4a0a0", "#a0a0d4", "#a0d4a0", "#d4d4a0", "#d4a0d4",
@@ -909,11 +845,10 @@ def averaging_hub(
     add_instruction_banner(
         fig,
         "Build your control-averaging set.  "
-        "Controls are auto-aligned to this run's H₂O₂ injection, and only "
-        "their drift away from the anchor is subtracted — so a 100 µM run "
-        "minus a 100 µM control stays near 100, not 0.  "
-        "Top: sample (green) + controls (faint) + average (red).  "
-        "Bottom: corrected sample.  Click upper plot to move the anchor.",
+        "Top: sample (green) + individual controls (faint) + average (red).  "
+        "Bottom: sample − average.  "
+        "Click upper plot to re-anchor.  "
+        "Add controls, then Accept.",
         y=0.985, width=110,
     )
 
@@ -942,12 +877,7 @@ def averaging_hub(
             return
 
         pairs = [(ct, cy) for (_label, ct, cy) in members]
-        # Members are pre-aligned to the sample's injection, so they are
-        # always placed at the interval start; the anchor only chooses the
-        # zero-deviation reference time.
-        averaged, interps = average_controls_on_grid(
-            pairs, sample_t, float(sample_t[0])
-        )
+        averaged, interps = average_controls_on_grid(pairs, sample_t, anchor["t0"])
 
         for i, (interp_y, (label, _ct, _cy)) in enumerate(zip(interps, members)):
             c = member_colours[i % len(member_colours)]
@@ -959,31 +889,12 @@ def averaging_hub(
                             label=f"Average ({len(members)} ctrl)")
         line_avg[0] = ln_a
 
-        dev = deviation_from_anchor(averaged, sample_t, anchor["t0"])
-        ln_c, = ax_bot.plot(sample_t, sample_y - dev, color="tab:blue",
-                            lw=1.3, label="Sample − control deviation")
+        ln_c, = ax_bot.plot(sample_t, sample_y - averaged, color="tab:blue",
+                            lw=1.3, label="Sample − Avg control")
         line_corr[0] = ln_c
 
         anchor_line_top.set_xdata([anchor["t0"], anchor["t0"]])
         anchor_line_bot.set_xdata([anchor["t0"], anchor["t0"]])
-
-        # Readout so a misplaced anchor is obvious rather than silent.
-        ctrl_at = float(np.interp(anchor["t0"], sample_t, averaged))
-        samp_at = float(np.interp(anchor["t0"], sample_t, sample_y))
-        drift = float(averaged[-1] - ctrl_at)
-        msg = (
-            f"At anchor t={anchor['t0']:.1f}s:  control={ctrl_at:.1f} µM   "
-            f"sample={samp_at:.1f} µM   |   control drift over run: "
-            f"{drift:+.1f} µM"
-        )
-        colour = "#333333"
-        span = float(np.nanmax(sample_y) - np.nanmin(sample_y))
-        if span > 0 and abs(samp_at - ctrl_at) > 0.25 * span:
-            msg += "\n⚠ Control and sample differ a lot here — the anchor may "
-            msg += "sit before an injection. Click the upper plot to move it."
-            colour = "#b00020"
-        readout[0].set_text(msg)
-        readout[0].set_color(colour)
 
         ax_top.legend(loc="upper right", fontsize=9)
         ax_bot.legend(loc="upper right", fontsize=9)
@@ -1010,7 +921,7 @@ def averaging_hub(
     def _close_with(v):
         def _f(_e=None):
             decision["value"] = v
-            get_window().stop()
+            plt.close(fig)
         return _f
 
     def _add_existing(_e=None):
@@ -1022,7 +933,7 @@ def averaging_hub(
             for p in picked:
                 ct, cy = p["load"]()
                 ct_zero = ct - ct[0]
-                members.append(_aligned((p["label"], ct_zero, cy)))
+                members.append((p["label"], ct_zero, cy))
             redraw()
 
     def _add_new(_e=None):
@@ -1030,17 +941,14 @@ def averaging_hub(
             print("No callback for new-control processing.")
             return
         picked_path = _qt_pick_control_file(
-            calibrated_dir.parent if calibrated_dir is not None else None,
-            subtracting_from=filename,
+            calibrated_dir.parent if calibrated_dir is not None else None
         )
         if picked_path is not None:
             template = new_control_callback(picked_path)
             if template is not None:
                 ct, cy = template
                 ct_zero = ct - ct[0]
-                members.append(
-                    _aligned((f"new: {picked_path.name}", ct_zero, cy))
-                )
+                members.append((f"new: {picked_path.name}", ct_zero, cy))
                 redraw()
 
     def _remove_last(_e=None):
@@ -1071,10 +979,11 @@ def averaging_hub(
 
     redraw()
     install_zoom_keys(fig, [ax_top, ax_bot])
-    get_window().run()
+    plt.show()
+    plt.close(fig)
 
     d = decision["value"] or "skip"
-    return (d, members if d == "accept" else [], float(anchor["t0"]))
+    return (d, members if d == "accept" else [])
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -1206,7 +1115,7 @@ def prompt_one_fit(
       "back"    — user wants to revisit the subtraction step.
     """
     # ── Figure layout: 2-row gridspec (data : residuals = 3 : 1) ──────
-    fig = get_window().reset(figsize=(11.5, 8.6))
+    fig = plt.figure(figsize=(11.5, 8.6))
     try:
         fig.canvas.manager.set_window_title(
             f"SensorFit — Fit #{fit_index}"
@@ -1553,7 +1462,7 @@ def prompt_one_fit(
             rec.back_extrap_t0_s = float(extrap_state["target_t"])
             rec.back_extrap_rate_uM_per_s = float(extrap_state["new_rate"])
         final["action"] = "accept"
-        get_window().stop()
+        plt.close(fig)
 
     def on_retry(_e=None):
         _clear_range()
@@ -1562,11 +1471,11 @@ def prompt_one_fit(
 
     def on_skip(_e=None):
         final["action"] = "skip"
-        get_window().stop()
+        plt.close(fig)
 
     def on_back(_e=None):
         final["action"] = "back"
-        get_window().stop()
+        plt.close(fig)
 
     ax_extrap = fig.add_axes([0.10, 0.04, 0.18, 0.05])
     ax_accept = fig.add_axes([0.30, 0.04, 0.14, 0.05])
@@ -1585,7 +1494,8 @@ def prompt_one_fit(
     btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, [ax_data, ax_resid])
-    get_window().run()
+    plt.show()
+    plt.close(fig)
 
     if final["action"] == "accept" and fit_state["record"] is not None:
         return fit_state["record"]
@@ -1654,8 +1564,7 @@ def prompt_delta_max(
     has_usable_fit = any(f.model in ("Exponential", "IB") for f in fits)
     default_mode = "from-fit" if has_usable_fit else "linear"
 
-    fig = get_window().reset(figsize=(11, 7.2))
-    ax = fig.add_subplot(111)
+    fig, ax = plt.subplots(figsize=(11, 7.2))
     try:
         fig.canvas.manager.set_window_title(
             "SensorFit — Δ[H₂O₂]max"
@@ -1674,15 +1583,23 @@ def prompt_delta_max(
 
     add_instruction_banner(
         fig,
-        "Pick mode; click t₀; Linear/Point also click on the baseline.  "
-        "Toggle 'Set max' to click-set max [H₂O₂] (horizontal line).  "
-        "Δmax = max_uM − baseline_at_t₀.",
+        "Pick mode; click t₀; Linear/Point also click on the baseline; "
+        "Δmax = max_uM − baseline_at_t₀.  Edit max_uM if needed.",
         y=0.985, width=130,
     )
 
     mode_state = {"mode": default_mode}
     max_uM_state = {"value": float(cal_max_uM)}
-    click_target = {"value": "t0"}  # "t0" or "max_uM"
+    # Artists are tracked by category so the two Retry buttons can clear
+    # one without disturbing the other:
+    #   tz_artists       — t₀ purple cross + dashed vertical line + (in
+    #                      From-fit mode) the highlighted bold fit and
+    #                      asymptote line
+    #   baseline_artists — the baseline picks (purple circles) + Linear's
+    #                      red fit line + dotted extension + the
+    #                      horizontal dashed line at the baseline level
+    #                      (for Linear/Point modes)
+    #   span_artists     — the purple double-arrow + corner annotation
     state = {
         "t_zero_idx": None,
         "linear_clicks": [],
@@ -1692,11 +1609,15 @@ def prompt_delta_max(
         "tz_artists": [],
         "baseline_artists": [],
         "span_artists": [],
-        "max_uM_artists": [],
         "annotation": None,
     }
+    # ± window for averaging y around each baseline click, mirroring
+    # baseline/calibration screens.  Default 50 samples either side.
     window_state = {"value": 50}
 
+    # Top controls: mode buttons + cal-max TextBox.  TextBox shifted right
+    # and its label placed ABOVE (not beside) to avoid colliding with the
+    # Point button.
     btn_axes = {
         "from-fit": fig.add_axes([0.10, 0.74, 0.13, 0.05]),
         "linear":   fig.add_axes([0.24, 0.74, 0.13, 0.05]),
@@ -1721,41 +1642,20 @@ def prompt_delta_max(
         ),
     }
 
-    # "Set max" toggle button — switches click mode between t₀/baseline
-    # picking and max_uM picking (horizontal line from y-click).
-    ax_set_max = fig.add_axes([0.53, 0.74, 0.12, 0.05])
-    btn_set_max = create_small_button(ax_set_max, "Set max ↕", "0.85", "#ffd480")
-
-    def _toggle_click_target(_e=None):
-        if click_target["value"] == "t0":
-            click_target["value"] = "max_uM"
-            btn_set_max.color = "#ffd480"
-            _update_status(
-                "Click on the plot to set max [H₂O₂] (horizontal line).  "
-                "Click 'Set max' again to return to t₀/baseline mode.",
-                "#995500",
-            )
-        else:
-            click_target["value"] = "t0"
-            btn_set_max.color = "0.85"
-            _update_status(_initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]))
-        fig.canvas.draw_idle()
-
-    btn_set_max.on_clicked(_toggle_click_target)
-
-    # max-µM TextBox (also settable by click) and window TextBox.
+    # max-µM (the calibration max) and click-averaging window TextBoxes.
+    # Labels are placed ABOVE so they don't bleed into the Point button.
     fig.text(
-        0.72, 0.795, "max [H₂O₂] (µM)",
+        0.66, 0.795, "max [H₂O₂] (µM)",
         ha="center", va="center", fontsize=9, color="dimgrey",
     )
-    ax_max = fig.add_axes([0.67, 0.745, 0.10, 0.04])
+    ax_max = fig.add_axes([0.61, 0.745, 0.10, 0.04])
     tb_max = TextBox(ax_max, "", initial=f"{cal_max_uM:.2f}")
 
     fig.text(
-        0.88, 0.795, "window ±",
+        0.84, 0.795, "window ±",
         ha="center", va="center", fontsize=9, color="dimgrey",
     )
-    ax_window = fig.add_axes([0.85, 0.745, 0.06, 0.04])
+    ax_window = fig.add_axes([0.81, 0.745, 0.06, 0.04])
     tb_window = TextBox(ax_window, "", initial=str(window_state["value"]))
 
     if not has_usable_fit:
@@ -1803,33 +1703,6 @@ def prompt_delta_max(
         state["linear_clicks"].clear()
         state["point_idx"] = None
         _clear_span()
-
-    def _clear_max_uM_line():
-        _remove_artists("max_uM_artists")
-
-    def _draw_max_uM_line(y_value):
-        """Horizontal orange dashed line showing the current max [H₂O₂]."""
-        _clear_max_uM_line()
-        # If the chosen value sits outside the current view, widen the y-limits
-        # so the line (and its label) stay visible inside the plot rather than
-        # being clipped off-screen and colliding with the status text.
-        y0, y1 = ax.get_ylim()
-        span = (y1 - y0) or 1.0
-        if y_value > y1 - 0.02 * span:
-            ax.set_ylim(y0, y_value + 0.06 * span)
-        elif y_value < y0 + 0.02 * span:
-            ax.set_ylim(y_value - 0.06 * span, y1)
-        hl = ax.axhline(
-            y_value, color="#E07020", lw=1.8, ls="--", alpha=0.85, zorder=4,
-        )
-        state["max_uM_artists"].append(hl)
-        lbl = ax.text(
-            0.015, y_value, f" max = {y_value:.2f} µM",
-            transform=ax.get_yaxis_transform(),
-            fontsize=8, color="#E07020", va="bottom", ha="left", zorder=5,
-        )
-        state["max_uM_artists"].append(lbl)
-        fig.canvas.draw_idle()
 
     def _clear_preview():
         _clear_t_zero()
@@ -2111,23 +1984,6 @@ def prompt_delta_max(
             return
         if getattr(fig.canvas.toolbar, "mode", "") in ("zoom rect", "pan/zoom", "zoom", "pan"):
             return
-
-        if click_target["value"] == "max_uM" and event.ydata is not None:
-            y_val = float(event.ydata)
-            max_uM_state["value"] = y_val
-            # set_val fires _on_max_submit, which already recomputes the
-            # preview when a t₀ is set — so we must not recompute again here.
-            tb_max.set_val(f"{y_val:.2f}")
-            _draw_max_uM_line(y_val)
-            click_target["value"] = "t0"
-            btn_set_max.color = "0.85"
-            if state["t_zero_idx"] is None:
-                _update_status(
-                    _initial_hint(mode_state["mode"], has_usable_fit, max_uM_state["value"]),
-                )
-            fig.canvas.draw_idle()
-            return
-
         idx = int(np.abs(interval_t - float(event.xdata)).argmin())
 
         if mode_state["mode"] == "from-fit":
@@ -2180,7 +2036,7 @@ def prompt_delta_max(
             _update_status("No Δmax computed yet.", "darkred")
             return
         state["action"] = "accept"
-        get_window().stop()
+        plt.close(fig)
 
     def on_retry_t0(_e=None):
         """Clear ONLY the t₀ marker + dashed line (and the From-fit
@@ -2229,11 +2085,11 @@ def prompt_delta_max(
 
     def on_skip(_e=None):
         state["action"] = "skip"
-        get_window().stop()
+        plt.close(fig)
 
     def on_back(_e=None):
         state["action"] = "back"
-        get_window().stop()
+        plt.close(fig)
 
     # Five buttons across the bottom:
     # Accept | Retry t₀ | Retry baseline | Skip | Back
@@ -2254,7 +2110,8 @@ def prompt_delta_max(
     btn_back.on_clicked(on_back)
 
     install_zoom_keys(fig, ax)
-    get_window().run()
+    plt.show()
+    plt.close(fig)
 
     if state["action"] == "accept" and state["computed"] is not None:
         return state["computed"]
@@ -2266,16 +2123,9 @@ def prompt_delta_max(
 # ────────────────────────────────────────────────────────────────────────
 
 
-def _qt_pick_control_file(
-    input_dir: Path | None,
-    subtracting_from: str | None = None,
-) -> Path | None:
+def _qt_pick_control_file(input_dir: Path | None) -> Path | None:
     """Open a Qt file dialog and let the user pick a control file.  Falls back
-    to None if Qt isn't available.
-
-    ``subtracting_from`` names the run the control will be subtracted from
-    and is shown in the dialog title, so the sample is never out of sight
-    while choosing."""
+    to None if Qt isn't available."""
     from .calibration_editor import _try_import_qt, QT_AVAILABLE, QT_LIB
     if not QT_AVAILABLE:
         ok, _, _ = _try_import_qt()
@@ -2291,12 +2141,9 @@ def _qt_pick_control_file(
     import sys as _sys
     app = QApplication.instance() or QApplication(_sys.argv)
     start_dir = str(input_dir) if input_dir is not None else ""
-    caption = "SensorFit — pick a control file to process"
-    if subtracting_from:
-        caption += f"  —  to subtract FROM: {subtracting_from}"
     selected, _ = QFileDialog.getOpenFileName(
         None,
-        caption,
+        "SensorFit — pick a control file to process",
         start_dir,
         "Excel / CSV (*.xlsx *.xls *.xlsm *.xlsb *.csv *.txt);;All files (*)",
     )
@@ -2402,7 +2249,7 @@ def run_per_interval_flow(
                     abort_to_pick = True
                     break
 
-                # Reset subtraction state on re-entry (e.g. Back from fit).
+                # Reset subtraction state on each re-entry (e.g. Back from fit).
                 control_subtracted = False
                 control_source = None
                 control_n_averaged = 0
@@ -2410,6 +2257,7 @@ def run_per_interval_flow(
                 interval_df[CALIBRATED_COLUMN] = interval_y
 
                 if sub_choice in ("existing", "new"):
+                    # Seed the averaging hub with initial members
                     initial_members: list[ControlMember] = []
                     candidates = _discover_existing_control_intervals(
                         calibrated_dir, session_intervals, self_stem
@@ -2431,8 +2279,7 @@ def run_per_interval_flow(
                             )
                         else:
                             picked_path = _qt_pick_control_file(
-                                calibrated_dir.parent if calibrated_dir is not None else None,
-                                subtracting_from=filename,
+                                calibrated_dir.parent if calibrated_dir is not None else None
                             )
                             if picked_path is not None:
                                 template = new_control_callback(picked_path)
@@ -2441,7 +2288,7 @@ def run_per_interval_flow(
                                     initial_members.append((f"new: {picked_path.name}", ct - ct[0], cy))
 
                     if initial_members:
-                        hub_decision, hub_members, hub_anchor = averaging_hub(
+                        hub_decision, hub_members = averaging_hub(
                             interval_t, interval_y, initial_members,
                             filename=filename,
                             existing_candidates=candidates,
@@ -2449,25 +2296,19 @@ def run_per_interval_flow(
                             calibrated_dir=calibrated_dir,
                         )
                         if hub_decision == "accept" and hub_members:
-                            # Reuse the hub's own alignment and anchor —
-                            # recomputing from interval_t[0] here would
-                            # silently apply a different subtraction from
-                            # the one the user just previewed.
                             pairs = [(ct, cy) for (_lbl, ct, cy) in hub_members]
                             averaged, _ = average_controls_on_grid(
                                 pairs, interval_t, float(interval_t[0])
                             )
-                            dev = deviation_from_anchor(
-                                averaged, interval_t, hub_anchor
-                            )
-                            interval_y = original_y - dev
+                            interval_y = original_y - averaged
                             interval_df[CALIBRATED_COLUMN] = interval_y
                             control_subtracted = True
                             control_n_averaged = len(hub_members)
                             labels = [lbl for (lbl, _, _) in hub_members]
                             control_source = " | ".join(labels)
                         elif hub_decision == "back":
-                            continue
+                            continue  # re-show subtraction choice
+                        # "skip" falls through to step = "fit"
 
                 step = "fit"
                 continue
@@ -2541,8 +2382,7 @@ def run_per_interval_flow(
 
 def _ask_another(question: str) -> bool:
     """Small yes/no popup; returns True if user clicks Yes."""
-    fig = get_window().reset(figsize=(7, 2.5))
-    ax = fig.add_subplot(111)
+    fig, ax = plt.subplots(figsize=(7, 2.5))
     try:
         fig.canvas.manager.set_window_title("SensorFit — Continue?")
     except Exception:
@@ -2553,11 +2393,11 @@ def _ask_another(question: str) -> bool:
 
     def _yes(_e=None):
         state["choice"] = True
-        get_window().stop()
+        plt.close(fig)
 
     def _no(_e=None):
         state["choice"] = False
-        get_window().stop()
+        plt.close(fig)
 
     ax_yes = fig.add_axes([0.22, 0.10, 0.22, 0.18])
     ax_no = fig.add_axes([0.56, 0.10, 0.22, 0.18])
@@ -2565,5 +2405,6 @@ def _ask_another(question: str) -> bool:
     _btn_yes_18.on_clicked(_yes)
     _btn_no_19 = create_small_button(ax_no, "No", "0.9", "0.8")
     _btn_no_19.on_clicked(_no)
-    get_window().run()
+    plt.show()
+    plt.close(fig)
     return state["choice"]

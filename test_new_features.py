@@ -759,6 +759,76 @@ def test_average_controls_on_grid() -> bool:
     return True
 
 
+def test_injection_alignment() -> bool:
+    _section("Injection-time alignment for control subtraction")
+    import numpy as np
+    from sensorfit.controls import (
+        align_control_offset,
+        average_controls_on_grid,
+        detect_injection_time,
+        deviation_from_anchor,
+        suggest_anchor_time,
+    )
+
+    # Sample: injects at t=5s (interval starts at t=0), then an enzyme
+    # consumes H2O2 down to 55 uM.  Control: same 100 uM injection but at
+    # t=9s within its own interval, and drifts down 4 uM (electrode drift).
+    dt = 0.08
+    t = np.arange(0.0, 400.0, dt)
+
+    def step(t, t_inj, plateau, decay_to, tau):
+        y = np.zeros_like(t)
+        post = t >= t_inj
+        y[post] = decay_to + (plateau - decay_to) * np.exp(-(t[post] - t_inj) / tau)
+        return y
+
+    sample_y = step(t, 5.0, 100.0, 55.0, 90.0)
+    control_y = step(t, 9.0, 100.0, 96.0, 900.0)
+    # Injection transient spikes — these must not fool the detector.
+    sample_y[int(5.0 / dt) + 1] = 640.0
+    control_y[int(9.0 / dt) + 1] = 580.0
+
+    inj_s = detect_injection_time(t, sample_y)
+    inj_c = detect_injection_time(t, control_y)
+    assert inj_s is not None and abs(inj_s - 5.0) < 0.5, f"sample inj {inj_s}"
+    assert inj_c is not None and abs(inj_c - 9.0) < 0.5, f"control inj {inj_c}"
+    print(f"  ✓ injection times found despite spikes ({inj_s:.2f}s / {inj_c:.2f}s)")
+
+    ctrl_zero = t - t[0]
+    shift = align_control_offset(t, sample_y, ctrl_zero, control_y)
+    assert abs(shift - (-4.0)) < 0.5, f"expected ~-4s shift, got {shift}"
+    print(f"  ✓ control shifted by {shift:+.2f}s to align injections")
+
+    anchor = suggest_anchor_time(t, sample_y)
+    assert anchor > inj_s, "anchor must sit after the injection"
+    avg, _ = average_controls_on_grid(
+        [(ctrl_zero + shift, control_y)], t, float(t[0])
+    )
+    ctrl_at_anchor = float(np.interp(anchor, t, avg))
+    assert ctrl_at_anchor > 90.0, (
+        f"anchor must land on the control's plateau, got {ctrl_at_anchor:.1f}"
+    )
+    print(f"  ✓ anchor t={anchor:.2f}s reads control at {ctrl_at_anchor:.1f} uM")
+
+    corrected = sample_y - deviation_from_anchor(avg, t, anchor)
+    # The corrected trace must stay near the sample, not collapse to zero:
+    # only the control's ~4 uM drift is removed.
+    late = corrected[t > 300.0]
+    raw_late = sample_y[t > 300.0]
+    assert np.all(late > 50.0), "corrected trace must not collapse toward 0"
+    assert np.max(np.abs(late - raw_late)) < 10.0, (
+        "only the control's small drift should be removed"
+    )
+    print("  ✓ corrected trace keeps absolute scale (no collapse to ~0)")
+
+    # Regression guard: the OLD start-of-interval alignment collapsed it.
+    old_avg, _ = average_controls_on_grid([(ctrl_zero, control_y)], t, float(t[0]))
+    old_corr = sample_y - deviation_from_anchor(old_avg, t, float(t[0]))
+    assert np.min(old_corr) < 0.0, "old behaviour should have gone negative"
+    print("  ✓ old start-of-interval alignment reproduced the reported bug")
+    return True
+
+
 def main() -> int:
     tests = [
         test_fit_summary_upsert,
@@ -782,6 +852,7 @@ def main() -> int:
         test_pad_fit_yhat_and_multifit_excel,
         test_review_per_interval_mode_hides_legacy_redo,
         test_average_controls_on_grid,
+        test_injection_alignment,
         test_pane_role_chrome,
     ]
     failures = []
