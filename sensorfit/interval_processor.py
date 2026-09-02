@@ -44,6 +44,7 @@ from .calibration import (
     CALIBRATED_COLUMN,
     IntervalSubset,
     add_instruction_banner,
+    apply_robust_ylim,
     average_window,
     create_small_button,
     truncate_filename,
@@ -226,6 +227,9 @@ def select_one_interval(
         pass
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.78)
     ax.plot(time_values, h2o2_values, color="tab:green", lw=1.2, label="Calibrated trace")
+    # Keep the injection transient from compressing the trace (see
+    # apply_robust_ylim); "r" restores this view, not the spike-wide one.
+    apply_robust_ylim(ax, h2o2_values)
     for (s_existing, e_existing) in already_defined:
         ax.axvspan(s_existing, e_existing, color="grey", alpha=0.18)
     ax.set_xlabel("Time (s)")
@@ -589,6 +593,7 @@ def preview_per_interval_subtraction(
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.78, hspace=0.25)
 
     ax_top.plot(sample_t, sample_y, color="tab:green", lw=1.3, label="Sample interval")
+    apply_robust_ylim(ax_top, sample_y, control_y)
     line_ctrl, = ax_top.plot([], [], color="tab:red", lw=1.2, alpha=0.85, label=label)
     anchor_line_top = ax_top.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9, label="Anchor (control t=0)")
     anchor_line_bot = ax_bot.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9)
@@ -887,6 +892,7 @@ def averaging_hub(
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.78, hspace=0.25)
 
     ax_top.plot(sample_t, sample_y, color="tab:green", lw=1.3, label="Sample")
+    apply_robust_ylim(ax_top, sample_y)
     anchor_line_top = ax_top.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9, label="Anchor")
     anchor_line_bot = ax_bot.axvline(anchor["t0"], color="#8B008B", lw=1.8, ls="--", alpha=0.9)
     ax_top.set_ylabel("H₂O₂ (µM)")
@@ -989,9 +995,10 @@ def averaging_hub(
         ax_bot.legend(loc="upper right", fontsize=9)
 
         if not view["autoscaled"]:
-            for a in (ax_top, ax_bot):
-                a.relim()
-                a.autoscale_view()
+            # Robust limits on both panes: the corrected trace inherits the
+            # sample's injection transient, which would otherwise squash it.
+            apply_robust_ylim(ax_top, sample_y, averaged)
+            apply_robust_ylim(ax_bot, sample_y - dev)
             view["autoscaled"] = True
         fig.canvas.draw_idle()
 
@@ -1206,7 +1213,7 @@ def prompt_one_fit(
       "back"    — user wants to revisit the subtraction step.
     """
     # ── Figure layout: 2-row gridspec (data : residuals = 3 : 1) ──────
-    fig = get_window().reset(figsize=(11.5, 8.6))
+    fig = get_window().reset(figsize=(11.5, 7.6))
     try:
         fig.canvas.manager.set_window_title(
             f"SensorFit — Fit #{fit_index}"
@@ -1215,10 +1222,11 @@ def prompt_one_fit(
     except Exception:
         pass
     gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.10,
-                          left=0.10, right=0.97, top=0.66, bottom=0.16)
+                          left=0.10, right=0.97, top=0.76, bottom=0.155)
     ax_data = fig.add_subplot(gs[0])
     ax_resid = fig.add_subplot(gs[1], sharex=ax_data)
     ax_data.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
+    apply_robust_ylim(ax_data, interval_y)
     ax_data.set_ylabel("H2O2 (µM)")
     ax_resid.axhline(0.0, color="grey", lw=0.6, ls=":")
     ax_resid.set_ylabel("residual")
@@ -1234,28 +1242,28 @@ def prompt_one_fit(
     # ── Controls along the top (between banner and plot) ─────────────
     n_existing = len(existing_fits or [])
     fig.text(
-        0.10, 0.755,
+        0.10, 0.895,
         f"Fit #{fit_index}" + (f"  (previous fits on this interval: {n_existing})" if n_existing else ""),
         fontsize=10, fontweight="bold",
     )
 
     # Model picker buttons
-    ax_mlin = fig.add_axes([0.10, 0.71, 0.12, 0.04])
-    ax_mexp = fig.add_axes([0.23, 0.71, 0.12, 0.04])
-    ax_mib = fig.add_axes([0.36, 0.71, 0.12, 0.04])
+    ax_mlin = fig.add_axes([0.10, 0.845, 0.12, 0.04])
+    ax_mexp = fig.add_axes([0.23, 0.845, 0.12, 0.04])
+    ax_mib = fig.add_axes([0.36, 0.845, 0.12, 0.04])
     btn_mlin = create_small_button(ax_mlin, "Manual linear", "0.85", "0.75")
     btn_mexp = create_small_button(ax_mexp, "Single exp", "0.85", "0.75")
     btn_mib = create_small_button(ax_mib, "Inactivation", "0.85", "0.75")
 
     # Action buttons in the same row
-    ax_fit = fig.add_axes([0.52, 0.71, 0.08, 0.04])
-    ax_clear = fig.add_axes([0.61, 0.71, 0.10, 0.04])
+    ax_fit = fig.add_axes([0.52, 0.845, 0.08, 0.04])
+    ax_clear = fig.add_axes([0.61, 0.845, 0.10, 0.04])
     btn_fit = create_small_button(ax_fit, "Fit", "#90ee90", "#7cd47c")
     btn_clear = create_small_button(ax_clear, "Clear range", "0.9", "0.8")
 
     # Stats line + status hint
     stats_text = fig.text(
-        0.10, 0.685,
+        0.10, 0.815,
         "Pick the fit range by clicking on the plot, then a model.",
         fontsize=9, color="dimgrey", style="italic",
     )
@@ -1665,6 +1673,7 @@ def prompt_delta_max(
         pass
     plt.subplots_adjust(left=0.10, bottom=0.20, right=0.98, top=0.66)
     ax.plot(interval_t, interval_y, color="tab:green", lw=1.2, label="Interval")
+    apply_robust_ylim(ax, interval_y)
     for i, f in enumerate(fits):
         t_seg = np.linspace(f.fit_start_s, f.fit_end_s, f.yhat.size)
         ax.plot(t_seg, f.yhat, "-", lw=1.0, alpha=0.6, label=f"fit#{i+1}:{f.model}")

@@ -305,6 +305,38 @@ def apply_pane_role_chrome(fig, role: str) -> None:
         fig.suptitle(title, fontsize=11, fontweight="bold", color=style["edge"])
 
 
+def apply_robust_ylim(ax, *series, pad: float = 0.08) -> None:
+    """Set y-limits from robust percentiles instead of min/max.
+
+    H₂O₂ injection produces a transient of several hundred µM lasting a
+    couple of samples.  Plain autoscaling therefore stretches the axis
+    over (say) −416 … +640 µM and squeezes the real 55–100 µM signal into
+    a tenth of the pane — the trace users actually need to click on.
+
+    Percentile limits ignore those few samples while still showing the
+    whole run.  The spike is not hidden: it is drawn, just off the top of
+    the pane, and pressing ``r`` (zoom reset) restores this same view
+    because ``install_zoom_keys`` captures limits after this call.
+    """
+    lows, highs = [], []
+    for y in series:
+        arr = np.asarray(y, dtype=float).ravel()
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            continue
+        lows.append(float(np.percentile(arr, 0.2)))
+        highs.append(float(np.percentile(arr, 99.8)))
+    if not lows:
+        return
+    lo, hi = min(lows), max(highs)
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return
+    if hi - lo < 1e-12:
+        lo, hi = lo - 1.0, hi + 1.0
+    margin = (hi - lo) * pad
+    ax.set_ylim(lo - margin, hi + margin)
+
+
 class pane_role_context:
     """Context manager that patches ``plt.subplots``, ``plt.figure``, and
     ``plt.show`` so every figure created and shown inside the block gets
@@ -436,6 +468,7 @@ def select_baseline(
         # overlapping the instruction banner.
         plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.66)
         ax.plot(time_values, signal_values, "b-", lw=1, label="Raw data")
+        apply_robust_ylim(ax, signal_values)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Current (A)")
         title = "Baseline selection — Line (2 clicks) or Curve (≥3 clicks)"
@@ -1029,6 +1062,7 @@ def select_points(
         pass
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.95, top=0.74)
     line, = ax.plot(time_values, signal_values, lw=1)
+    apply_robust_ylim(ax, signal_values)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Current (A)")
 
@@ -1482,6 +1516,7 @@ def select_intervals(
     ax = fig.add_subplot(111)
     plt.subplots_adjust(left=0.1, bottom=0.18, right=0.98, top=0.80)
     ax.plot(time_values, calibrated_values, color="tab:green", lw=1.25)
+    apply_robust_ylim(ax, calibrated_values)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("H2O2 (µM)")
     
